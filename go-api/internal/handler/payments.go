@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
+	"chainroute/go-api/internal/money"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -25,6 +26,7 @@ type PaymentStore interface {
 	CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error)
 	GetPayment(ctx context.Context, id string) (payment.Payment, bool, error)
 	LookupByIdempotencyKey(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, bool, error)
+	GetExecutionByPaymentID(ctx context.Context, paymentID string) (payment.Execution, bool, error)
 }
 
 var assetNameByValue = map[routingv1.Asset]string{
@@ -37,6 +39,7 @@ type createPaymentRequest struct {
 	DestinationChain string `json:"destination_chain"`
 	Asset            string `json:"asset"`
 	Amount           string `json:"amount"`
+	ExecutionMode    string `json:"execution_mode"`
 }
 
 type hopResponse struct {
@@ -59,12 +62,16 @@ type paymentResponse struct {
 	Status           string        `json:"status"`
 	TotalFee         float64       `json:"total_fee"`
 	Hops             []hopResponse `json:"hops"`
+	ExecutionMode    string        `json:"execution_mode"`
+	BridgeProvider   *string       `json:"bridge_provider"`
+	ExternalTxHash   *string       `json:"external_tx_hash"`
+	SubmittedAt      *string       `json:"submitted_at"`
 	CreatedAt        string        `json:"created_at"`
 	UpdatedAt        string        `json:"updated_at"`
 	CompletedAt      *string       `json:"completed_at"`
 }
 
-func toPaymentResponse(p payment.Payment) paymentResponse {
+func toPaymentResponse(p payment.Payment, exec payment.Execution, execFound bool) paymentResponse {
 	hops := make([]hopResponse, 0, len(p.Hops))
 	for _, h := range p.Hops {
 		hops = append(hops, hopResponse{
@@ -78,10 +85,22 @@ func toPaymentResponse(p payment.Payment) paymentResponse {
 		formatted := p.CompletedAt.UTC().Format(time.RFC3339Nano)
 		completedAt = &formatted
 	}
+	var externalTxHash, submittedAt *string
+	if execFound {
+		if exec.SignedTxHash != nil {
+			externalTxHash = exec.SignedTxHash
+		}
+		if exec.BroadcastAt != nil {
+			formatted := exec.BroadcastAt.UTC().Format(time.RFC3339Nano)
+			submittedAt = &formatted
+		}
+	}
 	return paymentResponse{
 		ID: p.ID, SourceChain: p.SourceChain, DestinationChain: p.DestinationChain,
 		Asset: p.Asset, Amount: p.Amount, Status: string(p.Status), TotalFee: p.TotalFee,
-		Hops: hops, CreatedAt: p.CreatedAt.UTC().Format(time.RFC3339Nano),
+		Hops: hops, ExecutionMode: string(p.ExecutionMode), BridgeProvider: p.BridgeProvider,
+		ExternalTxHash: externalTxHash, SubmittedAt: submittedAt,
+		CreatedAt:   p.CreatedAt.UTC().Format(time.RFC3339Nano),
 		UpdatedAt:   p.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		CompletedAt: completedAt,
 	}
@@ -133,6 +152,43 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 			"amount must be a positive decimal with at most 20 integer digits and 18 fractional digits")
 		return
 	}
+
+	mode := payment.ExecutionModeSimulated
+	if req.ExecutionMode != "" {
+		mode = payment.ExecutionMode(req.ExecutionMode)
+	}
+	if mode != payment.ExecutionModeSimulated && mode != payment.ExecutionModeTestnet {
+		writeError(w, http.StatusBadRequest, "execution_mode must be \"simulated\" or \"testnet\"")
+		return
+	}
+	var bridgeProvider *string
+	if mode == payment.ExecutionModeTestnet {
+		if h.BlockchainEnv != "testnet" {
+			writeError(w, http.StatusBadRequest, "execution_mode=testnet is not enabled on this server")
+			return
+		}
+		// Phase 7 supports exactly one hardcoded route/asset (design spec
+		// §19): Sepolia -> Base Sepolia, ETH (interpreted as WETH for testnet
+		// execution -- see internal/handler's asset naming, which reuses the
+		// existing "eth" asset value rather than introducing a new protobuf
+		// Asset variant purely for this one testnet path).
+		if strings.ToLower(req.SourceChain) != "ethereum" || strings.ToLower(req.DestinationChain) != "base" || strings.ToLower(req.Asset) != "eth" {
+			writeError(w, http.StatusBadRequest, "execution_mode=testnet only supports source_chain=ethereum, destination_chain=base, asset=eth (bridged as WETH)")
+			return
+		}
+		amountWei, err := money.DecimalToBaseUnits(req.Amount, 18)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid amount for testnet execution: "+err.Error())
+			return
+		}
+		if h.MaxTestnetAmountWei != nil && amountWei.Cmp(h.MaxTestnetAmountWei) > 0 {
+			writeError(w, http.StatusBadRequest, "amount exceeds the configured maximum testnet execution amount")
+			return
+		}
+		provider := "across"
+		bridgeProvider = &provider
+	}
+
 	if sourceChain == destChain {
 		writeError(w, http.StatusBadRequest, "source and destination must differ")
 		return
@@ -147,7 +203,7 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 	lookupCandidate := payment.Payment{
 		IdempotencyKey: idempotencyKey, SourceChain: chainNameByValue[sourceChain],
 		DestinationChain: chainNameByValue[destChain], Asset: assetNameByValue[asset],
-		Amount: req.Amount,
+		Amount: req.Amount, ExecutionMode: mode,
 	}
 	if existing, outcome, found, err := h.Store.LookupByIdempotencyKey(r.Context(), lookupCandidate); err != nil {
 		log.Printf("ERROR: failed to look up payment by idempotency key: %v", err)
@@ -157,7 +213,7 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		switch outcome {
 		case payment.Replayed:
 			w.Header().Set("Location", "/payments/"+existing.ID)
-			writeJSON(w, http.StatusOK, toPaymentResponse(existing))
+			writeJSON(w, http.StatusOK, toPaymentResponse(existing, payment.Execution{}, false))
 		case payment.Conflict:
 			writeError(w, http.StatusConflict, "Idempotency-Key already used with a different request")
 		}
@@ -216,6 +272,7 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: idempotencyKey, SourceChain: chainNameByValue[sourceChain],
 		DestinationChain: chainNameByValue[destChain], Asset: assetNameByValue[asset],
 		Amount: req.Amount, TotalFee: resp.GetTotalFee(), Hops: hops,
+		ExecutionMode: mode, BridgeProvider: bridgeProvider,
 	}
 
 	result, outcome, err := h.Store.CreateOrGetPayment(r.Context(), candidate)
@@ -228,10 +285,10 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 	switch outcome {
 	case payment.Created:
 		w.Header().Set("Location", "/payments/"+result.ID)
-		writeJSON(w, http.StatusCreated, toPaymentResponse(result))
+		writeJSON(w, http.StatusCreated, toPaymentResponse(result, payment.Execution{}, false))
 	case payment.Replayed:
 		w.Header().Set("Location", "/payments/"+result.ID)
-		writeJSON(w, http.StatusOK, toPaymentResponse(result))
+		writeJSON(w, http.StatusOK, toPaymentResponse(result, payment.Execution{}, false))
 	case payment.Conflict:
 		writeError(w, http.StatusConflict, "Idempotency-Key already used with a different request")
 	}
@@ -249,5 +306,11 @@ func (h *Handler) GetPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "payment not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, toPaymentResponse(p))
+	exec, execFound, err := h.Store.GetExecutionByPaymentID(r.Context(), id)
+	if err != nil {
+		log.Printf("ERROR: failed to read payment execution: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, toPaymentResponse(p, exec, execFound))
 }

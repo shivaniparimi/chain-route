@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -39,6 +40,10 @@ func (f *fakePaymentStore) GetPayment(_ context.Context, id string) (payment.Pay
 
 func (f *fakePaymentStore) LookupByIdempotencyKey(_ context.Context, _ payment.Payment) (payment.Payment, payment.CreateResult, bool, error) {
 	return f.lookupResult, f.lookupOutcome, f.lookupFound, f.lookupErr
+}
+
+func (f *fakePaymentStore) GetExecutionByPaymentID(_ context.Context, _ string) (payment.Execution, bool, error) {
+	return payment.Execution{}, false, nil
 }
 
 func doPaymentRequest(h *Handler, method, path, idempotencyKey, body string) *httptest.ResponseRecorder {
@@ -304,5 +309,63 @@ func TestToPaymentResponse_CompletedAtSetWhenTerminal(t *testing.T) {
 	}
 	if got != completedAt.Format(time.RFC3339Nano) {
 		t.Fatalf("expected %q, got %q", completedAt.Format(time.RFC3339Nano), got)
+	}
+}
+
+func TestPostPayments_TestnetModeRejectedWhenServerNotConfigured(t *testing.T) {
+	// h.BlockchainEnv left at its zero value "" -- testnet mode is disabled.
+	h := &Handler{Client: &fakeClient{}, Store: &fakePaymentStore{}}
+	rec := doPaymentRequest(h, "POST", "/payments", "testnet-gate-key",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when the server isn't configured for testnet execution, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetModeRejectsUnsupportedRoute(t *testing.T) {
+	h := &Handler{Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet"}
+	rec := doPaymentRequest(h, "POST", "/payments", "testnet-route-key",
+		`{"source_chain":"arbitrum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unsupported testnet route, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetModeRejectsAmountOverCeiling(t *testing.T) {
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{},
+		BlockchainEnv: "testnet", MaxTestnetAmountWei: big.NewInt(1), // absurdly low, guarantees rejection
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "testnet-ceiling-key",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an amount over the configured ceiling, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_DefaultExecutionModeIsSimulated(t *testing.T) {
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, TotalFee: 1.0}}
+	store := &fakePaymentStore{
+		createOutcome: payment.Created,
+		createResult: payment.Payment{
+			ID: "default-mode-id", Status: payment.StatusRouted, ExecutionMode: payment.ExecutionModeSimulated,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: fakeRoute, Store: store}
+	rec := doPaymentRequest(h, "POST", "/payments", "default-mode-key",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"usdc","amount":"100"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if store.lastCreate.ExecutionMode != payment.ExecutionModeSimulated {
+		t.Fatalf("expected execution_mode to default to simulated when omitted from the request, got %q", store.lastCreate.ExecutionMode)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["execution_mode"] != "simulated" {
+		t.Fatalf("expected execution_mode=simulated by default, got %v", body["execution_mode"])
 	}
 }

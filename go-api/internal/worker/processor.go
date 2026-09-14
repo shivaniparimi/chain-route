@@ -15,9 +15,23 @@ type PaymentStore interface {
 	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
 }
 
-// Processor handles one PAYMENT_ROUTED event at a time.
+// TestnetExecutor is the subset of *Executor Processor needs -- kept as an
+// interface so processor_test.go can fake it without constructing a real
+// wallet/RPC/Across client.
+type TestnetExecutor interface {
+	ExecuteTestnetPayment(ctx context.Context, paymentID string) error
+}
+
+// Processor handles one PAYMENT_ROUTED event at a time. Executor is nil
+// when BLOCKCHAIN_ENV != testnet (cmd/worker only wires it when testnet
+// execution is actually enabled) -- HandleRoutedPayment must never reach
+// the testnet branch in that configuration, because the API layer (Task
+// 15) refuses to create execution_mode="testnet" payments unless the
+// server itself is configured for testnet, so no ROUTED testnet-mode
+// payment can exist for Kafka to ever deliver in the first place.
 type Processor struct {
-	Store PaymentStore
+	Store    PaymentStore
+	Executor TestnetExecutor
 }
 
 // HandleRoutedPayment claims the payment and, only if the claim succeeds,
@@ -31,12 +45,19 @@ type Processor struct {
 // special-case: whichever of the two wins CompletePayment's guard is the
 // one that persists.
 func (p *Processor) HandleRoutedPayment(ctx context.Context, evt events.RoutedPayment) error {
-	claimed, _, err := p.Store.ClaimPayment(ctx, evt.PaymentID)
+	claimed, mode, err := p.Store.ClaimPayment(ctx, evt.PaymentID)
 	if err != nil {
 		return fmt.Errorf("claim payment %s: %w", evt.PaymentID, err)
 	}
 	if !claimed {
 		return nil
+	}
+
+	if mode == payment.ExecutionModeTestnet {
+		if p.Executor == nil {
+			return fmt.Errorf("payment %s is execution_mode=testnet but this worker has no Executor configured (BLOCKCHAIN_ENV != testnet) -- this should be unreachable if the API layer's testnet gate is working", evt.PaymentID)
+		}
+		return p.Executor.ExecuteTestnetPayment(ctx, evt.PaymentID)
 	}
 
 	result := execution.Execute(evt.PaymentID)

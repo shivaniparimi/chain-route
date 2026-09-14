@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
+	"math/big"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,8 +14,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"chainroute/go-api/internal/bridge/across"
+	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/kafka"
 	"chainroute/go-api/internal/postgres"
@@ -38,6 +42,12 @@ func main() {
 	recoverySweepInterval := envDuration("WORKER_RECOVERY_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second)
 	recoveryStaleness := envDuration("WORKER_RECOVERY_STALENESS_SECONDS", 120*time.Second, time.Second)
 
+	blockchainEnv := os.Getenv("BLOCKCHAIN_ENV")
+
+	reconcileStaleness := envDuration("RECONCILE_STALENESS_SECONDS", 120*time.Second, time.Second)
+	reconcileSweepInterval := envDuration("RECONCILE_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second)
+	nonceDivergenceCheckInterval := envDuration("NONCE_DIVERGENCE_CHECK_INTERVAL_SECONDS", 60*time.Second, time.Second)
+
 	// PostgreSQL is blocking-ping-or-die at startup, matching cmd/server:
 	// nothing in this binary can do anything useful without the database.
 	db, err := sql.Open("pgx", databaseURL)
@@ -56,6 +66,84 @@ func main() {
 
 	store := postgres.New(db)
 
+	var executor *worker.Executor
+	var reconciler *worker.Reconciler
+
+	if blockchainEnv == "testnet" {
+		testnetWalletKey := os.Getenv("TESTNET_WALLET_PRIVATE_KEY")
+		if testnetWalletKey == "" {
+			log.Fatal("TESTNET_WALLET_PRIVATE_KEY is required when BLOCKCHAIN_ENV=testnet")
+		}
+		sepoliaRPC := os.Getenv("ETHEREUM_SEPOLIA_RPC_URL")
+		baseSepoliaRPC := os.Getenv("BASE_SEPOLIA_RPC_URL")
+		if sepoliaRPC == "" || baseSepoliaRPC == "" {
+			log.Fatal("ETHEREUM_SEPOLIA_RPC_URL and BASE_SEPOLIA_RPC_URL are required when BLOCKCHAIN_ENV=testnet")
+		}
+		acrossBaseURL := envOrDefault("ACROSS_TESTNET_API_URL", "https://testnet.across.to/api")
+		maxTestnetAmountWei := envBigInt("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000)) // 0.01 WETH default ceiling
+
+		wallet, err := evm.LoadWallet(testnetWalletKey)
+		if err != nil {
+			log.Fatalf("failed to load testnet wallet: %v", err)
+		}
+		log.Printf("testnet execution enabled: wallet address %s", wallet.Address.Hex())
+
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		sepoliaClient, err := evm.Dial(dialCtx, sepoliaRPC, 11155111)
+		dialCancel()
+		if err != nil {
+			log.Fatalf("failed to dial Sepolia RPC: %v", err)
+		}
+		dialCtx2, dialCancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err = evm.Dial(dialCtx2, baseSepoliaRPC, 84532)
+		dialCancel2()
+		if err != nil {
+			log.Fatalf("failed to dial Base Sepolia RPC: %v", err)
+		}
+
+		seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pendingNonce, err := sepoliaClient.PendingNonceAt(seedCtx, wallet.Address)
+		seedCancel()
+		if err != nil {
+			log.Fatalf("failed to query starting nonce: %v", err)
+		}
+		seedCtx2, seedCancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		err = store.SeedWalletNonce(seedCtx2, wallet.Address.Hex(), int64(pendingNonce))
+		seedCancel2()
+		if err != nil {
+			log.Fatalf("failed to seed wallet nonce: %v", err)
+		}
+
+		acrossClient := across.NewClient(acrossBaseURL)
+		acrossClient.APIKey = os.Getenv("ACROSS_API_KEY")
+		acrossClient.IntegratorID = os.Getenv("ACROSS_INTEGRATOR_ID")
+
+		executor = &worker.Executor{
+			Store: store, Wallet: wallet, OriginClient: sepoliaClient, Across: acrossClient,
+			BridgeProvider: "across", OriginChainID: 11155111, DestChainID: 84532,
+			SpokePoolAddress: common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662"),
+			WETHOrigin:       common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
+			WETHDestination:  common.HexToAddress("0x4200000000000000000000000000000000000006"),
+			MaxAmountWei:     maxTestnetAmountWei,
+		}
+		reconciler = &worker.Reconciler{
+			Store: store, Executor: executor, OriginClient: sepoliaClient, Across: acrossClient,
+			WalletAddress: wallet.Address, OriginChainID: 11155111, Staleness: reconcileStaleness,
+		}
+	}
+
+	// Processor.Executor is declared as the TestnetExecutor interface, and a
+	// nil *worker.Executor assigned directly into an interface field would
+	// produce a non-nil interface (Go's typed-nil-in-interface trap) -- that
+	// would make HandleRoutedPayment's `p.Executor == nil` check evaluate
+	// false even when testnet execution is disabled. Guard the assignment
+	// explicitly so the interface field is a genuine nil when executor is nil.
+	var processorExecutor worker.TestnetExecutor
+	if executor != nil {
+		processorExecutor = executor
+	}
+	processor := &worker.Processor{Store: store, Executor: processorExecutor}
+
 	// Kafka is deliberately NOT blocking-or-die here: a transiently
 	// unreachable broker at startup is tolerated, since kafka-go's writer
 	// and reader dial lazily and retry internally rather than failing
@@ -66,7 +154,6 @@ func main() {
 	consumer := kafka.NewConsumer(kafka.ConsumerConfig{Brokers: brokers, Topic: topic, GroupID: consumerGroup})
 	defer consumer.Close()
 
-	processor := &worker.Processor{Store: store}
 	publisher := &worker.Publisher{
 		Store: store,
 		Publish: func(ctx context.Context, key string, value []byte) error {
@@ -79,10 +166,17 @@ func main() {
 	defer stop()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	goroutines := 3
+	if reconciler != nil {
+		goroutines = 4
+	}
+	wg.Add(goroutines)
 	go func() { defer wg.Done(); publisher.Run(ctx, outboxPollInterval) }()
 	go func() { defer wg.Done(); recovery.Run(ctx, recoverySweepInterval) }()
 	go func() { defer wg.Done(); runConsumeLoop(ctx, consumer, processor) }()
+	if reconciler != nil {
+		go func() { defer wg.Done(); reconciler.Run(ctx, reconcileSweepInterval, nonceDivergenceCheckInterval) }()
+	}
 
 	log.Printf("worker started: topic=%s group=%s brokers=%v", topic, consumerGroup, brokers)
 	<-ctx.Done()
@@ -158,4 +252,16 @@ func envDuration(key string, def time.Duration, unit time.Duration) time.Duratio
 		log.Fatalf("invalid %s: %v", key, err)
 	}
 	return time.Duration(n) * unit
+}
+
+func envBigInt(key string, def *big.Int) *big.Int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, ok := new(big.Int).SetString(v, 10)
+	if !ok {
+		log.Fatalf("invalid %s: not a valid base-10 integer", key)
+	}
+	return n
 }
