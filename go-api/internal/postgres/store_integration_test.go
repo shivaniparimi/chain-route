@@ -322,6 +322,15 @@ func TestCreateOrGetPayment_InsertsOutboxEventAtomically(t *testing.T) {
 	key := "test-outbox-atomic-insert"
 	p := testPayment(key)
 
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
 	result, outcome, err := s.CreateOrGetPayment(context.Background(), p)
 	if err != nil || outcome != payment.Created {
 		t.Fatalf("create: outcome=%v err=%v", outcome, err)
@@ -356,6 +365,15 @@ func TestCreateOrGetPayment_ReplayDoesNotInsertAnotherOutboxEvent(t *testing.T) 
 	s := newTestStore(t)
 	key := "test-outbox-no-duplicate-on-replay"
 	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
 
 	first, outcome1, err := s.CreateOrGetPayment(context.Background(), p)
 	if err != nil || outcome1 != payment.Created {
