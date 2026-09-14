@@ -53,6 +53,14 @@ int main(int argc, char** argv) {
     sigemptyset(&signalSet);
     sigaddset(&signalSet, SIGINT);
     sigaddset(&signalSet, SIGTERM);
+    // A non-interactive shell auto-SIG_IGNs SIGINT/SIGQUIT for `&`-backgrounded
+    // children; that disposition is inherited by this process and is NOT
+    // affected by pthread_sigmask() below (masking only controls blocking,
+    // not disposition), so an inherited SIG_IGN would cause the kernel to
+    // discard SIGINT before sigwait() ever sees it. Reset both to default
+    // first so blocking + sigwait() can reliably observe them.
+    std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGTERM, SIG_DFL);
     pthread_sigmask(SIG_BLOCK, &signalSet, nullptr);
 
     std::uint64_t seed = 42;
@@ -73,11 +81,18 @@ int main(int argc, char** argv) {
     grpc::EnableDefaultHealthCheckService(true);
 
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(listenAddress, grpc::InsecureServerCredentials());
+    // Disable SO_REUSEPORT (enabled by gRPC C++ by default): with it on, a
+    // second process binding the same already-bound address "succeeds"
+    // silently and the kernel load-balances traffic between both processes,
+    // so a genuine bind conflict must be surfaced via the selected-port
+    // out-parameter below instead.
+    builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
+    int selectedPort = 0;
+    builder.AddListeningPort(listenAddress, grpc::InsecureServerCredentials(), &selectedPort);
     builder.RegisterService(&service);
 
     g_server = builder.BuildAndStart();
-    if (!g_server) {
+    if (!g_server || selectedPort == 0) {
         std::cerr << "Failed to start server on " << listenAddress << "\n";
         return 1;
     }

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "chainroute/sim/network_simulator.hpp"
 #include "chainroute_service/routing_service.hpp"
 
@@ -96,6 +98,23 @@ TEST(RoutingServiceTest, RejectsNonPositiveAmount) {
     request.set_destination_chain(chainroute::v1::CHAIN_BASE);
     request.set_asset(chainroute::v1::ASSET_USDC);
     request.set_amount(0.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    const grpc::Status status = service.FindRoute(&context, &request, &response);
+
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+}
+
+TEST(RoutingServiceTest, RejectsNaNAmount) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_USDC);
+    request.set_amount(std::numeric_limits<double>::quiet_NaN());
 
     chainroute::v1::FindRouteResponse response;
     grpc::ServerContext context;

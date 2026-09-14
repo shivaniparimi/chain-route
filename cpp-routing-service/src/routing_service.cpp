@@ -25,7 +25,7 @@ grpc::Status RoutingServiceImpl::FindRoute(
     if (!asset.has_value()) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid asset");
     }
-    if (request->amount() <= 0.0) {
+    if (!(request->amount() > 0.0)) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "amount must be positive");
     }
 
