@@ -12,6 +12,8 @@ add_library(chainroute STATIC
     src/edge.cpp
     src/graph.cpp
     src/route.cpp
+    src/sim/deterministic_rng.cpp
+    src/sim/network_simulator.cpp
 )
 target_include_directories(chainroute PUBLIC include)
 
