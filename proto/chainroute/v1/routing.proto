@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package chainroute.v1;
+
+option go_package = "chainroute/go-api/internal/gen/chainroute/v1;routingv1";
+
+enum Chain {
+  CHAIN_UNSPECIFIED = 0;
+  CHAIN_ETHEREUM = 1;
+  CHAIN_BASE = 2;
+  CHAIN_ARBITRUM = 3;
+  CHAIN_OPTIMISM = 4;
+  CHAIN_POLYGON = 5;
+}
+
+enum Asset {
+  ASSET_UNSPECIFIED = 0;
+  ASSET_USDC = 1;
+  ASSET_ETH = 2;
+}
+
+message FindRouteRequest {
+  Chain source_chain = 1;
+  Chain destination_chain = 2;
+  Asset asset = 3;
+  double amount = 4;
+}
+
+message RouteHop {
+  Chain from_chain = 1;
+  Chain to_chain = 2;
+  string bridge_name = 3;
+  double fee = 4;
+  double latency_ms = 5;
+  double liquidity = 6;
+  double reliability = 7;
+}
+
+message FindRouteResponse {
+  bool route_found = 1;
+  repeated RouteHop hops = 2;
+  double total_fee = 3;
+}
+
+service RoutingService {
+  rpc FindRoute(FindRouteRequest) returns (FindRouteResponse);
+}
