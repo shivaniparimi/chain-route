@@ -3,12 +3,15 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -198,6 +201,21 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 		`, created.ID, h.HopIndex, h.FromChain, h.ToChain, h.BridgeName, h.Fee, h.LatencyMs, h.Liquidity, h.Reliability); err != nil {
 			return payment.Payment{}, 0, fmt.Errorf("insert hop %d: %w", h.HopIndex, err)
 		}
+	}
+
+	outboxPayload, err := json.Marshal(events.RoutedPayment{
+		PaymentID:  created.ID,
+		EventType:  events.RoutedPaymentEventType,
+		OccurredAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return payment.Payment{}, 0, fmt.Errorf("marshal outbox payload: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox_events (payment_id, event_type, payload)
+		VALUES ($1, $2, $3)
+	`, created.ID, events.RoutedPaymentEventType, outboxPayload); err != nil {
+		return payment.Payment{}, 0, fmt.Errorf("insert outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

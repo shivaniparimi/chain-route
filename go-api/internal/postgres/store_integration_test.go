@@ -316,3 +316,64 @@ func TestCreateOrGetPayment_ConcurrentSameKeyCreation(t *testing.T) {
 		t.Fatalf("expected exactly 1 row in the database, got %d", count)
 	}
 }
+
+func TestCreateOrGetPayment_InsertsOutboxEventAtomically(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-outbox-atomic-insert"
+	p := testPayment(key)
+
+	result, outcome, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create: outcome=%v err=%v", outcome, err)
+	}
+
+	var count int
+	var eventType string
+	var publishedAt sql.NullTime
+	row := s.db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM outbox_events WHERE payment_id = $1`, result.ID)
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 outbox row, got %d", count)
+	}
+
+	row = s.db.QueryRowContext(context.Background(),
+		`SELECT event_type, published_at FROM outbox_events WHERE payment_id = $1`, result.ID)
+	if err := row.Scan(&eventType, &publishedAt); err != nil {
+		t.Fatalf("select query: %v", err)
+	}
+	if eventType != "PAYMENT_ROUTED" {
+		t.Fatalf("expected event_type PAYMENT_ROUTED, got %q", eventType)
+	}
+	if publishedAt.Valid {
+		t.Fatalf("expected published_at to be NULL for a freshly inserted event")
+	}
+}
+
+func TestCreateOrGetPayment_ReplayDoesNotInsertAnotherOutboxEvent(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-outbox-no-duplicate-on-replay"
+	p := testPayment(key)
+
+	first, outcome1, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil || outcome1 != payment.Created {
+		t.Fatalf("first call: outcome=%v err=%v", outcome1, err)
+	}
+
+	_, outcome2, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil || outcome2 != payment.Replayed {
+		t.Fatalf("second call: outcome=%v err=%v", outcome2, err)
+	}
+
+	var count int
+	row := s.db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM outbox_events WHERE payment_id = $1`, first.ID)
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 outbox row after a replay, got %d", count)
+	}
+}
