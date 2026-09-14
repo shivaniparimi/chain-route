@@ -61,6 +61,7 @@ type paymentResponse struct {
 	Hops             []hopResponse `json:"hops"`
 	CreatedAt        string        `json:"created_at"`
 	UpdatedAt        string        `json:"updated_at"`
+	CompletedAt      *string       `json:"completed_at"`
 }
 
 func toPaymentResponse(p payment.Payment) paymentResponse {
@@ -72,11 +73,17 @@ func toPaymentResponse(p payment.Payment) paymentResponse {
 			Liquidity: h.Liquidity, Reliability: h.Reliability,
 		})
 	}
+	var completedAt *string
+	if p.CompletedAt != nil {
+		formatted := p.CompletedAt.UTC().Format(time.RFC3339Nano)
+		completedAt = &formatted
+	}
 	return paymentResponse{
 		ID: p.ID, SourceChain: p.SourceChain, DestinationChain: p.DestinationChain,
 		Asset: p.Asset, Amount: p.Amount, Status: string(p.Status), TotalFee: p.TotalFee,
 		Hops: hops, CreatedAt: p.CreatedAt.UTC().Format(time.RFC3339Nano),
 		UpdatedAt: p.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		CompletedAt: completedAt,
 	}
 }
 

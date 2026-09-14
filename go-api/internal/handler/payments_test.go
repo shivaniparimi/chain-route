@@ -257,3 +257,52 @@ func TestGetPayment_NotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", rec.Code)
 	}
 }
+
+func TestToPaymentResponse_CompletedAtNullWhenNotSet(t *testing.T) {
+	store := &fakePaymentStore{
+		createOutcome: payment.Created,
+		createResult: payment.Payment{
+			ID: "test-id-completed-at-null", Status: payment.StatusRouted,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(), CompletedAt: nil,
+		},
+	}
+	h := &Handler{Client: &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, TotalFee: 2.5}}, Store: store}
+	rec := doPaymentRequest(h, "POST", "/payments", "key-1", validPaymentBody())
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	v, ok := body["completed_at"]
+	if !ok {
+		t.Fatal("expected completed_at key to be present in the response")
+	}
+	if v != nil {
+		t.Fatalf("expected completed_at to be null, got %v", v)
+	}
+}
+
+func TestToPaymentResponse_CompletedAtSetWhenTerminal(t *testing.T) {
+	completedAt := time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-completed-at-set", Status: payment.StatusCompleted,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(), CompletedAt: &completedAt,
+		},
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-completed-at-set", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	got, ok := body["completed_at"].(string)
+	if !ok {
+		t.Fatalf("expected completed_at to be a string, got %v", body["completed_at"])
+	}
+	if got != completedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("expected %q, got %q", completedAt.Format(time.RFC3339Nano), got)
+	}
+}
