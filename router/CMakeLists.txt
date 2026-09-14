@@ -11,6 +11,7 @@ add_library(chainroute STATIC
     src/node.cpp
     src/edge.cpp
     src/graph.cpp
+    src/route.cpp
 )
 target_include_directories(chainroute PUBLIC include)
 
