@@ -12,6 +12,7 @@ import (
 
 type fakeStore struct {
 	claimResult    bool
+	claimMode      payment.ExecutionMode
 	claimErr       error
 	completeResult bool
 	completeErr    error
@@ -20,9 +21,13 @@ type fakeStore struct {
 	lastTerminal   payment.Status
 }
 
-func (f *fakeStore) ClaimPayment(ctx context.Context, paymentID string) (bool, error) {
+func (f *fakeStore) ClaimPayment(ctx context.Context, paymentID string) (bool, payment.ExecutionMode, error) {
 	f.claimCalls++
-	return f.claimResult, f.claimErr
+	mode := f.claimMode
+	if mode == "" {
+		mode = payment.ExecutionModeSimulated
+	}
+	return f.claimResult, mode, f.claimErr
 }
 
 func (f *fakeStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error) {

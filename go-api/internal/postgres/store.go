@@ -23,24 +23,38 @@ func New(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
+// normalizeExecutionMode maps the Go zero value "" (which every Phase 1-6
+// call site produces, since ExecutionMode didn't exist before Phase 7) to
+// ExecutionModeSimulated before it ever reaches SQL. The payments.execution_mode
+// column is NOT NULL with a CHECK constraint, so inserting "" directly would
+// violate it.
+func normalizeExecutionMode(m payment.ExecutionMode) payment.ExecutionMode {
+	if m == "" {
+		return payment.ExecutionModeSimulated
+	}
+	return m
+}
+
 // findByIdempotencyKey looks up an existing payment by idempotency key,
 // reporting via Postgres's own NUMERIC equality whether it matches the
 // given candidate's request fields. found=false means no row exists.
 func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (existing payment.Payment, matches bool, found bool, err error) {
+	mode := normalizeExecutionMode(p.ExecutionMode)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_chain, destination_chain, asset, amount::text,
-		       total_fee, status, completed_at, created_at, updated_at,
+		       total_fee, status, execution_mode, bridge_provider, completed_at, created_at, updated_at,
 		       (source_chain = $2 AND destination_chain = $3
-		        AND asset = $4 AND amount = $5::NUMERIC) AS request_matches
+		        AND asset = $4 AND amount = $5::NUMERIC AND execution_mode = $6) AS request_matches
 		FROM payments
 		WHERE idempotency_key = $1
-	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount)
+	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount, string(mode))
 
-	var status string
+	var status, execMode string
+	var bridgeProvider sql.NullString
 	var completedAt sql.NullTime
 	err = row.Scan(&existing.ID, &existing.SourceChain, &existing.DestinationChain,
-		&existing.Asset, &existing.Amount, &existing.TotalFee, &status, &completedAt,
-		&existing.CreatedAt, &existing.UpdatedAt, &matches)
+		&existing.Asset, &existing.Amount, &existing.TotalFee, &status, &execMode, &bridgeProvider,
+		&completedAt, &existing.CreatedAt, &existing.UpdatedAt, &matches)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Payment{}, false, false, nil
 	}
@@ -48,6 +62,10 @@ func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (ex
 		return payment.Payment{}, false, false, fmt.Errorf("find by idempotency key: %w", err)
 	}
 	existing.Status = payment.Status(status)
+	existing.ExecutionMode = payment.ExecutionMode(execMode)
+	if bridgeProvider.Valid {
+		existing.BridgeProvider = &bridgeProvider.String
+	}
 	if completedAt.Valid {
 		existing.CompletedAt = &completedAt.Time
 	}
@@ -81,16 +99,17 @@ func (s *Store) hopsForPayment(ctx context.Context, paymentID string) ([]payment
 
 func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, bool, error) {
 	var p payment.Payment
-	var status string
+	var status, execMode string
+	var bridgeProvider sql.NullString
 	var completedAt sql.NullTime
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, idempotency_key, source_chain, destination_chain, asset, amount::text,
-		       total_fee, status, completed_at, created_at, updated_at
+		       total_fee, status, execution_mode, bridge_provider, completed_at, created_at, updated_at
 		FROM payments
 		WHERE id = $1
 	`, id)
 	err := row.Scan(&p.ID, &p.IdempotencyKey, &p.SourceChain, &p.DestinationChain, &p.Asset,
-		&p.Amount, &p.TotalFee, &status, &completedAt, &p.CreatedAt, &p.UpdatedAt)
+		&p.Amount, &p.TotalFee, &status, &execMode, &bridgeProvider, &completedAt, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Payment{}, false, nil
 	}
@@ -102,6 +121,10 @@ func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, boo
 		return payment.Payment{}, false, fmt.Errorf("get payment: %w", err)
 	}
 	p.Status = payment.Status(status)
+	p.ExecutionMode = payment.ExecutionMode(execMode)
+	if bridgeProvider.Valid {
+		p.BridgeProvider = &bridgeProvider.String
+	}
 	if completedAt.Valid {
 		p.CompletedAt = &completedAt.Time
 	}
@@ -142,6 +165,8 @@ func (s *Store) LookupByIdempotencyKey(ctx context.Context, p payment.Payment) (
 }
 
 func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error) {
+	p.ExecutionMode = normalizeExecutionMode(p.ExecutionMode)
+
 	// Optimization only, not correctness-critical: skip the routing RPC's
 	// result entirely for the common retry case. If this races with a
 	// concurrent insert and misses it, nothing breaks -- the INSERT below
@@ -168,11 +193,11 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 
 	var created payment.Payment
 	row := tx.QueryRowContext(ctx, `
-		INSERT INTO payments (idempotency_key, source_chain, destination_chain, asset, amount, total_fee)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO payments (idempotency_key, source_chain, destination_chain, asset, amount, total_fee, execution_mode, bridge_provider)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING id, amount::text, created_at, updated_at
-	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount, p.TotalFee)
+	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount, p.TotalFee, string(p.ExecutionMode), p.BridgeProvider)
 
 	err = row.Scan(&created.ID, &created.Amount, &created.CreatedAt, &created.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -237,28 +262,33 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 	created.Status = payment.StatusRouted
 	created.TotalFee = p.TotalFee
 	created.Hops = p.Hops
+	created.ExecutionMode = p.ExecutionMode
+	created.BridgeProvider = p.BridgeProvider
 
 	return created, payment.Created, nil
 }
 
-// ClaimPayment atomically transitions a payment from ROUTED to PROCESSING.
-// claimed=false means the payment was not ROUTED (already claimed by
-// another delivery, or in some other state) -- a safe no-op, not an error.
-// This is the sole mechanism preventing duplicate claims (see the Phase 6
-// design spec, §7 case 2).
-func (s *Store) ClaimPayment(ctx context.Context, paymentID string) (claimed bool, err error) {
-	result, err := s.db.ExecContext(ctx, `
+// ClaimPayment atomically transitions a payment from ROUTED to PROCESSING,
+// returning its execution_mode in the same round trip. claimed=false means
+// the payment was not ROUTED (already claimed by another delivery, or in
+// some other state) -- a safe no-op, not an error; mode is the zero value
+// in that case and must not be used. This is the sole mechanism preventing
+// duplicate claims (see the Phase 6 design spec, §7 case 2).
+func (s *Store) ClaimPayment(ctx context.Context, paymentID string) (claimed bool, mode payment.ExecutionMode, err error) {
+	var modeStr string
+	row := s.db.QueryRowContext(ctx, `
 		UPDATE payments SET status = $2, updated_at = now()
 		WHERE id = $1 AND status = $3
+		RETURNING execution_mode
 	`, paymentID, payment.StatusProcessing, payment.StatusRouted)
-	if err != nil {
-		return false, fmt.Errorf("claim payment: %w", err)
+	err = row.Scan(&modeStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", nil
 	}
-	rows, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("claim payment rows affected: %w", err)
+		return false, "", fmt.Errorf("claim payment: %w", err)
 	}
-	return rows == 1, nil
+	return true, payment.ExecutionMode(modeStr), nil
 }
 
 // CompletePayment atomically transitions a payment from PROCESSING to the
@@ -285,13 +315,18 @@ func (s *Store) CompletePayment(ctx context.Context, paymentID string, terminal 
 // StalePaymentIDs returns the IDs of payments that have been PROCESSING for
 // longer than staleness. The caller (the worker's recovery sweep) is
 // responsible for re-running execution and calling CompletePayment for
-// each -- this method only identifies candidates.
+// each -- this method only identifies candidates. Only simulated-mode
+// payments are returned: Recovery calls the pure, deterministic
+// execution.Execute, which has no meaning for a real testnet transaction
+// (Phase 7 design spec §15), so testnet-mode payments must never be swept
+// here.
 func (s *Store) StalePaymentIDs(ctx context.Context, staleness time.Duration) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id FROM payments
 		WHERE status = $1
+		  AND execution_mode = $3
 		  AND updated_at < now() - make_interval(secs => $2)
-	`, payment.StatusProcessing, staleness.Seconds())
+	`, payment.StatusProcessing, staleness.Seconds(), string(payment.ExecutionModeSimulated))
 	if err != nil {
 		return nil, fmt.Errorf("query stale payments: %w", err)
 	}
