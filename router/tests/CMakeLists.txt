@@ -11,6 +11,8 @@ add_executable(chainroute_tests
     edge_test.cpp
     graph_test.cpp
     route_test.cpp
+    sim/deterministic_rng_test.cpp
+    sim/network_simulator_test.cpp
 )
 target_link_libraries(chainroute_tests PRIVATE chainroute GTest::gtest_main)
 
