@@ -10,6 +10,7 @@ add_library(chainroute STATIC
     src/asset.cpp
     src/node.cpp
     src/edge.cpp
+    src/graph.cpp
 )
 target_include_directories(chainroute PUBLIC include)
 
