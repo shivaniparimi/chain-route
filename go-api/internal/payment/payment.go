@@ -4,7 +4,12 @@ import "time"
 
 type Status string
 
-const StatusRouted Status = "ROUTED"
+const (
+	StatusRouted     Status = "ROUTED"
+	StatusProcessing Status = "PROCESSING"
+	StatusCompleted  Status = "COMPLETED"
+	StatusFailed     Status = "FAILED"
+)
 
 type Payment struct {
 	ID               string
@@ -18,6 +23,7 @@ type Payment struct {
 	Hops             []Hop
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+	CompletedAt      *time.Time
 }
 
 type Hop struct {
