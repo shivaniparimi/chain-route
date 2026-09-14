@@ -15,7 +15,7 @@ add_library(chainroute STATIC
 target_include_directories(chainroute PUBLIC include)
 
 if (NOT MSVC)
-    target_compile_options(chainroute PUBLIC -Wall -Wextra -Wpedantic)
+    target_compile_options(chainroute PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 enable_testing()
