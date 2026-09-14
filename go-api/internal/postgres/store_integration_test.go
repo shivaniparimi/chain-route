@@ -5,6 +5,8 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -693,5 +695,187 @@ func TestStalePaymentIDs_FindsOnlyPaymentsPastStaleness(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected stale payment %s to be reported", staleCreated.ID)
+	}
+}
+
+func TestPublishNextOutboxEvent_PublishesAndMarksRow(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-outbox-publish-success"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var publishedEvt OutboxEvent
+	for i := 0; i < 200; i++ {
+		var gotEvt OutboxEvent
+		didPublish, err := s.PublishNextOutboxEvent(context.Background(), func(evt OutboxEvent) error {
+			gotEvt = evt
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		if !didPublish {
+			t.Fatal("queue drained before finding our target row -- test isolation bug")
+		}
+		if gotEvt.PaymentID == created.ID {
+			publishedEvt = gotEvt
+			break
+		}
+	}
+	if publishedEvt.PaymentID != created.ID {
+		t.Fatal("never observed our target payment's outbox event")
+	}
+	if publishedEvt.EventType != "PAYMENT_ROUTED" {
+		t.Fatalf("expected event_type PAYMENT_ROUTED, got %q", publishedEvt.EventType)
+	}
+
+	var publishedAt sql.NullTime
+	row := s.db.QueryRowContext(context.Background(),
+		`SELECT published_at FROM outbox_events WHERE id = $1`, publishedEvt.ID)
+	if err := row.Scan(&publishedAt); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if !publishedAt.Valid {
+		t.Fatal("expected published_at to be set after a successful publish")
+	}
+}
+
+func TestPublishNextOutboxEvent_NoRowsReturnsFalseNoError(t *testing.T) {
+	s := newTestStore(t)
+	// Drain whatever is currently pending (from this or earlier tests).
+	for {
+		didPublish, err := s.PublishNextOutboxEvent(context.Background(), func(OutboxEvent) error { return nil })
+		if err != nil {
+			t.Fatalf("drain: %v", err)
+		}
+		if !didPublish {
+			break
+		}
+	}
+	// The queue is now empty; one more call must be a clean no-op.
+	didPublish, err := s.PublishNextOutboxEvent(context.Background(), func(OutboxEvent) error {
+		t.Fatal("publish should not be called when there is no unpublished row")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil error on an empty queue, got %v", err)
+	}
+	if didPublish {
+		t.Fatal("expected published=false on an empty queue")
+	}
+}
+
+func TestPublishNextOutboxEvent_FailedPublishLeavesRowUnpublishedForRetry(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-outbox-publish-fails-then-retries"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	publishErr := errors.New("simulated publish failure")
+	failedOnce := false
+	sawFailureForTarget := false
+	sawSuccessForTarget := false
+
+	for i := 0; i < 200 && !sawSuccessForTarget; i++ {
+		didPublish, err := s.PublishNextOutboxEvent(context.Background(), func(evt OutboxEvent) error {
+			if evt.PaymentID == created.ID && !failedOnce {
+				failedOnce = true
+				return publishErr
+			}
+			if evt.PaymentID == created.ID {
+				sawSuccessForTarget = true
+			}
+			return nil
+		})
+		if err != nil {
+			if !errors.Is(err, publishErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			sawFailureForTarget = true
+			continue
+		}
+		if !didPublish {
+			break
+		}
+	}
+	if !sawFailureForTarget {
+		t.Fatal("expected to observe the simulated publish failure for the target row")
+	}
+	if !sawSuccessForTarget {
+		t.Fatal("expected the target row to be successfully published on a later pass")
+	}
+}
+
+func TestPublishNextOutboxEvent_ConcurrentPublishersClaimDistinctRows(t *testing.T) {
+	s := newTestStore(t)
+	const n = 8
+	paymentIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("test-outbox-concurrent-%d-%d", i, time.Now().UnixNano())
+		created, _, err := s.CreateOrGetPayment(context.Background(), testPayment(key))
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		paymentIDs[i] = created.ID
+	}
+
+	var mu sync.Mutex
+	published := map[string]int{}
+
+	const workers = 4
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				didPublish, err := s.PublishNextOutboxEvent(context.Background(), func(evt OutboxEvent) error {
+					mu.Lock()
+					published[evt.PaymentID]++
+					mu.Unlock()
+					return nil
+				})
+				if err != nil {
+					t.Errorf("publish: %v", err)
+					return
+				}
+				if !didPublish {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, id := range paymentIDs {
+		if published[id] != 1 {
+			t.Fatalf("expected payment %s to be published exactly once, got %d", id, published[id])
+		}
 	}
 }

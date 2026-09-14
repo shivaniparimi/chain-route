@@ -307,3 +307,65 @@ func (s *Store) StalePaymentIDs(ctx context.Context, staleness time.Duration) ([
 	}
 	return ids, rows.Err()
 }
+
+// OutboxEvent is one row from outbox_events, as seen by a publisher.
+type OutboxEvent struct {
+	ID        string
+	PaymentID string
+	EventType string
+	Payload   []byte
+}
+
+// PublishNextOutboxEvent claims the oldest unpublished outbox row via
+// SELECT ... FOR UPDATE SKIP LOCKED, invokes publish with it while the
+// claiming transaction is held open, and marks the row published only if
+// publish succeeds. published=false, err=nil means there was nothing to
+// claim. If publish returns an error, the transaction rolls back, the row
+// stays unpublished, and a later call will retry it -- this is the
+// accepted at-least-once mechanism (Phase 6 design spec §5, §6): a
+// duplicate publish is possible and is why consumers must be idempotent.
+//
+// The transaction deliberately spans the publish call (an accepted
+// tradeoff, not an oversight -- see the design spec §5): a slow or
+// unavailable Kafka broker will hold one row lock and one pooled
+// connection for the duration of that call. No claimed_at/lease columns
+// are added to decouple this, since SKIP LOCKED already provides mutual
+// exclusion and automatically releases the lock if this process crashes
+// mid-transaction.
+func (s *Store) PublishNextOutboxEvent(ctx context.Context, publish func(OutboxEvent) error) (published bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var evt OutboxEvent
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, payment_id, event_type, payload
+		FROM outbox_events
+		WHERE published_at IS NULL
+		ORDER BY created_at
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`)
+	if err := row.Scan(&evt.ID, &evt.PaymentID, &evt.EventType, &evt.Payload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("claim outbox event: %w", err)
+	}
+
+	if err := publish(evt); err != nil {
+		return false, fmt.Errorf("publish outbox event: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE outbox_events SET published_at = now() WHERE id = $1`, evt.ID); err != nil {
+		return false, fmt.Errorf("mark outbox event published: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit outbox publish: %w", err)
+	}
+
+	return true, nil
+}
