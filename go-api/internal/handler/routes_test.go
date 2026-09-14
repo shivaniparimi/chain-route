@@ -15,12 +15,14 @@ import (
 )
 
 type fakeClient struct {
-	response *routingv1.FindRouteResponse
-	err      error
-	lastReq  *routingv1.FindRouteRequest
+	response  *routingv1.FindRouteResponse
+	err       error
+	lastReq   *routingv1.FindRouteRequest
+	callCount int
 }
 
 func (f *fakeClient) FindRoute(_ context.Context, req *routingv1.FindRouteRequest) (*routingv1.FindRouteResponse, error) {
+	f.callCount++
 	f.lastReq = req
 	return f.response, f.err
 }

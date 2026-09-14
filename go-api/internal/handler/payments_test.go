@@ -21,6 +21,11 @@ type fakePaymentStore struct {
 	getFound      bool
 	getErr        error
 	lastCreate    payment.Payment
+
+	lookupResult  payment.Payment
+	lookupOutcome payment.CreateResult
+	lookupFound   bool
+	lookupErr     error
 }
 
 func (f *fakePaymentStore) CreateOrGetPayment(_ context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error) {
@@ -30,6 +35,10 @@ func (f *fakePaymentStore) CreateOrGetPayment(_ context.Context, p payment.Payme
 
 func (f *fakePaymentStore) GetPayment(_ context.Context, id string) (payment.Payment, bool, error) {
 	return f.getResult, f.getFound, f.getErr
+}
+
+func (f *fakePaymentStore) LookupByIdempotencyKey(_ context.Context, _ payment.Payment) (payment.Payment, payment.CreateResult, bool, error) {
+	return f.lookupResult, f.lookupOutcome, f.lookupFound, f.lookupErr
 }
 
 func doPaymentRequest(h *Handler, method, path, idempotencyKey, body string) *httptest.ResponseRecorder {
@@ -183,6 +192,44 @@ func TestPostPayments_Conflict(t *testing.T) {
 	rec := doPaymentRequest(h, "POST", "/payments", "key-1", validPaymentBody())
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+}
+
+func TestPostPayments_EarlyLookupReplayed_SkipsRouting(t *testing.T) {
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, TotalFee: 2.5}}
+	store := &fakePaymentStore{
+		lookupFound:   true,
+		lookupOutcome: payment.Replayed,
+		lookupResult: payment.Payment{
+			ID: "existing-id", Status: payment.StatusRouted, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: fakeRoute, Store: store}
+	rec := doPaymentRequest(h, "POST", "/payments", "key-1", validPaymentBody())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/payments/existing-id" {
+		t.Fatalf("unexpected Location header: %q", loc)
+	}
+	if fakeRoute.callCount != 0 {
+		t.Fatalf("expected FindRoute not to be called, got %d calls", fakeRoute.callCount)
+	}
+}
+
+func TestPostPayments_EarlyLookupConflict_SkipsRouting(t *testing.T) {
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, TotalFee: 2.5}}
+	store := &fakePaymentStore{
+		lookupFound:   true,
+		lookupOutcome: payment.Conflict,
+	}
+	h := &Handler{Client: fakeRoute, Store: store}
+	rec := doPaymentRequest(h, "POST", "/payments", "key-1", validPaymentBody())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if fakeRoute.callCount != 0 {
+		t.Fatalf("expected FindRoute not to be called, got %d calls", fakeRoute.callCount)
 	}
 }
 

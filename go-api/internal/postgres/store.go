@@ -104,6 +104,32 @@ func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, boo
 	return p, true, nil
 }
 
+// LookupByIdempotencyKey checks whether a payment already exists for this
+// idempotency key WITHOUT calling the routing service. This lets a caller
+// resolve a retry (Replayed or Conflict) before paying for a routing RPC --
+// the same optimization CreateOrGetPayment performs internally, exposed
+// separately so the HTTP handler can check before routing rather than
+// after. found=false means no row exists yet and the caller should proceed
+// to routing.
+func (s *Store) LookupByIdempotencyKey(ctx context.Context, p payment.Payment) (result payment.Payment, outcome payment.CreateResult, found bool, err error) {
+	existing, matches, found, err := s.findByIdempotencyKey(ctx, p)
+	if err != nil {
+		return payment.Payment{}, 0, false, err
+	}
+	if !found {
+		return payment.Payment{}, 0, false, nil
+	}
+	if !matches {
+		return payment.Payment{}, payment.Conflict, true, nil
+	}
+	hops, err := s.hopsForPayment(ctx, existing.ID)
+	if err != nil {
+		return payment.Payment{}, 0, false, err
+	}
+	existing.Hops = hops
+	return existing, payment.Replayed, true, nil
+}
+
 func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error) {
 	// Optimization only, not correctness-critical: skip the routing RPC's
 	// result entirely for the common retry case. If this races with a
@@ -134,10 +160,10 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 		INSERT INTO payments (idempotency_key, source_chain, destination_chain, asset, amount, total_fee)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (idempotency_key) DO NOTHING
-		RETURNING id, created_at, updated_at
+		RETURNING id, amount::text, created_at, updated_at
 	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount, p.TotalFee)
 
-	err = row.Scan(&created.ID, &created.CreatedAt, &created.UpdatedAt)
+	err = row.Scan(&created.ID, &created.Amount, &created.CreatedAt, &created.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Lost the race: a concurrent request already created this key.
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
@@ -182,7 +208,6 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 	created.SourceChain = p.SourceChain
 	created.DestinationChain = p.DestinationChain
 	created.Asset = p.Asset
-	created.Amount = p.Amount
 	created.Status = payment.StatusRouted
 	created.TotalFee = p.TotalFee
 	created.Hops = p.Hops

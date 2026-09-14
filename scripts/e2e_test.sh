@@ -5,10 +5,18 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CPP_PORT=50098
 HTTP_PORT=8099
 SEED=1001
+PAYMENT_IDEMPOTENCY_KEY="e2e-test-key-$$-$(date +%s)"
+
+DATABASE_URL="${DATABASE_URL:-postgres://$(whoami)@localhost:5432/chainroute?sslmode=disable}"
+export DATABASE_URL
 
 cleanup() {
     [[ -n "${GO_PID:-}" ]] && kill "$GO_PID" 2>/dev/null || true
     [[ -n "${CPP_PID:-}" ]] && kill "$CPP_PID" 2>/dev/null || true
+    if [[ -n "${DATABASE_URL:-}" ]]; then
+        /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
+            "DELETE FROM payments WHERE idempotency_key = '$PAYMENT_IDEMPOTENCY_KEY'" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
@@ -98,6 +106,11 @@ fi
 
 kill -0 "$CPP_PID" 2>/dev/null || { echo "C++ service exited before becoming ready" >&2; exit 1; }
 
+echo "Ensuring database schema is up to date..."
+/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
+    "SELECT 1 FROM information_schema.tables WHERE table_name='payments'" | grep -q 1 || \
+    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0001_create_payments.sql"
+
 echo "Starting Go service on :$HTTP_PORT..."
 "$ROOT_DIR/go-api/server" \
     --http-addr=":$HTTP_PORT" --grpc-addr="127.0.0.1:$CPP_PORT" &
@@ -128,5 +141,59 @@ STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$HTTP_
     -d '{"source_chain":"ethereum","destination_chain":"ethereum","asset":"USDC","amount":1000}')
 [[ "$STATUS" == "400" ]] || { echo "FAIL: expected 400, got $STATUS"; exit 1; }
 echo "OK: got 400"
+
+echo "Test 4: POST /payments creates a payment"
+CREATE_STATUS=$(curl -s -o /tmp/e2e_create_body.json -w "%{http_code}" -X POST "http://127.0.0.1:$HTTP_PORT/payments" \
+    -H "Content-Type: application/json" -H "Idempotency-Key: $PAYMENT_IDEMPOTENCY_KEY" \
+    -d '{"source_chain":"ethereum","destination_chain":"base","asset":"USDC","amount":"1000.00"}')
+PAYMENT_RESPONSE=$(cat /tmp/e2e_create_body.json)
+rm -f /tmp/e2e_create_body.json
+echo "$PAYMENT_RESPONSE"
+[[ "$CREATE_STATUS" == "201" ]] || { echo "FAIL: expected 201, got $CREATE_STATUS"; exit 1; }
+echo "$PAYMENT_RESPONSE" | grep -q '"status":"ROUTED"' || { echo "FAIL: expected status ROUTED"; exit 1; }
+PAYMENT_ID=$(echo "$PAYMENT_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+[[ -n "$PAYMENT_ID" ]] || { echo "FAIL: no payment id in response"; exit 1; }
+echo "OK: created payment $PAYMENT_ID with 201"
+
+echo "Test 5: GET /payments/{id} reads it back"
+GET_RESPONSE=$(curl -s "http://127.0.0.1:$HTTP_PORT/payments/$PAYMENT_ID")
+echo "$GET_RESPONSE" | grep -q "\"id\":\"$PAYMENT_ID\"" || { echo "FAIL: GET did not return the same payment"; exit 1; }
+echo "OK"
+
+echo "Test 6: replaying the same Idempotency-Key returns 200 with the same payment"
+REPLAY_STATUS=$(curl -s -o /tmp/e2e_replay_body.json -w "%{http_code}" -X POST "http://127.0.0.1:$HTTP_PORT/payments" \
+    -H "Content-Type: application/json" -H "Idempotency-Key: $PAYMENT_IDEMPOTENCY_KEY" \
+    -d '{"source_chain":"ethereum","destination_chain":"base","asset":"USDC","amount":"1000.00"}')
+[[ "$REPLAY_STATUS" == "200" ]] || { echo "FAIL: expected 200 on replay, got $REPLAY_STATUS"; exit 1; }
+grep -q "\"id\":\"$PAYMENT_ID\"" /tmp/e2e_replay_body.json || { echo "FAIL: replay returned a different payment"; exit 1; }
+rm -f /tmp/e2e_replay_body.json
+echo "OK: replay returned the same payment with 200"
+
+echo "Test 7: same Idempotency-Key with a different body returns 409"
+CONFLICT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$HTTP_PORT/payments" \
+    -H "Content-Type: application/json" -H "Idempotency-Key: $PAYMENT_IDEMPOTENCY_KEY" \
+    -d '{"source_chain":"ethereum","destination_chain":"base","asset":"USDC","amount":"2000.00"}')
+[[ "$CONFLICT_STATUS" == "409" ]] || { echo "FAIL: expected 409, got $CONFLICT_STATUS"; exit 1; }
+echo "OK: got 409"
+
+echo "Test 8: missing Idempotency-Key returns 400"
+NOKEY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$HTTP_PORT/payments" \
+    -H "Content-Type: application/json" \
+    -d '{"source_chain":"ethereum","destination_chain":"base","asset":"USDC","amount":"1000.00"}')
+[[ "$NOKEY_STATUS" == "400" ]] || { echo "FAIL: expected 400, got $NOKEY_STATUS"; exit 1; }
+echo "OK: got 400"
+
+echo "Test 9: payment survives a Go process restart"
+kill -TERM "$GO_PID"
+wait "$GO_PID" 2>/dev/null || true
+
+"$ROOT_DIR/go-api/server" \
+    --http-addr=":$HTTP_PORT" --grpc-addr="127.0.0.1:$CPP_PORT" &
+GO_PID=$!
+sleep 1
+
+RESTART_RESPONSE=$(curl -s "http://127.0.0.1:$HTTP_PORT/payments/$PAYMENT_ID")
+echo "$RESTART_RESPONSE" | grep -q "\"id\":\"$PAYMENT_ID\"" || { echo "FAIL: payment not found after restart"; exit 1; }
+echo "OK: payment $PAYMENT_ID still readable after Go process restart"
 
 echo "All E2E checks passed."
