@@ -82,7 +82,7 @@ func toPaymentResponse(p payment.Payment) paymentResponse {
 		ID: p.ID, SourceChain: p.SourceChain, DestinationChain: p.DestinationChain,
 		Asset: p.Asset, Amount: p.Amount, Status: string(p.Status), TotalFee: p.TotalFee,
 		Hops: hops, CreatedAt: p.CreatedAt.UTC().Format(time.RFC3339Nano),
-		UpdatedAt: p.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:   p.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		CompletedAt: completedAt,
 	}
 }

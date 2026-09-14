@@ -836,14 +836,21 @@ func TestPublishNextOutboxEvent_ConcurrentPublishersClaimDistinctRows(t *testing
 	s := newTestStore(t)
 	const n = 8
 	paymentIDs := make([]string, n)
+	keys := make([]string, n)
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("test-outbox-concurrent-%d-%d", i, time.Now().UnixNano())
+		keys[i] = key
 		created, _, err := s.CreateOrGetPayment(context.Background(), testPayment(key))
 		if err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
 		paymentIDs[i] = created.ID
 	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			s.db.ExecContext(context.Background(), `DELETE FROM payments WHERE idempotency_key = $1`, key)
+		}
+	})
 
 	var mu sync.Mutex
 	published := map[string]int{}

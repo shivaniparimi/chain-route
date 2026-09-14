@@ -22,7 +22,7 @@ func NewProducer(brokers []string, topic string) *Producer {
 			Addr:         kafkago.TCP(brokers...),
 			Topic:        topic,
 			Balancer:     &kafkago.Hash{},
-			RequiredAcks: kafkago.RequireOne,
+			RequiredAcks: kafkago.RequireAll,
 			// kafka-go's Writer defaults to a 1s BatchTimeout, which is
 			// tuned for high-throughput batched producers -- payment
 			// events are latency-sensitive and typically published one
