@@ -19,6 +19,7 @@ type RoutingClient interface {
 
 type Handler struct {
 	Client RoutingClient
+	Store  PaymentStore
 }
 
 type findRouteRequest struct {

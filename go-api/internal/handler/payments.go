@@ -1,0 +1,219 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
+	"chainroute/go-api/internal/payment"
+)
+
+var amountPattern = regexp.MustCompile(`^\d{1,20}(\.\d{1,18})?$`)
+
+const maxIdempotencyKeyLength = 255
+
+type PaymentStore interface {
+	CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error)
+	GetPayment(ctx context.Context, id string) (payment.Payment, bool, error)
+}
+
+var assetNameByValue = map[routingv1.Asset]string{
+	routingv1.Asset_ASSET_USDC: "USDC",
+	routingv1.Asset_ASSET_ETH:  "ETH",
+}
+
+type createPaymentRequest struct {
+	SourceChain      string `json:"source_chain"`
+	DestinationChain string `json:"destination_chain"`
+	Asset            string `json:"asset"`
+	Amount           string `json:"amount"`
+}
+
+type hopResponse struct {
+	HopIndex    int     `json:"hop_index"`
+	FromChain   string  `json:"from_chain"`
+	ToChain     string  `json:"to_chain"`
+	BridgeName  string  `json:"bridge_name"`
+	Fee         float64 `json:"fee"`
+	LatencyMs   float64 `json:"latency_ms"`
+	Liquidity   float64 `json:"liquidity"`
+	Reliability float64 `json:"reliability"`
+}
+
+type paymentResponse struct {
+	ID               string        `json:"id"`
+	SourceChain      string        `json:"source_chain"`
+	DestinationChain string        `json:"destination_chain"`
+	Asset            string        `json:"asset"`
+	Amount           string        `json:"amount"`
+	Status           string        `json:"status"`
+	TotalFee         float64       `json:"total_fee"`
+	Hops             []hopResponse `json:"hops"`
+	CreatedAt        string        `json:"created_at"`
+	UpdatedAt        string        `json:"updated_at"`
+}
+
+func toPaymentResponse(p payment.Payment) paymentResponse {
+	hops := make([]hopResponse, 0, len(p.Hops))
+	for _, h := range p.Hops {
+		hops = append(hops, hopResponse{
+			HopIndex: h.HopIndex, FromChain: h.FromChain, ToChain: h.ToChain,
+			BridgeName: h.BridgeName, Fee: h.Fee, LatencyMs: h.LatencyMs,
+			Liquidity: h.Liquidity, Reliability: h.Reliability,
+		})
+	}
+	return paymentResponse{
+		ID: p.ID, SourceChain: p.SourceChain, DestinationChain: p.DestinationChain,
+		Asset: p.Asset, Amount: p.Amount, Status: string(p.Status), TotalFee: p.TotalFee,
+		Hops: hops, CreatedAt: p.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt: p.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func isZeroAmount(amount string) bool {
+	for _, r := range amount {
+		if r != '0' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
+	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+	if len(idempotencyKey) > maxIdempotencyKeyLength {
+		writeError(w, http.StatusBadRequest, "Idempotency-Key exceeds maximum length")
+		return
+	}
+
+	var req createPaymentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	sourceChain, ok := chainByName[strings.ToLower(req.SourceChain)]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid chain: "+req.SourceChain)
+		return
+	}
+	destChain, ok := chainByName[strings.ToLower(req.DestinationChain)]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid chain: "+req.DestinationChain)
+		return
+	}
+	asset, ok := assetByName[strings.ToLower(req.Asset)]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid asset: "+req.Asset)
+		return
+	}
+	if !amountPattern.MatchString(req.Amount) || isZeroAmount(req.Amount) {
+		writeError(w, http.StatusBadRequest,
+			"amount must be a positive decimal with at most 20 integer digits and 18 fractional digits")
+		return
+	}
+	if sourceChain == destChain {
+		writeError(w, http.StatusBadRequest, "source and destination must differ")
+		return
+	}
+
+	// This float64 conversion feeds only the pre-existing (Phase 2-4,
+	// unmodified) FindRouteRequest.amount `double` field, which has
+	// always been a liquidity-filter threshold for the C++ simulator --
+	// never the authoritative amount. req.Amount (the exact string) is
+	// what gets persisted below, untouched by this conversion.
+	amountForRouting, err := strconv.ParseFloat(req.Amount, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid amount")
+		return
+	}
+
+	grpcReq := &routingv1.FindRouteRequest{
+		SourceChain: sourceChain, DestinationChain: destChain,
+		Asset: asset, Amount: amountForRouting,
+	}
+
+	resp, err := h.Client.FindRoute(r.Context(), grpcReq)
+	if err != nil {
+		st, _ := status.FromError(err)
+		switch st.Code() {
+		case codes.InvalidArgument:
+			log.Printf("WARNING: routing service rejected a request that passed Go validation (possible validation drift): %v", st.Message())
+			writeError(w, http.StatusBadRequest, st.Message())
+		case codes.Unavailable:
+			writeError(w, http.StatusServiceUnavailable, "routing service unavailable")
+		case codes.DeadlineExceeded:
+			writeError(w, http.StatusGatewayTimeout, "routing service timed out")
+		default:
+			log.Printf("ERROR: routing service call failed: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
+	if !resp.GetRouteFound() {
+		writeError(w, http.StatusUnprocessableEntity, "no route available for the requested payment")
+		return
+	}
+
+	hops := make([]payment.Hop, 0, len(resp.GetHops()))
+	for i, hop := range resp.GetHops() {
+		hops = append(hops, payment.Hop{
+			HopIndex: i, FromChain: chainNameByValue[hop.GetFromChain()], ToChain: chainNameByValue[hop.GetToChain()],
+			BridgeName: hop.GetBridgeName(), Fee: hop.GetFee(), LatencyMs: hop.GetLatencyMs(),
+			Liquidity: hop.GetLiquidity(), Reliability: hop.GetReliability(),
+		})
+	}
+
+	candidate := payment.Payment{
+		IdempotencyKey: idempotencyKey, SourceChain: chainNameByValue[sourceChain],
+		DestinationChain: chainNameByValue[destChain], Asset: assetNameByValue[asset],
+		Amount: req.Amount, TotalFee: resp.GetTotalFee(), Hops: hops,
+	}
+
+	result, outcome, err := h.Store.CreateOrGetPayment(r.Context(), candidate)
+	if err != nil {
+		log.Printf("ERROR: failed to persist payment: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	switch outcome {
+	case payment.Created:
+		w.Header().Set("Location", "/payments/"+result.ID)
+		writeJSON(w, http.StatusCreated, toPaymentResponse(result))
+	case payment.Replayed:
+		w.Header().Set("Location", "/payments/"+result.ID)
+		writeJSON(w, http.StatusOK, toPaymentResponse(result))
+	case payment.Conflict:
+		writeError(w, http.StatusConflict, "Idempotency-Key already used with a different request")
+	}
+}
+
+func (h *Handler) GetPayment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	p, found, err := h.Store.GetPayment(r.Context(), id)
+	if err != nil {
+		log.Printf("ERROR: failed to read payment: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "payment not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, toPaymentResponse(p))
+}
