@@ -147,6 +147,20 @@ func (r *Reconciler) checkAndUpdateOutcome(ctx context.Context, exec payment.Exe
 	if exec.SignedTxHash == nil {
 		return fmt.Errorf("execution %s is marked broadcast but has no signed_tx_hash", exec.ID)
 	}
+
+	// Crash-point repair (review Finding 1): DriveExecutionForward performs
+	// MarkExecutionBroadcast then MarkSubmitted as two separate statements.
+	// If the process died in between, this execution row is exactly what we
+	// see here -- broadcast_at set -- while the payment itself is still
+	// durably stuck PROCESSING, and driveStaleNotYetBroadcast deliberately
+	// skips any candidate with BroadcastAt set (it's handled here instead).
+	// Repair it before doing anything else: MarkSubmitted's own
+	// WHERE status = 'PROCESSING' guard makes this a safe no-op if the
+	// payment is already SUBMITTED.
+	if _, err := r.Store.MarkSubmitted(ctx, exec.PaymentID); err != nil {
+		return fmt.Errorf("repair submitted status for payment %s: %w", exec.PaymentID, err)
+	}
+
 	hash := common.HexToHash(*exec.SignedTxHash)
 
 	receipt, err := r.OriginClient.TransactionReceipt(ctx, hash)
@@ -188,8 +202,22 @@ func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, e
 	if err := r.Store.UpdateExecutionExternalStatus(ctx, exec.ID, external, confirmedAt); err != nil {
 		return fmt.Errorf("record %s: %w", external, err)
 	}
-	if _, err := r.Store.CompleteSubmittedPayment(ctx, exec.PaymentID, terminal); err != nil {
+	completed, err := r.Store.CompleteSubmittedPayment(ctx, exec.PaymentID, terminal)
+	if err != nil {
 		return fmt.Errorf("complete payment as %s: %w", terminal, err)
+	}
+	if !completed {
+		// completed=false means CompleteSubmittedPayment's own
+		// WHERE status = 'SUBMITTED' guard affected zero rows even though
+		// we just made a definitive terminal observation on-chain/via
+		// Across. That should be unreachable -- checkAndUpdateOutcome
+		// always repairs PROCESSING -> SUBMITTED via MarkSubmitted first --
+		// so silently discarding this (review Finding 1) would hide a
+		// genuine state-machine bug or double-completion race. Log loudly
+		// rather than error: the terminal observation itself was already
+		// recorded above, and erroring here would just cause the sweep to
+		// retry an update that will never succeed.
+		log.Printf("ERROR: reconciler: CompleteSubmittedPayment(payment=%s, execution=%s, terminal=%s) affected no rows despite a definitive terminal observation (%s) -- the payment was not in SUBMITTED status; this indicates an unexpected state transition and needs investigation", exec.PaymentID, exec.ID, terminal, external)
 	}
 	return nil
 }

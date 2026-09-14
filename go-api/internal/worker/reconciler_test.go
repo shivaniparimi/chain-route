@@ -23,6 +23,13 @@ type fakeReconcilerStore struct {
 	completeCalls     []payment.Status
 	lowestNonce       int64
 	lowestNonceFound  bool
+
+	// completeSubmittedFails, when true, makes CompleteSubmittedPayment
+	// report completed=false (as if its own WHERE status = 'SUBMITTED'
+	// guard affected no rows) instead of the default success. Named so its
+	// Go zero value (false) preserves every existing test's behavior
+	// unmodified -- the fake still returns (true, nil) by default.
+	completeSubmittedFails bool
 }
 
 func (f *fakeReconcilerStore) GetExecutionByPaymentID(ctx context.Context, paymentID string) (payment.Execution, bool, error) {
@@ -41,6 +48,9 @@ func (f *fakeReconcilerStore) UpdateExecutionExternalStatus(ctx context.Context,
 }
 func (f *fakeReconcilerStore) CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error) {
 	f.completeCalls = append(f.completeCalls, terminal)
+	if f.completeSubmittedFails {
+		return false, nil
+	}
 	return true, nil
 }
 func (f *fakeReconcilerStore) LowestUnconfirmedNonce(ctx context.Context, walletAddress string) (int64, bool, error) {
@@ -135,6 +145,60 @@ func TestCheckAndUpdateOutcome_TransientPollFailureDoesNotFailPayment(t *testing
 	}
 	if len(store.completeCalls) != 0 {
 		t.Fatal("a transient/not-yet-mined poll must never produce a terminal transition")
+	}
+}
+
+// TestCheckAndUpdateOutcome_RepairsBroadcastButNotYetSubmittedPayment is the
+// regression test for review Finding 1: a payment_executions row that has
+// broadcast_at set (DriveExecutionForward's MarkExecutionBroadcast already
+// ran) but whose payment is still durably PROCESSING (the process died
+// before DriveExecutionForward's subsequent MarkSubmitted call) must be
+// repaired to SUBMITTED by checkAndUpdateOutcome -- driveStaleNotYetBroadcast
+// deliberately skips exactly this case (BroadcastAt != nil), so this is the
+// only remaining place that can ever call MarkSubmitted for it. This is
+// asserted here regardless of what the receipt lookup finds (no receipt
+// yet, in this test), since the repair must happen before -- not
+// conditioned on -- the rest of the terminal-status logic.
+func TestCheckAndUpdateOutcome_RepairsBroadcastButNotYetSubmittedPayment(t *testing.T) {
+	hash := "0x5555555555555555555555555555555555555555555555555555555555555555"
+	store := &fakeReconcilerStore{}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{}} // not yet mined
+	r := &Reconciler{Store: store, OriginClient: ethClient, Across: newTestAcrossServer(t), OriginChainID: 11155111, Staleness: time.Hour}
+
+	exec := payment.Execution{ID: "exec-repair", PaymentID: "pay-repair", SignedTxHash: &hash, BroadcastAt: timePtr()}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !store.submittedCalled {
+		t.Fatal("expected checkAndUpdateOutcome to call MarkSubmitted to repair a broadcast-but-still-PROCESSING payment, even when the receipt isn't mined yet")
+	}
+}
+
+// TestMarkTerminal_LogsRatherThanErrorsWhenCompleteSubmittedPaymentReturnsFalse
+// covers the other half of review Finding 1's fix: markTerminal must no
+// longer silently discard CompleteSubmittedPayment's returned bool. A
+// completed=false result (the payment wasn't SUBMITTED when a definitive
+// terminal observation was made) should be logged loudly, not swallowed --
+// but also must not itself be treated as a hard error, since the terminal
+// observation (UpdateExecutionExternalStatus) was already durably recorded
+// and there is nothing to retry.
+func TestMarkTerminal_LogsRatherThanErrorsWhenCompleteSubmittedPaymentReturnsFalse(t *testing.T) {
+	hash := "0x6666666666666666666666666666666666666666666666666666666666666666"
+	store := &fakeReconcilerStore{completeSubmittedFails: true}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{
+		common.HexToHash(hash): {Status: 0}, // reverted -- reaches markTerminal directly
+	}}
+	r := &Reconciler{Store: store, OriginClient: ethClient, Across: newTestAcrossServer(t), OriginChainID: 11155111, Staleness: time.Hour}
+
+	exec := payment.Execution{ID: "exec-mismatch", PaymentID: "pay-mismatch", SignedTxHash: &hash}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("a false return from CompleteSubmittedPayment must be logged, not surfaced as an error: %v", err)
+	}
+	if len(store.updateStatusCalls) != 1 || store.updateStatusCalls[0] != payment.ExternalStatusReverted {
+		t.Fatalf("expected the terminal observation to still be recorded, got %v", store.updateStatusCalls)
+	}
+	if len(store.completeCalls) != 1 || store.completeCalls[0] != payment.StatusFailed {
+		t.Fatalf("expected CompleteSubmittedPayment to still be called exactly once, got %v", store.completeCalls)
 	}
 }
 
