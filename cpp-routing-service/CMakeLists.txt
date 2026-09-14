@@ -38,14 +38,23 @@ add_library(chainroute_proto STATIC ${PROTO_SRCS} ${GRPC_SRCS})
 target_include_directories(chainroute_proto PUBLIC ${PROTO_GEN_DIR})
 target_link_libraries(chainroute_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
 
+add_library(chainroute_service_lib STATIC
+    src/chain_asset_convert.cpp
+)
+target_include_directories(chainroute_service_lib PUBLIC include)
+target_link_libraries(chainroute_service_lib PUBLIC chainroute chainroute_proto)
+if (NOT MSVC)
+    target_compile_options(chainroute_service_lib PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(chainroute_service_server src/main.cpp)
-target_link_libraries(chainroute_service_server PRIVATE chainroute_proto)
+target_link_libraries(chainroute_service_server PRIVATE chainroute_service_lib chainroute_proto)
 
 if (NOT MSVC)
     target_compile_options(chainroute_proto PRIVATE -w)  # generated code, not ours
     target_compile_options(chainroute_service_server PRIVATE -Wall -Wextra -Wpedantic)
-    # Future project-code targets added here (e.g. chainroute_service_lib,
-    # chainroute_service_tests) should apply the same -Wall -Wextra -Wpedantic flags.
+    # Future project-code targets added here (e.g. chainroute_service_tests)
+    # should apply the same -Wall -Wextra -Wpedantic flags.
 endif()
 
 enable_testing()
