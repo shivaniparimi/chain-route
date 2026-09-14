@@ -121,6 +121,9 @@ echo "Ensuring database schema is up to date..."
 /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
     "SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_payment_id_fkey' AND confdeltype = 'c'" | grep -q 1 || \
     /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0003_outbox_events_cascade_delete.sql"
+/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
+    "SELECT 1 FROM information_schema.tables WHERE table_name='payment_executions'" | grep -q 1 || \
+    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0004_across_testnet_execution.sql"
 
 # Resolve a way to talk to Redpanda's rpk. The upstream project ships rpk
 # directly on PATH when Redpanda is installed natively (e.g. via Homebrew),
