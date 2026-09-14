@@ -12,13 +12,24 @@ import (
 // and JSON tags are taken directly from a live captured response (see
 // quote_test.go's realSuggestedFeesFixture), not guessed from docs alone.
 type SuggestedFeesResponse struct {
-	OutputAmount        string `json:"outputAmount"`
-	FillDeadline        string `json:"fillDeadline"`
-	ExclusivityDeadline int64  `json:"exclusivityDeadline"`
-	ExclusiveRelayer    string `json:"exclusiveRelayer"`
-	Timestamp           string `json:"timestamp"`
-	SpokePoolAddress    string `json:"spokePoolAddress"`
-	IsAmountTooLow      bool   `json:"isAmountTooLow"`
+	OutputAmount        string         `json:"outputAmount"`
+	FillDeadline        string         `json:"fillDeadline"`
+	ExclusivityDeadline int64          `json:"exclusivityDeadline"`
+	ExclusiveRelayer    string         `json:"exclusiveRelayer"`
+	Timestamp           string         `json:"timestamp"`
+	SpokePoolAddress    string         `json:"spokePoolAddress"`
+	IsAmountTooLow      bool           `json:"isAmountTooLow"`
+	InputToken          QuoteTokenInfo `json:"inputToken"`
+	OutputToken         QuoteTokenInfo `json:"outputToken"`
+}
+
+// QuoteTokenInfo echoes the token/chain the quote was actually computed
+// for -- used to validate the response matches what was requested before
+// any of it flows into a signing call (design spec §21).
+type QuoteTokenInfo struct {
+	Address  string `json:"address"`
+	ChainID  int64  `json:"chainId"`
+	Decimals int    `json:"decimals"`
 }
 
 // SuggestedFees calls GET /suggested-fees. Per the Across docs (confirmed
