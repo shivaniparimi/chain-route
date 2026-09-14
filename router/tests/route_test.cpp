@@ -113,5 +113,36 @@ TEST(RouteTest, ReturnsNulloptForIsolatedDestination) {
     EXPECT_FALSE(route.has_value());
 }
 
+TEST(RouteTest, PicksCheaperOfTwoParallelEdges) {
+    Graph graph;
+    const NodeIndex ethUsdc = graph.addNode(Node{ChainId::Ethereum, AssetId::USDC});
+    const NodeIndex baseUsdc = graph.addNode(Node{ChainId::Base, AssetId::USDC});
+
+    graph.addEdge(ethUsdc, Edge{baseUsdc, "ExpensiveBridge", 5.0, 500.0, 1000000.0, 0.99});
+    graph.addEdge(ethUsdc, Edge{baseUsdc, "CheapBridge", 2.0, 1500.0, 1000000.0, 0.95});
+
+    const auto route = findCheapestRoute(graph, ethUsdc, baseUsdc, 1000.0);
+
+    ASSERT_TRUE(route.has_value());
+    EXPECT_DOUBLE_EQ(route->totalFee, 2.0);
+    ASSERT_EQ(route->edges.size(), 1u);
+    EXPECT_EQ(route->edges[0].bridgeName, "CheapBridge");
+}
+
+TEST(RouteTest, ThrowsOnInvalidSourceIndex) {
+    Graph graph;
+    graph.addNode(Node{ChainId::Ethereum, AssetId::USDC});
+    const NodeIndex baseUsdc = graph.addNode(Node{ChainId::Base, AssetId::USDC});
+
+    EXPECT_THROW(findCheapestRoute(graph, 42, baseUsdc, 1000.0), std::out_of_range);
+}
+
+TEST(RouteTest, ThrowsOnInvalidDestinationIndex) {
+    Graph graph;
+    const NodeIndex ethUsdc = graph.addNode(Node{ChainId::Ethereum, AssetId::USDC});
+
+    EXPECT_THROW(findCheapestRoute(graph, ethUsdc, 42, 1000.0), std::out_of_range);
+}
+
 }  // namespace
 }  // namespace chainroute
