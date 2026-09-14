@@ -297,22 +297,25 @@ TEST(NetworkSimulatorTest, CheapestRouteChangesAcrossTicks) {
 TEST(NetworkSimulatorTest, LiquidityChangeInvalidatesAPreviouslyEligibleRoute) {
     // Fixture pinned from a development-time search (Task 4, plan step 2).
     //
-    // amount is deliberately set to the exact tick-0 liquidity of the
-    // Ethereum-USDC -> Optimism-USDC "Hop#2" edge (seed=1001). At that
-    // amount, Hop#2 is the ONLY eligible direct edge between this pair at
-    // tick 0 (the cheaper Stargate#1 and Wormhole#3 edges both have lower
-    // liquidity than `amount` and are excluded), so Hop#2 -- despite not
-    // being the cheapest fee -- is chosen. By tick 1, Hop#2's own
-    // liquidity noise has dropped it (2002813.4593519256) below `amount`,
-    // so it too becomes ineligible; no other direct or multi-hop path
-    // exists at this amount, so the route disappears entirely. This was
-    // confirmed causally: the same bridge (matched by name and target) is
-    // the one, and only one, edge whose liquidity crosses below `amount`
-    // between these two ticks.
+    // amount sits strictly between the Ethereum-USDC -> Optimism-USDC
+    // "Hop#2" edge's tick-0 liquidity (~2010510.8658421615) and its tick-1
+    // liquidity (~2002813.4593519256), with real margin on both sides
+    // (deliberately not pinned to either boundary, since the metric
+    // computation pipeline is not guaranteed bit-portable across
+    // compilers/optimization levels). At this amount, Hop#2 is the ONLY
+    // eligible direct edge between this pair at tick 0 (the cheaper
+    // Stargate#1 and Wormhole#3 edges both have lower liquidity than
+    // `amount` and are excluded), so Hop#2 -- despite not being the
+    // cheapest fee -- is chosen. By tick 1, Hop#2's own liquidity noise has
+    // dropped it below `amount`, so it too becomes ineligible; no other
+    // direct or multi-hop path exists at this amount, so the route
+    // disappears entirely. This was confirmed causally: the same bridge
+    // (matched by name and target) is the one, and only one, edge whose
+    // liquidity crosses below `amount` between these two ticks.
     NetworkSimulator sim(1001);
     const Node sourceNode{ChainId::Ethereum, AssetId::USDC};
     const Node destNode{ChainId::Optimism, AssetId::USDC};
-    const double amount = 2010510.8658421615;
+    const double amount = 2006000.0;
 
     // tickA = 0: no ticks advanced yet.
     const Graph gA = sim.snapshot();

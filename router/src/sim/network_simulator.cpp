@@ -17,6 +17,19 @@ constexpr std::array<ChainId, 5> kChains = {
 constexpr std::array<AssetId, 2> kAssets = {
     AssetId::USDC, AssetId::ETH,
 };
+
+// snapshot() below builds nodeIndex[assetIdx][chainIdx] by iterating
+// *positions* in kChains, but edge lookup reads it back via
+// static_cast<std::size_t>(bridge.source.chain) -- i.e. the raw ChainId
+// enum value used directly as an index. That is only correct if kChains is
+// in ChainId's exact enum-declaration order (kChains[i] == ChainId(i) for
+// every i). These static_asserts fail to compile if kChains is ever
+// reordered without updating the cast-based lookup to match.
+static_assert(kChains[0] == static_cast<ChainId>(0), "kChains must be in ChainId enum-declaration order");
+static_assert(kChains[1] == static_cast<ChainId>(1), "kChains must be in ChainId enum-declaration order");
+static_assert(kChains[2] == static_cast<ChainId>(2), "kChains must be in ChainId enum-declaration order");
+static_assert(kChains[3] == static_cast<ChainId>(3), "kChains must be in ChainId enum-declaration order");
+static_assert(kChains[4] == static_cast<ChainId>(4), "kChains must be in ChainId enum-declaration order");
 constexpr std::array<const char*, 6> kBridgeNamePool = {
     "Stargate", "Wormhole", "Across", "Hop", "Synapse", "Celer",
 };
@@ -54,6 +67,10 @@ std::size_t assetIndexOf(AssetId asset) {
 std::uint64_t pairKey(ChainId source, ChainId target) {
     return static_cast<std::uint64_t>(source) * 8 + static_cast<std::uint64_t>(target);
 }
+// pairKey's radix (8, above) must stay strictly greater than the number of
+// ChainId values for the packing to remain collision-free. Fails to
+// compile the moment the chain set grows past what radix 8 supports.
+static_assert(kChains.size() < 8, "pairKey's radix-8 packing requires kChains.size() < 8");
 
 double clamp(double value, double lo, double hi) {
     if (value < lo) return lo;
