@@ -1,0 +1,51 @@
+# Secrets and credentials — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials.json
+credentials.yaml
+secrets.json
+secrets.yaml
+*.pgpass
+.netrc
+
+# Build output (subdirectory .gitignores already cover router/build/,
+# cpp-routing-service/build/, go-api/server — this is a repo-wide catch-all
+# for any future build directory)
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Claude Code local session/worktree state — not project source
+.claude/
