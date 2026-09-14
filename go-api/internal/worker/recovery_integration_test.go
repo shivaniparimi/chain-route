@@ -56,7 +56,7 @@ func TestRecovery_CompletesStalePaymentDirectly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if claimed, err := store.ClaimPayment(context.Background(), created.ID); err != nil || !claimed {
+	if claimed, _, err := store.ClaimPayment(context.Background(), created.ID); err != nil || !claimed {
 		t.Fatalf("claim: claimed=%v err=%v", claimed, err)
 	}
 	backdatePaymentUpdatedAt(t, created.ID, 10*time.Minute)
@@ -111,7 +111,7 @@ func TestRecovery_StalledWorkerVsSweepRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	claimed, err := store.ClaimPayment(context.Background(), created.ID)
+	claimed, _, err := store.ClaimPayment(context.Background(), created.ID)
 	if err != nil || !claimed {
 		t.Fatalf("claim: claimed=%v err=%v", claimed, err)
 	}

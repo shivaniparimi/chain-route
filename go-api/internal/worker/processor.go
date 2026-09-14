@@ -11,7 +11,7 @@ import (
 
 // PaymentStore is the subset of *postgres.Store the processor needs.
 type PaymentStore interface {
-	ClaimPayment(ctx context.Context, paymentID string) (bool, error)
+	ClaimPayment(ctx context.Context, paymentID string) (bool, payment.ExecutionMode, error)
 	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
 }
 
@@ -31,7 +31,7 @@ type Processor struct {
 // special-case: whichever of the two wins CompletePayment's guard is the
 // one that persists.
 func (p *Processor) HandleRoutedPayment(ctx context.Context, evt events.RoutedPayment) error {
-	claimed, err := p.Store.ClaimPayment(ctx, evt.PaymentID)
+	claimed, _, err := p.Store.ClaimPayment(ctx, evt.PaymentID)
 	if err != nil {
 		return fmt.Errorf("claim payment %s: %w", evt.PaymentID, err)
 	}

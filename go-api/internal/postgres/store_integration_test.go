@@ -418,7 +418,7 @@ func TestClaimPayment_TransitionsRoutedToProcessing(t *testing.T) {
 		t.Fatalf("create: outcome=%v err=%v", outcome, err)
 	}
 
-	claimed, err := s.ClaimPayment(context.Background(), created.ID)
+	claimed, _, err := s.ClaimPayment(context.Background(), created.ID)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
@@ -453,11 +453,11 @@ func TestClaimPayment_NoOpIfNotRouted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+	if _, _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 
-	claimedAgain, err := s.ClaimPayment(context.Background(), created.ID)
+	claimedAgain, _, err := s.ClaimPayment(context.Background(), created.ID)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -494,7 +494,7 @@ func TestClaimPayment_ConcurrentClaimsSucceedExactlyOnce(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			claimed, err := s.ClaimPayment(context.Background(), created.ID)
+			claimed, _, err := s.ClaimPayment(context.Background(), created.ID)
 			if err != nil {
 				t.Errorf("goroutine %d: %v", i, err)
 				return
@@ -534,7 +534,7 @@ func TestCompletePayment_TransitionsProcessingToTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+	if _, _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
@@ -604,7 +604,7 @@ func TestCompletePayment_ConcurrentCompletionsSucceedExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+	if _, _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
@@ -667,10 +667,10 @@ func TestStalePaymentIDs_FindsOnlyPaymentsPastStaleness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fresh: %v", err)
 	}
-	if _, err := s.ClaimPayment(context.Background(), staleCreated.ID); err != nil {
+	if _, _, err := s.ClaimPayment(context.Background(), staleCreated.ID); err != nil {
 		t.Fatalf("claim stale: %v", err)
 	}
-	if _, err := s.ClaimPayment(context.Background(), freshCreated.ID); err != nil {
+	if _, _, err := s.ClaimPayment(context.Background(), freshCreated.ID); err != nil {
 		t.Fatalf("claim fresh: %v", err)
 	}
 	// Backdate only the "stale" payment's updated_at.
@@ -883,6 +883,89 @@ func TestPublishNextOutboxEvent_ConcurrentPublishersClaimDistinctRows(t *testing
 	for _, id := range paymentIDs {
 		if published[id] != 1 {
 			t.Fatalf("expected payment %s to be published exactly once, got %d", id, published[id])
+		}
+	}
+}
+
+func TestCreateOrGetPayment_DefaultsExecutionModeToSimulated(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-default-mode-key"
+	cleanup := func() {
+		s.db.ExecContext(context.Background(), `DELETE FROM payments WHERE idempotency_key = $1`, key)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	p := testPayment(key) // does not set ExecutionMode
+	result, outcome, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome != payment.Created {
+		t.Fatalf("expected Created, got %v", outcome)
+	}
+	if result.ExecutionMode != payment.ExecutionModeSimulated {
+		t.Fatalf("expected simulated, got %q", result.ExecutionMode)
+	}
+}
+
+func TestClaimPayment_ReturnsExecutionMode(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-claim-mode-key"
+	cleanup := func() {
+		s.db.ExecContext(context.Background(), `DELETE FROM payments WHERE idempotency_key = $1`, key)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	p := testPayment(key)
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	claimed, mode, err := s.ClaimPayment(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected claim to succeed")
+	}
+	if mode != payment.ExecutionModeSimulated {
+		t.Fatalf("expected simulated, got %q", mode)
+	}
+}
+
+func TestStalePaymentIDs_ExcludesTestnetMode(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-stale-excludes-testnet-key"
+	cleanup := func() {
+		s.db.ExecContext(context.Background(), `DELETE FROM payments WHERE idempotency_key = $1`, key)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	p := testPayment(key)
+	p.ExecutionMode = payment.ExecutionModeTestnet
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	// Force it stale.
+	if _, err := s.db.ExecContext(context.Background(),
+		`UPDATE payments SET updated_at = now() - interval '1 hour' WHERE id = $1`, created.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	ids, err := s.StalePaymentIDs(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatalf("stale ids: %v", err)
+	}
+	for _, id := range ids {
+		if id == created.ID {
+			t.Fatal("StalePaymentIDs must never return a testnet-mode payment -- Recovery's execution.Execute has no meaning for a real transaction")
 		}
 	}
 }
