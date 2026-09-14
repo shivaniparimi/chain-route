@@ -103,3 +103,89 @@ func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, boo
 
 	return p, true, nil
 }
+
+func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error) {
+	// Optimization only, not correctness-critical: skip the routing RPC's
+	// result entirely for the common retry case. If this races with a
+	// concurrent insert and misses it, nothing breaks -- the INSERT below
+	// is what actually enforces correctness.
+	if existing, matches, found, err := s.findByIdempotencyKey(ctx, p); err != nil {
+		return payment.Payment{}, 0, err
+	} else if found {
+		if !matches {
+			return payment.Payment{}, payment.Conflict, nil
+		}
+		hops, err := s.hopsForPayment(ctx, existing.ID)
+		if err != nil {
+			return payment.Payment{}, 0, err
+		}
+		existing.Hops = hops
+		return existing, payment.Replayed, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return payment.Payment{}, 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var created payment.Payment
+	row := tx.QueryRowContext(ctx, `
+		INSERT INTO payments (idempotency_key, source_chain, destination_chain, asset, amount, total_fee)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (idempotency_key) DO NOTHING
+		RETURNING id, created_at, updated_at
+	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount, p.TotalFee)
+
+	err = row.Scan(&created.ID, &created.CreatedAt, &created.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Lost the race: a concurrent request already created this key.
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return payment.Payment{}, 0, fmt.Errorf("rollback after lost race: %w", rbErr)
+		}
+		existing, matches, found, ferr := s.findByIdempotencyKey(ctx, p)
+		if ferr != nil {
+			return payment.Payment{}, 0, ferr
+		}
+		if !found {
+			return payment.Payment{}, 0, errors.New("idempotency key conflicted but no row found on re-read")
+		}
+		if !matches {
+			return payment.Payment{}, payment.Conflict, nil
+		}
+		hops, herr := s.hopsForPayment(ctx, existing.ID)
+		if herr != nil {
+			return payment.Payment{}, 0, herr
+		}
+		existing.Hops = hops
+		return existing, payment.Replayed, nil
+	}
+	if err != nil {
+		return payment.Payment{}, 0, fmt.Errorf("insert payment: %w", err)
+	}
+
+	for _, h := range p.Hops {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO payment_route_hops
+				(payment_id, hop_index, from_chain, to_chain, bridge_name, fee, latency_ms, liquidity, reliability)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`, created.ID, h.HopIndex, h.FromChain, h.ToChain, h.BridgeName, h.Fee, h.LatencyMs, h.Liquidity, h.Reliability); err != nil {
+			return payment.Payment{}, 0, fmt.Errorf("insert hop %d: %w", h.HopIndex, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return payment.Payment{}, 0, fmt.Errorf("commit: %w", err)
+	}
+
+	created.IdempotencyKey = p.IdempotencyKey
+	created.SourceChain = p.SourceChain
+	created.DestinationChain = p.DestinationChain
+	created.Asset = p.Asset
+	created.Amount = p.Amount
+	created.Status = payment.StatusRouted
+	created.TotalFee = p.TotalFee
+	created.Hops = p.Hops
+
+	return created, payment.Created, nil
+}
