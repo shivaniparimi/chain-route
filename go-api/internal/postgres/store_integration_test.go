@@ -72,7 +72,19 @@ func testPayment(idempotencyKey string) payment.Payment {
 
 func TestCreateOrGetPayment_NormalCreation(t *testing.T) {
 	s := newTestStore(t)
-	p := testPayment("test-normal-creation-key")
+	key := "test-normal-creation-key"
+	p := testPayment(key)
+
+	// Clean up before and after so repeated invocations against the
+	// persistent local database don't collide with their own leftovers.
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
 
 	result, outcome, err := s.CreateOrGetPayment(context.Background(), p)
 	if err != nil {
@@ -101,6 +113,17 @@ func TestCreateOrGetPayment_SequentialIdenticalRetry(t *testing.T) {
 	s := newTestStore(t)
 	key := "test-sequential-retry-key"
 	p := testPayment(key)
+
+	// Clean up before and after so repeated invocations against the
+	// persistent local database don't collide with their own leftovers.
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
 
 	first, outcome1, err := s.CreateOrGetPayment(context.Background(), p)
 	if err != nil || outcome1 != payment.Created {
@@ -134,6 +157,17 @@ func TestCreateOrGetPayment_SameKeyDifferentRequest(t *testing.T) {
 	key := "test-same-key-different-request"
 	original := testPayment(key)
 
+	// Clean up before and after so repeated invocations against the
+	// persistent local database don't collide with their own leftovers.
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
 	_, outcome1, err := s.CreateOrGetPayment(context.Background(), original)
 	if err != nil || outcome1 != payment.Created {
 		t.Fatalf("first call: outcome=%v err=%v", outcome1, err)
@@ -164,6 +198,17 @@ func TestCreateOrGetPayment_CommitSucceedsResponseLostThenRetry(t *testing.T) {
 	s := newTestStore(t)
 	key := "test-commit-lost-response-retry"
 	p := testPayment(key)
+
+	// Clean up before and after so repeated invocations against the
+	// persistent local database don't collide with their own leftovers.
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
 
 	// Simulate: the DB transaction committed, but the caller never
 	// observed the result (e.g. the process crashed before responding).
