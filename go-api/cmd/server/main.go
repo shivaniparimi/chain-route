@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"flag"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,6 +29,9 @@ func main() {
 		log.Fatal("DATABASE_URL environment variable is required")
 	}
 
+	blockchainEnv := os.Getenv("BLOCKCHAIN_ENV")
+	maxTestnetAmountWei := envBigIntServer("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000))
+
 	client, err := grpcclient.Dial(*grpcAddr)
 	if err != nil {
 		log.Fatalf("failed to dial routing service at %s: %v", *grpcAddr, err)
@@ -50,7 +54,7 @@ func main() {
 
 	store := postgres.New(db)
 
-	h := &handler.Handler{Client: client, Store: store}
+	h := &handler.Handler{Client: client, Store: store, BlockchainEnv: blockchainEnv, MaxTestnetAmountWei: maxTestnetAmountWei}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /routes", h.PostRoutes)
 	mux.HandleFunc("POST /payments", h.PostPayments)
@@ -77,4 +81,16 @@ func main() {
 		log.Printf("graceful shutdown error: %v", err)
 	}
 	log.Println("go-api shut down")
+}
+
+func envBigIntServer(key string, def *big.Int) *big.Int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, ok := new(big.Int).SetString(v, 10)
+	if !ok {
+		log.Fatalf("invalid %s: not a valid base-10 integer", key)
+	}
+	return n
 }

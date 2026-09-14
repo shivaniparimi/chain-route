@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math/big"
 	"net/http"
 	"strings"
 
@@ -18,8 +19,10 @@ type RoutingClient interface {
 }
 
 type Handler struct {
-	Client RoutingClient
-	Store  PaymentStore
+	Client              RoutingClient
+	Store               PaymentStore
+	BlockchainEnv       string   // "testnet" enables execution_mode="testnet" requests; anything else (including "") rejects them
+	MaxTestnetAmountWei *big.Int // nil means no ceiling is enforced (only safe when BlockchainEnv != "testnet")
 }
 
 type findRouteRequest struct {

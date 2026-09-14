@@ -119,3 +119,56 @@ func TestHandleRoutedPayment_ClaimErrorPropagates(t *testing.T) {
 		t.Fatalf("expected CompletePayment not to be called after a claim error, got %d calls", store.completeCalls)
 	}
 }
+
+type fakeTestnetExecutor struct {
+	called    bool
+	calledID  string
+	returnErr error
+}
+
+func (f *fakeTestnetExecutor) ExecuteTestnetPayment(ctx context.Context, paymentID string) error {
+	f.called = true
+	f.calledID = paymentID
+	return f.returnErr
+}
+
+func TestHandleRoutedPayment_TestnetModeDispatchesToExecutor(t *testing.T) {
+	store := &fakeStore{claimResult: true, claimMode: payment.ExecutionModeTestnet}
+	executor := &fakeTestnetExecutor{}
+	proc := &Processor{Store: store, Executor: executor}
+
+	evt := events.RoutedPayment{PaymentID: "testnet-pay-1"}
+	if err := proc.HandleRoutedPayment(context.Background(), evt); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !executor.called || executor.calledID != "testnet-pay-1" {
+		t.Fatalf("expected Executor.ExecuteTestnetPayment to be called with the payment id, got called=%v id=%q", executor.called, executor.calledID)
+	}
+	if store.completeCalls != 0 {
+		t.Fatal("testnet-mode dispatch must never call CompletePayment directly -- the executor/reconciler own that transition via MarkSubmitted/CompleteSubmittedPayment")
+	}
+}
+
+func TestHandleRoutedPayment_SimulatedModeNeverCallsExecutor(t *testing.T) {
+	id := findIDWithOutcome(t, true)
+	store := &fakeStore{claimResult: true, claimMode: payment.ExecutionModeSimulated, completeResult: true}
+	executor := &fakeTestnetExecutor{}
+	proc := &Processor{Store: store, Executor: executor}
+
+	if err := proc.HandleRoutedPayment(context.Background(), events.RoutedPayment{PaymentID: id}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if executor.called {
+		t.Fatal("simulated-mode payments must never reach the testnet executor")
+	}
+}
+
+func TestHandleRoutedPayment_TestnetModeWithNilExecutorErrors(t *testing.T) {
+	store := &fakeStore{claimResult: true, claimMode: payment.ExecutionModeTestnet}
+	proc := &Processor{Store: store, Executor: nil}
+
+	err := proc.HandleRoutedPayment(context.Background(), events.RoutedPayment{PaymentID: "any"})
+	if err == nil {
+		t.Fatal("expected an error when a testnet-mode payment reaches a Processor with no Executor configured")
+	}
+}
