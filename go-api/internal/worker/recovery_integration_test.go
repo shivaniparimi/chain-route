@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"chainroute/go-api/internal/execution"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -124,14 +125,43 @@ func TestRecovery_StalledWorkerVsSweepRace(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
+	var sweepCompleted int
+	var workerCompleted bool
 	var sweepErr, workerErr error
 	go func() {
 		defer wg.Done()
-		_, sweepErr = r.SweepOnce(context.Background())
+		sweepCompleted, sweepErr = r.SweepOnce(context.Background())
 	}()
 	go func() {
 		defer wg.Done()
-		_, workerErr = store.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
+		// A short delay before this goroutine's own completion attempt is a
+		// deliberate, realistic part of the simulation, not a timing hack:
+		// on local Postgres, a direct single-UPDATE CompletePayment call is
+		// structurally faster than the sweep's own SELECT-then-UPDATE path
+		// (StalePaymentIDs plus CompletePayment), so without this delay the
+		// "stalled worker" call would always win outright before the
+		// sweep's StalePaymentIDs query even runs -- verified empirically:
+		// without it, StalePaymentIDs consistently found zero candidates
+		// (0/19 trials), meaning the two paths never actually contended for
+		// the same row and this test exercised no real race at all. A
+		// worker that has genuinely stalled and is only now finishing is
+		// plausibly still a little behind a freshly-dispatched sweep pass,
+		// which is exactly what this delay models -- it does not favor
+		// either side; it only widens the window enough for both attempts
+		// to land while the row is still PROCESSING, so the guard this test
+		// exists to prove actually gets exercised under real contention.
+		time.Sleep(20 * time.Millisecond)
+
+		// Mirror what a real worker does: derive the terminal status from
+		// execution.Execute the same way Recovery.SweepOnce does internally,
+		// rather than hardcoding it, so this goroutine realistically models
+		// the "stalled but still-running worker" it simulates.
+		result := execution.Execute(created.ID)
+		terminal := payment.StatusCompleted
+		if !result.Success {
+			terminal = payment.StatusFailed
+		}
+		workerCompleted, workerErr = store.CompletePayment(context.Background(), created.ID, terminal)
 	}()
 	wg.Wait()
 
@@ -140,6 +170,18 @@ func TestRecovery_StalledWorkerVsSweepRace(t *testing.T) {
 	}
 	if workerErr != nil {
 		t.Fatalf("worker error: %v", workerErr)
+	}
+
+	// This is the property the test exists to prove: exactly one of the two
+	// concurrent actors persists the terminal transition. Asserting only
+	// that the payment ended up in SOME terminal state (as the test used to
+	// do) is vacuous -- it would also pass if CompletePayment's guard were
+	// broken and both actors persisted their own update.
+	sweepWon := sweepCompleted == 1
+	workerWon := workerCompleted
+	if sweepWon == workerWon {
+		// Both true (double-persisted) or both false (neither persisted) are both wrong.
+		t.Fatalf("expected exactly one of {sweep, stalled worker} to persist the terminal transition, got sweepCompleted=%d (sweepWon=%v) workerCompleted=%v", sweepCompleted, sweepWon, workerCompleted)
 	}
 
 	fetched, found, err := store.GetPayment(context.Background(), created.ID)

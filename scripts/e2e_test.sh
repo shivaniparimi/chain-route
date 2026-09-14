@@ -6,16 +6,18 @@ CPP_PORT=50098
 HTTP_PORT=8099
 SEED=1001
 PAYMENT_IDEMPOTENCY_KEY="e2e-test-key-$$-$(date +%s)"
+ASYNC_IDEMPOTENCY_KEY="e2e-async-test-key-$$-$(date +%s)"
 
 DATABASE_URL="${DATABASE_URL:-postgres://$(whoami)@localhost:5432/chainroute?sslmode=disable}"
 export DATABASE_URL
 
 cleanup() {
+    [[ -n "${WORKER_PID:-}" ]] && kill "$WORKER_PID" 2>/dev/null || true
     [[ -n "${GO_PID:-}" ]] && kill "$GO_PID" 2>/dev/null || true
     [[ -n "${CPP_PID:-}" ]] && kill "$CPP_PID" 2>/dev/null || true
     if [[ -n "${DATABASE_URL:-}" ]]; then
         /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-            "DELETE FROM payments WHERE idempotency_key = '$PAYMENT_IDEMPOTENCY_KEY'" >/dev/null 2>&1 || true
+            "DELETE FROM payments WHERE idempotency_key IN ('$PAYMENT_IDEMPOTENCY_KEY', '$ASYNC_IDEMPOTENCY_KEY')" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
@@ -26,6 +28,9 @@ cmake --build "$ROOT_DIR/cpp-routing-service/build" >/dev/null
 
 echo "Building Go service..."
 (cd "$ROOT_DIR/go-api" && go build -o "$ROOT_DIR/go-api/server" ./cmd/server)
+
+echo "Building Go worker..."
+(cd "$ROOT_DIR/go-api" && go build -o "$ROOT_DIR/go-api/worker" ./cmd/worker)
 
 echo "Starting C++ service on 127.0.0.1:$CPP_PORT (seed=$SEED)..."
 "$ROOT_DIR/cpp-routing-service/build/chainroute_service_server" \
@@ -110,6 +115,42 @@ echo "Ensuring database schema is up to date..."
 /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
     "SELECT 1 FROM information_schema.tables WHERE table_name='payments'" | grep -q 1 || \
     /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0001_create_payments.sql"
+/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
+    "SELECT 1 FROM information_schema.tables WHERE table_name='outbox_events'" | grep -q 1 || \
+    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0002_payment_processing.sql"
+/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
+    "SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_payment_id_fkey' AND confdeltype = 'c'" | grep -q 1 || \
+    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0003_outbox_events_cascade_delete.sql"
+
+# Resolve a way to talk to Redpanda's rpk. The upstream project ships rpk
+# directly on PATH when Redpanda is installed natively (e.g. via Homebrew),
+# but on machines where that native install fails, Task 1 instead ran
+# Redpanda in a Docker container named "redpanda" -- rpk exists only inside
+# that container, reached via `docker exec redpanda rpk ...`, never on the
+# host PATH. Resolve defensively in order of preference, and fall back to a
+# plain TCP-connect check (skipping explicit topic creation) if neither
+# form of rpk is available, per this script's documented fallback policy.
+RPK=""
+if command -v rpk >/dev/null 2>&1; then
+    RPK="rpk"
+elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx redpanda; then
+    RPK="docker exec redpanda rpk"
+fi
+
+echo "Checking Redpanda is reachable..."
+if [[ -n "$RPK" ]]; then
+    if ! $RPK cluster info >/dev/null 2>&1; then
+        echo "FAIL: Redpanda does not appear to be running -- start it per the Phase 6 plan's Task 1 before running this script" >&2
+        exit 1
+    fi
+    $RPK topic create chainroute.payments.routed --partitions 3 --replicas 1 >/dev/null 2>&1 || true
+else
+    echo "rpk unavailable (neither on PATH nor via a running 'redpanda' Docker container); falling back to a plain TCP-connect readiness check (weaker: confirms the port is open, not that Redpanda is actually serving) and skipping explicit topic creation -- relying on the topic already existing."
+    if ! nc -z localhost 9092 >/dev/null 2>&1; then
+        echo "FAIL: Redpanda does not appear to be running on localhost:9092 -- start it per the Phase 6 plan's Task 1 before running this script" >&2
+        exit 1
+    fi
+fi
 
 echo "Starting Go service on :$HTTP_PORT..."
 "$ROOT_DIR/go-api/server" \
@@ -195,5 +236,48 @@ sleep 1
 RESTART_RESPONSE=$(curl -s "http://127.0.0.1:$HTTP_PORT/payments/$PAYMENT_ID")
 echo "$RESTART_RESPONSE" | grep -q "\"id\":\"$PAYMENT_ID\"" || { echo "FAIL: payment not found after restart"; exit 1; }
 echo "OK: payment $PAYMENT_ID still readable after Go process restart"
+
+echo "Test 10: async execution reaches a terminal state via Kafka"
+KAFKA_BOOTSTRAP_SERVERS="localhost:9092" \
+OUTBOX_POLL_INTERVAL_MS=200 \
+WORKER_RECOVERY_SWEEP_INTERVAL_SECONDS=5 \
+WORKER_RECOVERY_STALENESS_SECONDS=30 \
+"$ROOT_DIR/go-api/worker" &
+WORKER_PID=$!
+sleep 1
+kill -0 "$WORKER_PID" || { echo "FAIL: worker exited before becoming ready" >&2; exit 1; }
+
+ASYNC_CREATE_STATUS=$(curl -s -o /tmp/e2e_async_create_body.json -w "%{http_code}" -X POST "http://127.0.0.1:$HTTP_PORT/payments" \
+    -H "Content-Type: application/json" -H "Idempotency-Key: $ASYNC_IDEMPOTENCY_KEY" \
+    -d '{"source_chain":"ethereum","destination_chain":"base","asset":"USDC","amount":"500.00"}')
+ASYNC_PAYMENT_RESPONSE=$(cat /tmp/e2e_async_create_body.json)
+rm -f /tmp/e2e_async_create_body.json
+[[ "$ASYNC_CREATE_STATUS" == "201" ]] || { echo "FAIL: expected 201, got $ASYNC_CREATE_STATUS"; exit 1; }
+ASYNC_PAYMENT_ID=$(echo "$ASYNC_PAYMENT_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+[[ -n "$ASYNC_PAYMENT_ID" ]] || { echo "FAIL: no payment id in async response"; exit 1; }
+
+# The worker joins a real Kafka consumer group on every fresh start, and
+# consumer-group-join/rebalance latency is genuinely variable in practice --
+# measured on this setup from well under a second up to several seconds
+# (Kafka's JoinGroup/SyncGroup handshake, not this pipeline's own logic).
+# 30s/300 polls gives roughly a 4-6x safety margin over the slowest observed
+# real-world join latency here, while still failing loudly (not hanging) if
+# the pipeline is genuinely broken.
+TERMINAL_STATUS=""
+for i in $(seq 1 300); do
+    ASYNC_GET_RESPONSE=$(curl -s "http://127.0.0.1:$HTTP_PORT/payments/$ASYNC_PAYMENT_ID")
+    if echo "$ASYNC_GET_RESPONSE" | grep -q '"status":"COMPLETED"'; then
+        TERMINAL_STATUS="COMPLETED"
+        break
+    fi
+    if echo "$ASYNC_GET_RESPONSE" | grep -q '"status":"FAILED"'; then
+        TERMINAL_STATUS="FAILED"
+        break
+    fi
+    sleep 0.1
+done
+[[ -n "$TERMINAL_STATUS" ]] || { echo "FAIL: payment $ASYNC_PAYMENT_ID did not reach a terminal state in time: $ASYNC_GET_RESPONSE"; exit 1; }
+echo "$ASYNC_GET_RESPONSE" | grep -q '"completed_at":"[^"]' || { echo "FAIL: expected a non-null completed_at, got: $ASYNC_GET_RESPONSE"; exit 1; }
+echo "OK: payment $ASYNC_PAYMENT_ID reached $TERMINAL_STATUS with completed_at set"
 
 echo "All E2E checks passed."
