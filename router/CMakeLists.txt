@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(chainroute STATIC
     src/chain.cpp
     src/asset.cpp
+    src/node.cpp
+    src/edge.cpp
 )
 target_include_directories(chainroute PUBLIC include)
 

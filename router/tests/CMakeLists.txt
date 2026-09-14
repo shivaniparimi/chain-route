@@ -8,6 +8,7 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(chainroute_tests
     node_test.cpp
+    edge_test.cpp
 )
 target_link_libraries(chainroute_tests PRIVATE chainroute GTest::gtest_main)
 
