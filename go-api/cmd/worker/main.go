@@ -18,8 +18,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"chainroute/go-api/internal/bridge/across"
-	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/events"
+	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/kafka"
 	"chainroute/go-api/internal/postgres"
 	"chainroute/go-api/internal/worker"
@@ -47,6 +47,15 @@ func main() {
 	reconcileStaleness := envDuration("RECONCILE_STALENESS_SECONDS", 120*time.Second, time.Second)
 	reconcileSweepInterval := envDuration("RECONCILE_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second)
 	nonceDivergenceCheckInterval := envDuration("NONCE_DIVERGENCE_CHECK_INTERVAL_SECONDS", 60*time.Second, time.Second)
+
+	// Testnet-mode message handling gets its own, larger timeout than the
+	// simulated path's fixed 10-second handleCtx below: real testnet
+	// execution makes several sequential network round trips (an Across
+	// quote alone can take up to across.Client's own 15-second HTTP
+	// timeout), so 10 seconds is not comfortably larger than that (review
+	// Finding 4). Simulated-mode handling is unaffected -- it keeps using
+	// handleCtx's fixed 10 seconds unchanged.
+	testnetHandleTimeout := envDuration("TESTNET_HANDLE_TIMEOUT_SECONDS", 30*time.Second, time.Second)
 
 	// PostgreSQL is blocking-ping-or-die at startup, matching cmd/server:
 	// nothing in this binary can do anything useful without the database.
@@ -142,7 +151,7 @@ func main() {
 	if executor != nil {
 		processorExecutor = executor
 	}
-	processor := &worker.Processor{Store: store, Executor: processorExecutor}
+	processor := &worker.Processor{Store: store, Executor: processorExecutor, TestnetTimeout: testnetHandleTimeout}
 
 	// Kafka is deliberately NOT blocking-or-die here: a transiently
 	// unreachable broker at startup is tolerated, since kafka-go's writer
@@ -218,6 +227,15 @@ func runConsumeLoop(ctx context.Context, consumer *kafka.Consumer, processor *wo
 			continue
 		}
 
+		// This 10-second budget is unchanged from Phase 6 and stays exactly
+		// as-is for simulated-mode payments (the only kind this worker
+		// handled prior to Phase 7). It also bounds ClaimPayment for
+		// testnet-mode payments, which is fine -- that's a single fast DB
+		// write, not the network-heavy part. HandleRoutedPayment itself
+		// swaps in a separate, larger, independent context (TestnetTimeout)
+		// once it learns a claim was for a testnet-mode payment, rather
+		// than this loop needing to know the mode up front (review Finding
+		// 4).
 		handleCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err = processor.HandleRoutedPayment(handleCtx, evt)
 		cancel()

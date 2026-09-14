@@ -16,12 +16,23 @@ import (
 func Dial(ctx context.Context, rpcURL string, expectedChainID int64) (*ethclient.Client, error) {
 	client, err := ethclient.DialContext(ctx, rpcURL)
 	if err != nil {
-		return nil, fmt.Errorf("dial rpc: %w", err)
+		// Deliberately NOT %w-wrapping the underlying error here: for HTTP
+		// transports go-ethereum's dial failure surfaces as a *url.Error
+		// whose Error() string embeds the full request URL, and provider
+		// RPC URLs (Alchemy, Infura, etc.) commonly embed an API key in
+		// that URL's path. Propagating it verbatim would let a down or
+		// misconfigured endpoint leak the credential into logs on one of
+		// the most common startup failure modes (review Finding 2).
+		return nil, fmt.Errorf("dial rpc: connection failed (see network diagnostics separately, url omitted for credential safety)")
 	}
 	gotChainID, err := client.ChainID(ctx)
 	if err != nil {
 		client.Close()
-		return nil, fmt.Errorf("query chain id: %w", err)
+		// Same reasoning as above: for HTTP transports the dial itself is
+		// lazy, so a down/misconfigured endpoint's failure actually
+		// surfaces here, at the first real request -- again as a
+		// *url.Error carrying the full URL.
+		return nil, fmt.Errorf("query chain id: request failed (url omitted for credential safety)")
 	}
 	if gotChainID.Cmp(big.NewInt(expectedChainID)) != 0 {
 		client.Close()

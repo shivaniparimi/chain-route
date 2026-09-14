@@ -17,9 +17,9 @@ import (
 // the documented mainnet requirement. APIKey/IntegratorID remain wired as
 // optional, harmless if the testnet API ever starts requiring them.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	APIKey     string
+	baseURL      string
+	httpClient   *http.Client
+	APIKey       string
 	IntegratorID string
 }
 
