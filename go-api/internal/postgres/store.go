@@ -29,7 +29,7 @@ func New(db *sql.DB) *Store {
 func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (existing payment.Payment, matches bool, found bool, err error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_chain, destination_chain, asset, amount::text,
-		       total_fee, status, created_at, updated_at,
+		       total_fee, status, completed_at, created_at, updated_at,
 		       (source_chain = $2 AND destination_chain = $3
 		        AND asset = $4 AND amount = $5::NUMERIC) AS request_matches
 		FROM payments
@@ -37,8 +37,9 @@ func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (ex
 	`, p.IdempotencyKey, p.SourceChain, p.DestinationChain, p.Asset, p.Amount)
 
 	var status string
+	var completedAt sql.NullTime
 	err = row.Scan(&existing.ID, &existing.SourceChain, &existing.DestinationChain,
-		&existing.Asset, &existing.Amount, &existing.TotalFee, &status,
+		&existing.Asset, &existing.Amount, &existing.TotalFee, &status, &completedAt,
 		&existing.CreatedAt, &existing.UpdatedAt, &matches)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Payment{}, false, false, nil
@@ -47,6 +48,9 @@ func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (ex
 		return payment.Payment{}, false, false, fmt.Errorf("find by idempotency key: %w", err)
 	}
 	existing.Status = payment.Status(status)
+	if completedAt.Valid {
+		existing.CompletedAt = &completedAt.Time
+	}
 	existing.IdempotencyKey = p.IdempotencyKey
 	return existing, matches, true, nil
 }
@@ -78,14 +82,15 @@ func (s *Store) hopsForPayment(ctx context.Context, paymentID string) ([]payment
 func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, bool, error) {
 	var p payment.Payment
 	var status string
+	var completedAt sql.NullTime
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, idempotency_key, source_chain, destination_chain, asset, amount::text,
-		       total_fee, status, created_at, updated_at
+		       total_fee, status, completed_at, created_at, updated_at
 		FROM payments
 		WHERE id = $1
 	`, id)
 	err := row.Scan(&p.ID, &p.IdempotencyKey, &p.SourceChain, &p.DestinationChain, &p.Asset,
-		&p.Amount, &p.TotalFee, &status, &p.CreatedAt, &p.UpdatedAt)
+		&p.Amount, &p.TotalFee, &status, &completedAt, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Payment{}, false, nil
 	}
@@ -97,6 +102,9 @@ func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, boo
 		return payment.Payment{}, false, fmt.Errorf("get payment: %w", err)
 	}
 	p.Status = payment.Status(status)
+	if completedAt.Valid {
+		p.CompletedAt = &completedAt.Time
+	}
 
 	hops, err := s.hopsForPayment(ctx, p.ID)
 	if err != nil {
@@ -231,4 +239,71 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 	created.Hops = p.Hops
 
 	return created, payment.Created, nil
+}
+
+// ClaimPayment atomically transitions a payment from ROUTED to PROCESSING.
+// claimed=false means the payment was not ROUTED (already claimed by
+// another delivery, or in some other state) -- a safe no-op, not an error.
+// This is the sole mechanism preventing duplicate claims (see the Phase 6
+// design spec, §7 case 2).
+func (s *Store) ClaimPayment(ctx context.Context, paymentID string) (claimed bool, err error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE payments SET status = $2, updated_at = now()
+		WHERE id = $1 AND status = $3
+	`, paymentID, payment.StatusProcessing, payment.StatusRouted)
+	if err != nil {
+		return false, fmt.Errorf("claim payment: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim payment rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
+// CompletePayment atomically transitions a payment from PROCESSING to the
+// given terminal status. completed=false means the payment was not
+// PROCESSING -- a safe no-op. This is the sole mechanism guaranteeing
+// exactly one terminal outcome is ever persisted per payment (Phase 6
+// design spec, §7 case 4), regardless of how many times the caller's
+// execution logic itself ran.
+func (s *Store) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (completed bool, err error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE payments SET status = $2, completed_at = now(), updated_at = now()
+		WHERE id = $1 AND status = $3
+	`, paymentID, terminal, payment.StatusProcessing)
+	if err != nil {
+		return false, fmt.Errorf("complete payment: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("complete payment rows affected: %w", err)
+	}
+	return rows == 1, nil
+}
+
+// StalePaymentIDs returns the IDs of payments that have been PROCESSING for
+// longer than staleness. The caller (the worker's recovery sweep) is
+// responsible for re-running execution and calling CompletePayment for
+// each -- this method only identifies candidates.
+func (s *Store) StalePaymentIDs(ctx context.Context, staleness time.Duration) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM payments
+		WHERE status = $1
+		  AND updated_at < now() - make_interval(secs => $2)
+	`, payment.StatusProcessing, staleness.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("query stale payments: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan stale payment id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

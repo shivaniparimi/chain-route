@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -393,5 +394,304 @@ func TestCreateOrGetPayment_ReplayDoesNotInsertAnotherOutboxEvent(t *testing.T) 
 	}
 	if count != 1 {
 		t.Fatalf("expected exactly 1 outbox row after a replay, got %d", count)
+	}
+}
+
+func TestClaimPayment_TransitionsRoutedToProcessing(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-claim-routed-to-processing"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, outcome, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create: outcome=%v err=%v", outcome, err)
+	}
+
+	claimed, err := s.ClaimPayment(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected claim to succeed on a ROUTED payment")
+	}
+
+	fetched, found, err := s.GetPayment(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("get after claim: found=%v err=%v", found, err)
+	}
+	if fetched.Status != payment.StatusProcessing {
+		t.Fatalf("expected PROCESSING, got %v", fetched.Status)
+	}
+}
+
+func TestClaimPayment_NoOpIfNotRouted(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-claim-noop-if-not-routed"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+
+	claimedAgain, err := s.ClaimPayment(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if claimedAgain {
+		t.Fatal("expected the second claim on an already-PROCESSING payment to be a no-op")
+	}
+}
+
+func TestClaimPayment_ConcurrentClaimsSucceedExactlyOnce(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-claim-concurrent-race"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	const n = 10
+	results := make([]bool, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			claimed, err := s.ClaimPayment(context.Background(), created.ID)
+			if err != nil {
+				t.Errorf("goroutine %d: %v", i, err)
+				return
+			}
+			results[i] = claimed
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	claimedCount := 0
+	for _, claimed := range results {
+		if claimed {
+			claimedCount++
+		}
+	}
+	if claimedCount != 1 {
+		t.Fatalf("expected exactly 1 successful claim among %d concurrent attempts, got %d", n, claimedCount)
+	}
+}
+
+func TestCompletePayment_TransitionsProcessingToTerminal(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-complete-processing-to-terminal"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	completed, err := s.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if !completed {
+		t.Fatal("expected completion to succeed on a PROCESSING payment")
+	}
+
+	fetched, found, err := s.GetPayment(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("get after complete: found=%v err=%v", found, err)
+	}
+	if fetched.Status != payment.StatusCompleted {
+		t.Fatalf("expected COMPLETED, got %v", fetched.Status)
+	}
+	if fetched.CompletedAt == nil {
+		t.Fatal("expected CompletedAt to be set")
+	}
+}
+
+func TestCompletePayment_NoOpIfNotProcessing(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-complete-noop-if-not-processing"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Payment is ROUTED, not PROCESSING -- completion must be a no-op.
+	completed, err := s.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if completed {
+		t.Fatal("expected completion on a ROUTED (not PROCESSING) payment to be a no-op")
+	}
+}
+
+func TestCompletePayment_ConcurrentCompletionsSucceedExactlyOnce(t *testing.T) {
+	s := newTestStore(t)
+	key := "test-complete-concurrent-race"
+	p := testPayment(key)
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	created, _, err := s.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ClaimPayment(context.Background(), created.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	const n = 10
+	results := make([]bool, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			terminal := payment.StatusCompleted
+			if i%2 == 0 {
+				terminal = payment.StatusFailed
+			}
+			completed, err := s.CompletePayment(context.Background(), created.ID, terminal)
+			if err != nil {
+				t.Errorf("goroutine %d: %v", i, err)
+				return
+			}
+			results[i] = completed
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	completedCount := 0
+	for _, completed := range results {
+		if completed {
+			completedCount++
+		}
+	}
+	if completedCount != 1 {
+		t.Fatalf("expected exactly 1 successful completion among %d concurrent attempts, got %d", n, completedCount)
+	}
+}
+
+func TestStalePaymentIDs_FindsOnlyPaymentsPastStaleness(t *testing.T) {
+	s := newTestStore(t)
+	staleKey := "test-stale-payment-ids-stale"
+	freshKey := "test-stale-payment-ids-fresh"
+
+	cleanup := func() {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key IN ($1, $2)`, staleKey, freshKey); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	stale := testPayment(staleKey)
+	fresh := testPayment(freshKey)
+	staleCreated, _, err := s.CreateOrGetPayment(context.Background(), stale)
+	if err != nil {
+		t.Fatalf("create stale: %v", err)
+	}
+	freshCreated, _, err := s.CreateOrGetPayment(context.Background(), fresh)
+	if err != nil {
+		t.Fatalf("create fresh: %v", err)
+	}
+	if _, err := s.ClaimPayment(context.Background(), staleCreated.ID); err != nil {
+		t.Fatalf("claim stale: %v", err)
+	}
+	if _, err := s.ClaimPayment(context.Background(), freshCreated.ID); err != nil {
+		t.Fatalf("claim fresh: %v", err)
+	}
+	// Backdate only the "stale" payment's updated_at.
+	if _, err := s.db.ExecContext(context.Background(),
+		`UPDATE payments SET updated_at = now() - interval '10 minutes' WHERE id = $1`,
+		staleCreated.ID); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	staleIDs, err := s.StalePaymentIDs(context.Background(), 2*time.Minute)
+	if err != nil {
+		t.Fatalf("StalePaymentIDs: %v", err)
+	}
+	found := false
+	for _, id := range staleIDs {
+		if id == staleCreated.ID {
+			found = true
+		}
+		if id == freshCreated.ID {
+			t.Fatalf("fresh payment %s should not be reported as stale", freshCreated.ID)
+		}
+	}
+	if !found {
+		t.Fatalf("expected stale payment %s to be reported", staleCreated.ID)
 	}
 }
