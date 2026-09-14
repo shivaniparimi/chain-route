@@ -40,6 +40,7 @@ target_link_libraries(chainroute_proto PUBLIC protobuf::libprotobuf gRPC::grpc++
 
 add_library(chainroute_service_lib STATIC
     src/chain_asset_convert.cpp
+    src/routing_service.cpp
 )
 target_include_directories(chainroute_service_lib PUBLIC include)
 target_link_libraries(chainroute_service_lib PUBLIC chainroute chainroute_proto)
