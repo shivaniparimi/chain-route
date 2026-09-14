@@ -28,8 +28,14 @@ func newTestStore(t *testing.T) *Store {
 	if err := db.PingContext(context.Background()); err != nil {
 		t.Fatalf("ping db: %v", err)
 	}
-	// Isolate each test's rows with a unique idempotency-key prefix rather
-	// than truncating shared tables, so tests can run in parallel safely.
+	// Each test uses a fixed idempotency key and cleans up its own row via
+	// t.Cleanup (or upfront deletion for tests with multiple assertions).
+	// This is safe for sequential runs of this package against a shared
+	// database, but NOT safe for concurrent execution -- running two
+	// `go test` processes against the same DATABASE_URL at the same time,
+	// or adding t.Parallel() to these tests, will cause spurious failures
+	// from key collisions between tests, not from any bug in the code
+	// under test.
 	return New(db)
 }
 

@@ -24,6 +24,7 @@ const maxIdempotencyKeyLength = 255
 type PaymentStore interface {
 	CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error)
 	GetPayment(ctx context.Context, id string) (payment.Payment, bool, error)
+	LookupByIdempotencyKey(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, bool, error)
 }
 
 var assetNameByValue = map[routingv1.Asset]string{
@@ -127,6 +128,32 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 	}
 	if sourceChain == destChain {
 		writeError(w, http.StatusBadRequest, "source and destination must differ")
+		return
+	}
+
+	// Check for an existing payment under this idempotency key BEFORE
+	// paying for a routing RPC. This lets a retry of an already-committed
+	// payment resolve to its guaranteed outcome (200 Replayed, or 409
+	// Conflict) even if the routing service happens to be down --
+	// CreateOrGetPayment's own internal pre-check runs too late to help
+	// here, since it only happens after routing already succeeded.
+	lookupCandidate := payment.Payment{
+		IdempotencyKey: idempotencyKey, SourceChain: chainNameByValue[sourceChain],
+		DestinationChain: chainNameByValue[destChain], Asset: assetNameByValue[asset],
+		Amount: req.Amount,
+	}
+	if existing, outcome, found, err := h.Store.LookupByIdempotencyKey(r.Context(), lookupCandidate); err != nil {
+		log.Printf("ERROR: failed to look up payment by idempotency key: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	} else if found {
+		switch outcome {
+		case payment.Replayed:
+			w.Header().Set("Location", "/payments/"+existing.ID)
+			writeJSON(w, http.StatusOK, toPaymentResponse(existing))
+		case payment.Conflict:
+			writeError(w, http.StatusConflict, "Idempotency-Key already used with a different request")
+		}
 		return
 	}
 
