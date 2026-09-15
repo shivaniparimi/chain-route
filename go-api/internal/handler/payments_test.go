@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
 	"chainroute/go-api/internal/payment"
 )
@@ -340,6 +342,108 @@ func TestPostPayments_TestnetModeRejectsAmountOverCeiling(t *testing.T) {
 		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an amount over the configured ceiling, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+type fakeQuoteProvider struct {
+	name  string
+	quote quote.Quote
+	err   error
+}
+
+func (f *fakeQuoteProvider) Name() string { return f.name }
+func (f *fakeQuoteProvider) GetQuote(_ context.Context, _ quote.Request) (quote.Quote, error) {
+	return f.quote, f.err
+}
+
+// testnetChainKey mirrors the ethereum->base, WETH route the handler
+// resolves for source_chain=ethereum, destination_chain=base, asset=eth
+// in testnet mode (see testnetChainIDByChain/bridgedAssetSymbol in
+// routes.go).
+var testnetChainKey = quote.RouteKey{SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH"}
+
+func TestPostPayments_TestnetMode_UnregisteredRouteReturns400(t *testing.T) {
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: quote.NewRegistry(), // nothing registered
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-unregistered-route",
+		`{"source_chain":"arbitrum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_ProviderReportsUnavailableReturns422(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: false}})
+
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: registry,
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-unavailable",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_ProviderErrorReturns503(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", err: errors.New("connection refused")})
+
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: registry,
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-provider-error",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_CandidateEdgeBuiltFromLiveQuote(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{
+		ProviderName: "across", Available: true,
+		InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000), OutputAmountBaseUnits: big.NewInt(999_900_000_000_000),
+		FeeBaseUnits: big.NewInt(100_000_000_000), EstimatedFillTimeSec: 60,
+		QuotedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+		RawProviderPayload: json.RawMessage(`{"spokePoolAddress":"0xabc"}`),
+	}})
+
+	fakeRoute := &fakeClient{
+		response: &routingv1.FindRouteResponse{
+			RouteFound: true, TotalFee: 0.0001,
+			Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "across", Fee: 0.0001, LatencyMs: 60000, Liquidity: 0.001, Reliability: 1.0}},
+		},
+	}
+	store := &fakePaymentStore{}
+	h := &Handler{Client: fakeRoute, Store: store, BlockchainEnv: "testnet", QuoteRegistry: registry}
+
+	rec := doPaymentRequest(h, "POST", "/payments", "test-candidate-edge",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	if len(fakeRoute.lastReq.GetCandidateEdges()) != 1 {
+		t.Fatalf("expected exactly 1 candidate edge sent to FindRoute, got %d", len(fakeRoute.lastReq.GetCandidateEdges()))
+	}
+	edge := fakeRoute.lastReq.GetCandidateEdges()[0]
+	if edge.GetBridgeName() != "across" {
+		t.Errorf("bridge_name = %q, want across", edge.GetBridgeName())
+	}
+	if edge.GetLiquidity() != 0.001 {
+		t.Errorf("liquidity = %v, want 0.001 (the request amount, since Available=true)", edge.GetLiquidity())
+	}
+	if store.lastCreate.Quote == nil {
+		t.Fatal("expected the created payment to carry a Quote to persist")
+	}
+	if store.lastCreate.Quote.Provider != "across" {
+		t.Errorf("persisted Quote.Provider = %q, want across", store.lastCreate.Quote.Provider)
 	}
 }
 

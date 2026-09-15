@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
 )
 
@@ -21,8 +22,9 @@ type RoutingClient interface {
 type Handler struct {
 	Client              RoutingClient
 	Store               PaymentStore
-	BlockchainEnv       string   // "testnet" enables execution_mode="testnet" requests; anything else (including "") rejects them
-	MaxTestnetAmountWei *big.Int // nil means no ceiling is enforced (only safe when BlockchainEnv != "testnet")
+	BlockchainEnv       string          // "testnet" enables execution_mode="testnet" requests; anything else (including "") rejects them
+	MaxTestnetAmountWei *big.Int        // nil means no ceiling is enforced (only safe when BlockchainEnv != "testnet")
+	QuoteRegistry       *quote.Registry // nil when BlockchainEnv != "testnet"; never consulted otherwise
 }
 
 type findRouteRequest struct {
@@ -71,6 +73,24 @@ var chainNameByValue = map[routingv1.Chain]string{
 var assetByName = map[string]routingv1.Asset{
 	"usdc": routingv1.Asset_ASSET_USDC,
 	"eth":  routingv1.Asset_ASSET_ETH,
+}
+
+// testnetChainIDByChain maps the routing proto's chain-family enum to the
+// specific testnet chain ID Phase 7/8 execution actually uses. This is a
+// deliberately separate concept from routingv1.Chain (which represents a
+// chain family, not a specific network) -- exactly why Phase 7 already
+// kept this mapping local to testnet-mode code rather than extending the
+// proto enum.
+var testnetChainIDByChain = map[routingv1.Chain]int64{
+	routingv1.Chain_CHAIN_ETHEREUM: 11155111,
+	routingv1.Chain_CHAIN_BASE:     84532,
+}
+
+// bridgedAssetSymbol maps the API's asset name to the actual on-chain
+// asset a testnet-mode payment bridges as -- "eth" is requested but
+// bridged as WETH, matching Phase 7's existing handler comment/behavior.
+var bridgedAssetSymbol = map[string]string{
+	"eth": "WETH",
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

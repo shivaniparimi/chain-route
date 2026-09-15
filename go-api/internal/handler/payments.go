@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
 	"chainroute/go-api/internal/money"
 	"chainroute/go-api/internal/payment"
@@ -161,36 +162,22 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "execution_mode must be \"simulated\" or \"testnet\"")
 		return
 	}
-	var bridgeProvider *string
-	if mode == payment.ExecutionModeTestnet {
-		if h.BlockchainEnv != "testnet" {
-			writeError(w, http.StatusBadRequest, "execution_mode=testnet is not enabled on this server")
-			return
-		}
-		// Phase 7 supports exactly one hardcoded route/asset (design spec
-		// §19): Sepolia -> Base Sepolia, ETH (interpreted as WETH for testnet
-		// execution -- see internal/handler's asset naming, which reuses the
-		// existing "eth" asset value rather than introducing a new protobuf
-		// Asset variant purely for this one testnet path).
-		if strings.ToLower(req.SourceChain) != "ethereum" || strings.ToLower(req.DestinationChain) != "base" || strings.ToLower(req.Asset) != "eth" {
-			writeError(w, http.StatusBadRequest, "execution_mode=testnet only supports source_chain=ethereum, destination_chain=base, asset=eth (bridged as WETH)")
-			return
-		}
-		amountWei, err := money.DecimalToBaseUnits(req.Amount, 18)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid amount for testnet execution: "+err.Error())
-			return
-		}
-		if h.MaxTestnetAmountWei != nil && amountWei.Cmp(h.MaxTestnetAmountWei) > 0 {
-			writeError(w, http.StatusBadRequest, "amount exceeds the configured maximum testnet execution amount")
-			return
-		}
-		provider := "across"
-		bridgeProvider = &provider
-	}
-
 	if sourceChain == destChain {
 		writeError(w, http.StatusBadRequest, "source and destination must differ")
+		return
+	}
+
+	// This float64 conversion feeds only the pre-existing (Phase 2-4,
+	// unmodified) FindRouteRequest.amount `double` field, which has
+	// always been a liquidity-filter threshold for the C++ simulator --
+	// never the authoritative amount. req.Amount (the exact string) is
+	// what gets persisted below, untouched by this conversion. Computed
+	// here (rather than immediately before grpcReq, as in Phase 2-7)
+	// because the testnet-mode block below also needs it, for
+	// CandidateEdge.Liquidity.
+	amountForRouting, err := strconv.ParseFloat(req.Amount, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid amount")
 		return
 	}
 
@@ -220,20 +207,78 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// This float64 conversion feeds only the pre-existing (Phase 2-4,
-	// unmodified) FindRouteRequest.amount `double` field, which has
-	// always been a liquidity-filter threshold for the C++ simulator --
-	// never the authoritative amount. req.Amount (the exact string) is
-	// what gets persisted below, untouched by this conversion.
-	amountForRouting, err := strconv.ParseFloat(req.Amount, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid amount")
-		return
+	var bridgeProvider *string
+	var candidateEdges []*routingv1.CandidateEdge
+	quotesByBridgeName := map[string]quote.Quote{}
+
+	if mode == payment.ExecutionModeTestnet {
+		if h.BlockchainEnv != "testnet" {
+			writeError(w, http.StatusBadRequest, "execution_mode=testnet is not enabled on this server")
+			return
+		}
+
+		originChainID, ok1 := testnetChainIDByChain[sourceChain]
+		destChainID, ok2 := testnetChainIDByChain[destChain]
+		bridgedAsset, ok3 := bridgedAssetSymbol[strings.ToLower(req.Asset)]
+		if !ok1 || !ok2 || !ok3 {
+			writeError(w, http.StatusBadRequest, "execution_mode=testnet does not support this source_chain/destination_chain/asset combination")
+			return
+		}
+
+		routeKey := quote.RouteKey{SourceChainID: originChainID, DestinationChainID: destChainID, Asset: bridgedAsset}
+		var providers []quote.Provider
+		if h.QuoteRegistry != nil {
+			providers = h.QuoteRegistry.ProvidersFor(routeKey)
+		}
+		if len(providers) == 0 {
+			writeError(w, http.StatusBadRequest, "execution_mode=testnet does not support this source_chain/destination_chain/asset combination")
+			return
+		}
+
+		amountWei, err := money.DecimalToBaseUnits(req.Amount, 18)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid amount for testnet execution: "+err.Error())
+			return
+		}
+		if h.MaxTestnetAmountWei != nil && amountWei.Cmp(h.MaxTestnetAmountWei) > 0 {
+			writeError(w, http.StatusBadRequest, "amount exceeds the configured maximum testnet execution amount")
+			return
+		}
+
+		anyAvailable := false
+		for _, p := range providers {
+			q, err := p.GetQuote(r.Context(), quote.Request{
+				SourceChainID: originChainID, DestinationChainID: destChainID, Asset: bridgedAsset, AmountBaseUnits: amountWei,
+			})
+			if err != nil {
+				log.Printf("ERROR: quote provider %s failed: %v", p.Name(), err)
+				writeError(w, http.StatusServiceUnavailable, "bridge quote provider unavailable")
+				return
+			}
+			if !q.Available {
+				continue
+			}
+			anyAvailable = true
+			feeDecimal := money.BaseUnitsToDecimal(q.FeeBaseUnits, 18)
+			feeFloat, _ := strconv.ParseFloat(feeDecimal, 64)
+			candidateEdges = append(candidateEdges, &routingv1.CandidateEdge{
+				BridgeName: p.Name(), Fee: feeFloat, LatencyMs: float64(q.EstimatedFillTimeSec) * 1000,
+				Liquidity: amountForRouting, Reliability: 1.0,
+			})
+			quotesByBridgeName[p.Name()] = q
+		}
+		if !anyAvailable {
+			writeError(w, http.StatusUnprocessableEntity, "no route available for the requested payment")
+			return
+		}
+
+		provider := "across" // overwritten below once the winning hop is known; placeholder to keep bridgeProvider non-nil until then
+		bridgeProvider = &provider
 	}
 
 	grpcReq := &routingv1.FindRouteRequest{
 		SourceChain: sourceChain, DestinationChain: destChain,
-		Asset: asset, Amount: amountForRouting,
+		Asset: asset, Amount: amountForRouting, CandidateEdges: candidateEdges,
 	}
 
 	resp, err := h.Client.FindRoute(r.Context(), grpcReq)
@@ -268,11 +313,35 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	if mode == payment.ExecutionModeTestnet && len(hops) > 0 {
+		winningQuote, ok := quotesByBridgeName[hops[0].BridgeName]
+		if !ok {
+			log.Printf("ERROR: winning hop bridge_name %q has no matching fetched quote -- this should be unreachable", hops[0].BridgeName)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		provider := winningQuote.ProviderName
+		bridgeProvider = &provider
+	}
+
 	candidate := payment.Payment{
 		IdempotencyKey: idempotencyKey, SourceChain: chainNameByValue[sourceChain],
 		DestinationChain: chainNameByValue[destChain], Asset: assetNameByValue[asset],
 		Amount: req.Amount, TotalFee: resp.GetTotalFee(), Hops: hops,
 		ExecutionMode: mode, BridgeProvider: bridgeProvider,
+	}
+	if mode == payment.ExecutionModeTestnet && len(hops) > 0 {
+		winningQuote := quotesByBridgeName[hops[0].BridgeName]
+		candidate.Quote = &payment.Quote{
+			Provider: winningQuote.ProviderName, OriginChainID: winningQuote.SourceChainID,
+			DestinationChainID: winningQuote.DestinationChainID, Asset: winningQuote.Asset,
+			InputAmount:          winningQuote.InputAmountBaseUnits.String(),
+			OutputAmount:         winningQuote.OutputAmountBaseUnits.String(),
+			FeeAmount:            winningQuote.FeeBaseUnits.String(),
+			EstimatedFillTimeSec: winningQuote.EstimatedFillTimeSec,
+			QuotedAt:             winningQuote.QuotedAt, ExpiresAt: winningQuote.ExpiresAt,
+			RawProviderPayload: winningQuote.RawProviderPayload,
+		}
 	}
 
 	result, outcome, err := h.Store.CreateOrGetPayment(r.Context(), candidate)
