@@ -157,11 +157,18 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 // tolerance, regardless of toleranceBps.
 func exceedsSlippageTolerance(baselineFeeDecimal string, freshFee *big.Int, toleranceBps int64) bool {
 	baseline, ok := new(big.Int).SetString(baselineFeeDecimal, 10)
-	if !ok || baseline.Sign() == 0 {
-		// A zero or unparseable baseline can't be exceeded by a positive
-		// tolerance-relative amount in a well-defined way; treat any
-		// positive fresh fee increase over a zero baseline as exceeding
-		// tolerance rather than dividing by zero.
+	if !ok {
+		// An unparseable baseline is never a valid *big.Int -- return
+		// directly rather than falling through to Cmp(nil), which would
+		// panic. Any positive fresh fee is treated as exceeding tolerance
+		// against a baseline we can't make sense of.
+		return freshFee.Sign() > 0
+	}
+	if baseline.Sign() == 0 {
+		// A zero baseline can't be exceeded by a positive tolerance-relative
+		// amount in a well-defined way; treat any positive fresh fee
+		// increase over a zero baseline as exceeding tolerance rather than
+		// dividing by zero.
 		return freshFee.Cmp(baseline) > 0
 	}
 	if freshFee.Cmp(baseline) <= 0 {
@@ -177,16 +184,41 @@ func exceedsSlippageTolerance(baselineFeeDecimal string, freshFee *big.Int, tole
 // DriveExecutionForward is the resume entry point used by BOTH
 // crash-recovery and the reconciler. For an already-signed row (crash
 // point C/D/E/F: exec.SignedTxHash != nil), it goes straight to broadcast
-// recovery using the persisted bytes -- it must NEVER re-fetch a quote or
-// re-check slippage for an already-signed row, since re-deriving anything
-// at that point risks constructing a second, distinct transaction for the
-// same payment, which is exactly what the crash-safety guarantees forbid.
-// For an unsigned row (crash point B), it re-runs the same
-// expiry/provider-lookup/fresh-quote/slippage sequence ExecuteTestnetPayment
-// runs, since the nonce is already allocated by the time this is reached
-// but the payment must still never be signed and broadcast against a
-// stale or now-unfavorable quote.
+// recovery using the persisted bytes -- checked FIRST, before touching
+// payment_quotes or the provider map at all. This must not be reordered:
+// an already-signed row is typically resumed later (by the reconciler, or
+// on worker restart), by which point the routing-time quote has very
+// plausibly expired -- if the expiry check ran first, it would call
+// MarkProcessingFailed and mark the payment FAILED even though its
+// transaction may already be sitting on-chain, mined or pending, which is
+// exactly the "never re-derive/re-decide for an already-signed row"
+// guarantee this task exists to protect. The already-signed path therefore
+// has zero new preconditions in front of it, unchanged from Phase 7: it
+// never re-quotes or re-checks slippage or expiry, since re-deriving
+// anything at that point risks constructing a second, distinct transaction
+// for the same payment. Only the unsigned-row path (crash point B) needs
+// quoteRow/expiry/provider/fresh-quote/slippage -- that logic runs only in
+// the else branch below, mirroring ExecuteTestnetPayment's own sequence,
+// since the nonce is already allocated by the time this is reached but the
+// payment must still never be signed and broadcast against a stale or
+// now-unfavorable quote.
 func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execution) error {
+	if exec.SignedTxHash != nil {
+		// Already signed (crash point C/D/E/F) -- go straight to broadcast
+		// recovery using the persisted bytes, never re-quote or re-check
+		// expiry/slippage for an already-signed row (design doc §8 concern
+		// 2's protocol-freshness argument only applies BEFORE signing; once
+		// signed, re-deriving anything risks a second distinct transaction).
+		if err := e.broadcastWithRecovery(ctx, exec); err != nil {
+			return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
+		}
+		if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
+			return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)
+		}
+		_, err := e.Store.MarkSubmitted(ctx, exec.PaymentID)
+		return err
+	}
+
 	quoteRow, found, err := e.Store.GetQuoteByPaymentID(ctx, exec.PaymentID)
 	if err != nil {
 		return fmt.Errorf("get quote for payment %s: %w", exec.PaymentID, err)
@@ -203,22 +235,6 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 	provider, ok := e.QuoteProviders[quoteRow.Provider]
 	if !ok {
 		return fmt.Errorf("payment %s uses provider %q, which this worker has no configured client for", exec.PaymentID, quoteRow.Provider)
-	}
-
-	if exec.SignedTxHash != nil {
-		// Already signed (crash point C/D/E/F) -- go straight to broadcast
-		// recovery using the persisted bytes, never re-quote or re-check
-		// slippage for an already-signed row (design doc §8 concern 2's
-		// protocol-freshness argument only applies BEFORE signing; once
-		// signed, re-deriving anything risks a second distinct transaction).
-		if err := e.broadcastWithRecovery(ctx, exec); err != nil {
-			return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
-		}
-		if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
-			return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)
-		}
-		_, err := e.Store.MarkSubmitted(ctx, exec.PaymentID)
-		return err
 	}
 
 	p, pFound, err := e.Store.GetPayment(ctx, exec.PaymentID)

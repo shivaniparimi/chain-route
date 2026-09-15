@@ -287,6 +287,119 @@ func TestDriveExecutionForward_TransientLookupErrorPropagatesWithoutResend(t *te
 	}
 }
 
+// TestDriveExecutionForward_AlreadySignedIgnoresExpiredRoutingQuote guards
+// the fix for the finding that DriveExecutionForward was checking
+// exec.SignedTxHash != nil too late -- after the routing-time quote expiry
+// check. An already-signed row (crash point C/D/E/F) is typically resumed
+// later, by which point the routing-time quote has very plausibly expired;
+// checking expiry first would wrongly call MarkProcessingFailed and mark
+// the payment FAILED even though its transaction may already be sitting
+// on-chain, mined or pending. This pairs a signed exec with an EXPIRED
+// quoteRow and asserts broadcastWithRecovery still runs and
+// MarkProcessingFailed is never called.
+func TestDriveExecutionForward_AlreadySignedIgnoresExpiredRoutingQuote(t *testing.T) {
+	hash := "0xabcd000000000000000000000000000000000000000000000000000000000000"[:66]
+	store := &fakeExecutorStore{
+		quoteFound: true,
+		quoteRow: payment.Quote{
+			Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+			FeeAmount: "100000000000", ExpiresAt: time.Now().Add(-time.Minute), // already expired
+		},
+	}
+	ethClient := &fakeExecutorEthClient{txByHashFound: false, txByHashErr: gethereum.NotFound}
+	e := newTestExecutor(t, store, ethClient)
+
+	// broadcastWithRecovery's not-found path unmarshals RawSignedTx as a
+	// real RLP-encoded transaction before rebroadcasting it -- unlike the
+	// found-on-chain tests above (which never reach that unmarshal), this
+	// test needs genuine RLP bytes here, not an arbitrary byte slice.
+	rawTx, err := types.NewTx(&types.LegacyTx{
+		Nonce: 1, GasPrice: big.NewInt(1), Gas: 21000, To: &common.Address{}, Value: big.NewInt(0),
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatalf("build fixture raw tx: %v", err)
+	}
+
+	exec := payment.Execution{
+		ID: "exec-already-signed", PaymentID: "pay-already-signed", Nonce: 1,
+		SignedTxHash: &hash, RawSignedTx: rawTx,
+	}
+	if err := e.DriveExecutionForward(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ethClient.sendCalled {
+		t.Fatal("expected broadcastWithRecovery to still run (and rebroadcast) for an already-signed row, even with an expired routing-time quote")
+	}
+	if !store.broadcastCalled {
+		t.Fatal("expected MarkExecutionBroadcast to be called")
+	}
+	if !store.submittedCalled {
+		t.Fatal("expected MarkSubmitted to be called")
+	}
+	if store.markFailedReason != "" {
+		t.Fatalf("must never call MarkProcessingFailed for an already-signed row, even with an expired routing-time quote; got reason %q", store.markFailedReason)
+	}
+}
+
+// TestDriveExecutionForward_UnsignedResumedExecRechecksSlippageBeforeSigning
+// covers the resume path (crash point B) for an UNSIGNED execution row:
+// unlike the already-signed path above, this one must still re-check
+// expiry/availability/slippage against a freshly-fetched quote before ever
+// signing, exactly as ExecuteTestnetPayment does on a first attempt.
+func TestDriveExecutionForward_UnsignedResumedExecRechecksSlippageBeforeSigning(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound: true,
+		quoteRow: payment.Quote{
+			Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+			FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour),
+		},
+		pmt: payment.Payment{ID: "pay-resume-slippage", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	e.MaxFeeSlippageBps = 500 // 5%
+	// Fresh fee is double the routing-time fee -- far beyond 5% tolerance.
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{
+		quote: quote.Quote{
+			ProviderName: "across", Available: true,
+			FeeBaseUnits: big.NewInt(200_000_000_000), OutputAmountBaseUnits: big.NewInt(800_000_000_000_000),
+			RawProviderPayload: rawAcrossPayload(),
+		},
+	}}
+
+	// An unsigned execution row -- the nonce is already allocated (crash
+	// point B), but signing hasn't happened yet.
+	exec := payment.Execution{ID: "exec-resume-slippage", PaymentID: "pay-resume-slippage", Nonce: 1}
+	if err := e.DriveExecutionForward(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never sign/broadcast an unsigned resumed execution whose fresh fee exceeds slippage tolerance")
+	}
+	if store.persistedHash != "" {
+		t.Fatal("must never persist a signed tx built from a quote that exceeds slippage tolerance")
+	}
+	if store.broadcastCalled || store.submittedCalled {
+		t.Fatal("must never mark broadcast/submitted when the fresh quote exceeds slippage tolerance")
+	}
+}
+
+// TestExceedsSlippageTolerance_UnparseableBaselineDoesNotPanic guards the
+// fix for the finding that an unparseable baselineFeeDecimal left baseline
+// nil (SetString's ok=false case) but the old code still fell through to
+// freshFee.Cmp(baseline), panicking on the nil *big.Int. Not reachable in
+// production today (every write path populates FeeAmount via a real
+// *big.Int's .String()), but a safety-critical helper like this must never
+// panic on malformed input.
+func TestExceedsSlippageTolerance_UnparseableBaselineDoesNotPanic(t *testing.T) {
+	if !exceedsSlippageTolerance("not-a-number", big.NewInt(1), 500) {
+		t.Error("expected a positive fresh fee against an unparseable baseline to be treated as exceeding tolerance")
+	}
+	if exceedsSlippageTolerance("not-a-number", big.NewInt(0), 500) {
+		t.Error("expected a zero fresh fee against an unparseable baseline to not exceed tolerance")
+	}
+}
+
 // TestSignAndPersist_PersistsBeforeBroadcast guards the crash-safety
 // ordering design spec §8 step 2 requires: the signed transaction must be
 // durably persisted BEFORE any broadcast is attempted, so a crash between
