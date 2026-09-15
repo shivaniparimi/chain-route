@@ -42,12 +42,12 @@ const (
 // payment's winning route -- persisted once, atomically with the payment
 // (design doc §7). nil for simulated-mode payments.
 type Quote struct {
-	ID                   string
-	PaymentID            string
-	Provider             string
-	OriginChainID        int64
-	DestinationChainID   int64
-	Asset                string
+	ID                 string
+	PaymentID          string
+	Provider           string
+	OriginChainID      int64
+	DestinationChainID int64
+	Asset              string
 	// InputAmount/OutputAmount/FeeAmount are BASE-UNITS INTEGER decimal
 	// strings (e.g. "1000000000000000"), NOT human-decimal amounts like
 	// Payment.Amount ("0.001") -- deliberately different from Payment.Amount's
