@@ -5,6 +5,23 @@
 
 namespace chainroute_service {
 
+namespace {
+
+chainroute::Graph buildGraphFromCandidates(
+    chainroute::ChainId source, chainroute::ChainId dest, chainroute::AssetId asset,
+    const google::protobuf::RepeatedPtrField<chainroute::v1::CandidateEdge>& candidates) {
+    chainroute::Graph graph;
+    const chainroute::NodeIndex sourceNode = graph.addNode(chainroute::Node{source, asset});
+    const chainroute::NodeIndex destNode = graph.addNode(chainroute::Node{dest, asset});
+    for (const auto& c : candidates) {
+        graph.addEdge(sourceNode, chainroute::Edge{
+            destNode, c.bridge_name(), c.fee(), c.latency_ms(), c.liquidity(), c.reliability()});
+    }
+    return graph;
+}
+
+}  // namespace
+
 RoutingServiceImpl::RoutingServiceImpl(chainroute::sim::NetworkSimulator& simulator)
     : simulator_(simulator) {}
 
@@ -29,7 +46,9 @@ grpc::Status RoutingServiceImpl::FindRoute(
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "amount must be positive");
     }
 
-    const chainroute::Graph graph = simulator_.snapshot();
+    const chainroute::Graph graph = request->candidate_edges_size() > 0
+        ? buildGraphFromCandidates(*sourceChain, *destChain, *asset, request->candidate_edges())
+        : simulator_.snapshot();
 
     const auto sourceNode = graph.findNode(chainroute::Node{*sourceChain, *asset});
     const auto destNode = graph.findNode(chainroute::Node{*destChain, *asset});

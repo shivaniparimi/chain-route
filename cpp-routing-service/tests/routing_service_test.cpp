@@ -123,5 +123,91 @@ TEST(RoutingServiceTest, RejectsNaNAmount) {
     EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
 }
 
+TEST(RoutingServiceTest, UsesCandidateEdgesInsteadOfSimulatorWhenPresent) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* cheap = request.add_candidate_edges();
+    cheap->set_bridge_name("across");
+    cheap->set_fee(0.0001);
+    cheap->set_latency_ms(60000.0);
+    cheap->set_liquidity(0.001);
+    cheap->set_reliability(1.0);
+
+    auto* expensive = request.add_candidate_edges();
+    expensive->set_bridge_name("other-provider");
+    expensive->set_fee(0.01);
+    expensive->set_latency_ms(60000.0);
+    expensive->set_liquidity(0.001);
+    expensive->set_reliability(1.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    const grpc::Status status = service.FindRoute(&context, &request, &response);
+
+    ASSERT_TRUE(status.ok());
+    ASSERT_TRUE(response.route_found());
+    ASSERT_EQ(response.hops_size(), 1);
+    EXPECT_EQ(response.hops(0).bridge_name(), "across");
+    EXPECT_DOUBLE_EQ(response.hops(0).fee(), 0.0001);
+    EXPECT_EQ(response.hops(0).from_chain(), chainroute::v1::CHAIN_ETHEREUM);
+    EXPECT_EQ(response.hops(0).to_chain(), chainroute::v1::CHAIN_BASE);
+    EXPECT_DOUBLE_EQ(response.total_fee(), 0.0001);
+}
+
+TEST(RoutingServiceTest, CandidateEdgeBelowLiquidityIsFilteredOut) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* tooSmall = request.add_candidate_edges();
+    tooSmall->set_bridge_name("across");
+    tooSmall->set_fee(0.0001);
+    tooSmall->set_latency_ms(60000.0);
+    tooSmall->set_liquidity(0.0);  // Available=false maps to liquidity=0 (design §4)
+    tooSmall->set_reliability(1.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    const grpc::Status status = service.FindRoute(&context, &request, &response);
+
+    ASSERT_TRUE(status.ok());
+    EXPECT_FALSE(response.route_found());
+    EXPECT_EQ(response.hops_size(), 0);
+}
+
+TEST(RoutingServiceTest, EmptyCandidateEdgesFallsBackToSimulator) {
+    // No candidate_edges set at all -- must take the exact same path as
+    // every pre-Phase-8 test above, proving backward compatibility.
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_USDC);
+    request.set_amount(1000.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    const grpc::Status status = service.FindRoute(&context, &request, &response);
+
+    ASSERT_TRUE(status.ok());
+    // Same assertion shape as the pre-existing ReturnsARouteForAValidRequest
+    // test -- simulator-driven, so route_found depends on the seed's
+    // topology, not asserted true/false here, only that no crash/error occurs.
+}
+
 }  // namespace
 }  // namespace chainroute_service
