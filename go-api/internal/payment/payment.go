@@ -80,7 +80,7 @@ type Payment struct {
 	Hops             []Hop
 	ExecutionMode    ExecutionMode
 	BridgeProvider   *string
-	FailureReason    *string // populated only for the two Phase 8 reasons: routing_quote_expired, fee_slippage_exceeded
+	FailureReason    *string // populated only for the Phase 8 reasons: routing_quote_expired, fee_slippage_exceeded, route_unavailable, amount_exceeds_guardrail
 	Quote            *Quote  // set by the caller before CreateOrGetPayment for testnet-mode; nil for simulated
 	CreatedAt        time.Time
 	UpdatedAt        time.Time

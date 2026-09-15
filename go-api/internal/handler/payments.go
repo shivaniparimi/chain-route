@@ -65,6 +65,7 @@ type paymentResponse struct {
 	Hops             []hopResponse `json:"hops"`
 	ExecutionMode    string        `json:"execution_mode"`
 	BridgeProvider   *string       `json:"bridge_provider"`
+	FailureReason    *string       `json:"failure_reason"`
 	ExternalTxHash   *string       `json:"external_tx_hash"`
 	SubmittedAt      *string       `json:"submitted_at"`
 	CreatedAt        string        `json:"created_at"`
@@ -100,6 +101,7 @@ func toPaymentResponse(p payment.Payment, exec payment.Execution, execFound bool
 		ID: p.ID, SourceChain: p.SourceChain, DestinationChain: p.DestinationChain,
 		Asset: p.Asset, Amount: p.Amount, Status: string(p.Status), TotalFee: p.TotalFee,
 		Hops: hops, ExecutionMode: string(p.ExecutionMode), BridgeProvider: p.BridgeProvider,
+		FailureReason:  p.FailureReason,
 		ExternalTxHash: externalTxHash, SubmittedAt: submittedAt,
 		CreatedAt:   p.CreatedAt.UTC().Format(time.RFC3339Nano),
 		UpdatedAt:   p.UpdatedAt.UTC().Format(time.RFC3339Nano),

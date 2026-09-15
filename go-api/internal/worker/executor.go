@@ -117,7 +117,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 		return fmt.Errorf("fetch fresh quote for payment %s: %w", paymentID, err)
 	}
 	if !freshQuote.Available {
-		if _, err := e.Store.MarkProcessingFailed(ctx, paymentID, "fee_slippage_exceeded"); err != nil {
+		if _, err := e.Store.MarkProcessingFailed(ctx, paymentID, "route_unavailable"); err != nil {
 			return fmt.Errorf("mark payment %s failed (route no longer available): %w", paymentID, err)
 		}
 		return nil
@@ -147,7 +147,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	if !created {
 		return nil
 	}
-	return e.signAndBroadcastFresh(ctx, exec, freshQuote)
+	return e.signAndBroadcastFresh(ctx, exec, quoteRow, freshQuote)
 }
 
 // exceedsSlippageTolerance reports whether freshFee exceeds baselineFee
@@ -269,7 +269,14 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 		return nil
 	}
 
-	return e.signAndBroadcastFresh(ctx, exec, freshQuote)
+	if e.MaxAmountWei != nil && inputAmount.Cmp(e.MaxAmountWei) > 0 {
+		if _, err := e.Store.MarkProcessingFailed(ctx, exec.PaymentID, "amount_exceeds_guardrail"); err != nil {
+			return fmt.Errorf("mark payment %s failed (amount_exceeds_guardrail): %w", exec.PaymentID, err)
+		}
+		return nil
+	}
+
+	return e.signAndBroadcastFresh(ctx, exec, quoteRow, freshQuote)
 }
 
 // signAndBroadcastFresh builds DepositV3Params from freshQuote (via
@@ -277,11 +284,37 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 // re-validating anything itself -- the validation across.Provider.GetQuote
 // already performed (Task 6) is what makes this safe: signAndBroadcastFresh
 // trusts freshQuote came from a provider call, not raw user input.
-func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, freshQuote quote.Quote) error {
+//
+// It also re-asserts, right before building the transaction, that the
+// persisted routing-time quote (quoteRow) actually agrees with this
+// Executor's own fixed chain/SpokePool constants. Nothing else in this call
+// chain ties "the route that was quoted and persisted" to "the route this
+// Executor is hardwired to sign for" -- across.Provider.GetQuote only checks
+// its own request against its own response, which says nothing about
+// whether quoteRow.OriginChainID/DestinationChainID (the persisted,
+// routing-time selection) match e.OriginChainID/e.DestChainID. If a second
+// route were ever registered for the same provider name but a different
+// destination, the provider-name lookup upstream would still succeed and
+// this would otherwise silently sign against the WRONG chain/SpokePool. Not
+// reachable today (exactly one route is registered), but this is the exact
+// class of bug design spec §21 exists to prevent, so it is a hard,
+// should-be-unreachable error, never a silent substitution.
+func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, quoteRow payment.Quote, freshQuote quote.Quote) error {
+	if quoteRow.OriginChainID != e.OriginChainID || quoteRow.DestinationChainID != e.DestChainID {
+		return fmt.Errorf("execution %s: persisted quote route (origin=%d, dest=%d) does not match this executor's configured route (origin=%d, dest=%d) -- refusing to sign against a mismatched route",
+			exec.ID, quoteRow.OriginChainID, quoteRow.DestinationChainID, e.OriginChainID, e.DestChainID)
+	}
+
 	payload, err := across.DecodeQuotePayload(freshQuote.RawProviderPayload)
 	if err != nil {
 		return fmt.Errorf("decode across quote payload for execution %s: %w", exec.ID, err)
 	}
+
+	if quotedSpokePool := common.HexToAddress(payload.SpokePoolAddress); quotedSpokePool != e.SpokePoolAddress {
+		return fmt.Errorf("execution %s: quoted SpokePool address %s does not match this executor's configured SpokePool %s -- refusing to sign against a mismatched route",
+			exec.ID, quotedSpokePool.Hex(), e.SpokePoolAddress.Hex())
+	}
+
 	quoteTimestamp, err := strconv.ParseUint(payload.QuoteTimestamp, 10, 32)
 	if err != nil {
 		return fmt.Errorf("parse quote timestamp %q: %w", payload.QuoteTimestamp, err)

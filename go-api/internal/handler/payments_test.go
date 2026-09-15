@@ -314,6 +314,65 @@ func TestToPaymentResponse_CompletedAtSetWhenTerminal(t *testing.T) {
 	}
 }
 
+// TestToPaymentResponse_FailureReasonSetWhenFailed guards the fix for the
+// final-review finding that payment.FailureReason was persisted and read
+// internally but never exposed via GET /payments/{id} -- the whole
+// justification for the failure_reason column is that a caller can learn
+// WHY a payment failed. Mirrors
+// TestToPaymentResponse_CompletedAtSetWhenTerminal's null-vs-set pattern.
+func TestToPaymentResponse_FailureReasonSetWhenFailed(t *testing.T) {
+	reason := "fee_slippage_exceeded"
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-failure-reason-set", Status: payment.StatusFailed, FailureReason: &reason,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-failure-reason-set", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	got, ok := body["failure_reason"].(string)
+	if !ok {
+		t.Fatalf("expected failure_reason to be a string, got %v", body["failure_reason"])
+	}
+	if got != reason {
+		t.Fatalf("expected failure_reason = %q, got %q", reason, got)
+	}
+}
+
+// TestToPaymentResponse_FailureReasonNullWhenNotSet is the null-key
+// counterpart -- a payment with no failure reason must show
+// "failure_reason": null (present, not absent), matching the existing
+// completed_at convention this file already tests.
+func TestToPaymentResponse_FailureReasonNullWhenNotSet(t *testing.T) {
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-failure-reason-null", Status: payment.StatusRouted, FailureReason: nil,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-failure-reason-null", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	v, ok := body["failure_reason"]
+	if !ok {
+		t.Fatal("expected failure_reason key to be present in the response")
+	}
+	if v != nil {
+		t.Fatalf("expected failure_reason to be null, got %v", v)
+	}
+}
+
 func TestPostPayments_TestnetModeRejectedWhenServerNotConfigured(t *testing.T) {
 	// h.BlockchainEnv left at its zero value "" -- testnet mode is disabled.
 	h := &Handler{Client: &fakeClient{}, Store: &fakePaymentStore{}}

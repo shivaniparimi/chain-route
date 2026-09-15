@@ -679,6 +679,110 @@ func TestExecuteTestnetPayment_FeeDecreaseAlwaysPasses(t *testing.T) {
 	}
 }
 
+// TestExecuteTestnetPayment_QuoteRouteMismatchIsHardError guards the fix for
+// the final-review finding that nothing tied the persisted quote's route
+// (quoteRow.OriginChainID/DestinationChainID) to what signAndBroadcastFresh
+// actually signs against (e.OriginChainID/e.DestChainID, the Executor's own
+// fixed constants). This pairs a quoteRow naming a DIFFERENT destination
+// chain than the executor's configured DestChainID with an otherwise
+// perfectly valid, available, non-slippage-tripping fresh quote, and asserts
+// signAndBroadcastFresh's new guard rejects it before ever calling
+// SendTransaction -- same "should be unreachable" hard-error category as
+// TestExecuteTestnetPayment_UnknownPersistedProviderIsHardError below.
+func TestExecuteTestnetPayment_QuoteRouteMismatchIsHardError(t *testing.T) {
+	store, ethClient := newRejectedQuoteTestSetup(t, "pay-route-mismatch")
+	store.quoteFound = true
+	store.quoteRow = payment.Quote{
+		Provider: "across", OriginChainID: 11155111, DestinationChainID: 999999, Asset: "WETH", // mismatched destination chain
+		FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour),
+	}
+	e := newTestExecutor(t, store, ethClient)
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{
+		quote: quote.Quote{
+			ProviderName: "across", Available: true,
+			FeeBaseUnits:          big.NewInt(100_000_000_000), // equal to baseline fee -- never trips slippage
+			InputAmountBaseUnits:  big.NewInt(1_000_000_000_000_000),
+			OutputAmountBaseUnits: big.NewInt(900_000_000_000_000),
+			RawProviderPayload:    rawAcrossPayload(),
+		},
+	}}
+	assertQuoteRejected(t, e, store, ethClient, "pay-route-mismatch")
+}
+
+// TestExecuteTestnetPayment_QuoteSpokePoolMismatchIsHardError is the
+// SpokePool-address half of the same guard: a quoteRow whose origin/dest
+// chain IDs match the executor, but whose decoded quote payload names a
+// different SpokePool address than e.SpokePoolAddress, must also be
+// rejected before signing.
+func TestExecuteTestnetPayment_QuoteSpokePoolMismatchIsHardError(t *testing.T) {
+	store, ethClient := newRejectedQuoteTestSetup(t, "pay-spokepool-mismatch")
+	store.quoteFound = true
+	store.quoteRow = payment.Quote{
+		Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+		FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour),
+	}
+	e := newTestExecutor(t, store, ethClient)
+	mismatchedPayload := json.RawMessage(`{"exclusiveRelayer":"0x0000000000000000000000000000000000000000","quoteTimestamp":"1789340112","fillDeadline":"1789347312","exclusivityDeadline":0,"spokePoolAddress":"0x000000000000000000000000000000000000dEaD"}`)
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{
+		quote: quote.Quote{
+			ProviderName: "across", Available: true,
+			FeeBaseUnits:          big.NewInt(100_000_000_000),
+			InputAmountBaseUnits:  big.NewInt(1_000_000_000_000_000),
+			OutputAmountBaseUnits: big.NewInt(900_000_000_000_000),
+			RawProviderPayload:    mismatchedPayload,
+		},
+	}}
+	assertQuoteRejected(t, e, store, ethClient, "pay-spokepool-mismatch")
+}
+
+// TestDriveExecutionForward_UnsignedResumedExecRejectsAmountExceedingMaxAmountWei
+// guards the fix for the final-review finding that MAX_TESTNET_AMOUNT_WEI was
+// enforced on the first-attempt path (ExecuteTestnetPayment) but not on
+// DriveExecutionForward's unsigned-row resume branch (crash point B). An
+// operator lowering the ceiling and restarting the worker must still stop an
+// in-flight, not-yet-signed payment from broadcasting.
+func TestDriveExecutionForward_UnsignedResumedExecRejectsAmountExceedingMaxAmountWei(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound: true,
+		quoteRow: payment.Quote{
+			Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+			FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour),
+		},
+		pmt: payment.Payment{ID: "pay-resume-ceiling", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	e.MaxAmountWei = big.NewInt(1) // 0.001 WETH = 10^15 wei, far above this ceiling
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{
+		quote: quote.Quote{
+			ProviderName: "across", Available: true,
+			FeeBaseUnits:          big.NewInt(100_000_000_000), // equal to baseline -- never trips slippage
+			InputAmountBaseUnits:  big.NewInt(1_000_000_000_000_000),
+			OutputAmountBaseUnits: big.NewInt(900_000_000_000_000),
+			RawProviderPayload:    rawAcrossPayload(),
+		},
+	}}
+
+	// An unsigned execution row -- the nonce is already allocated (crash
+	// point B), but signing hasn't happened yet.
+	exec := payment.Execution{ID: "exec-resume-ceiling", PaymentID: "pay-resume-ceiling", Nonce: 1}
+	if err := e.DriveExecutionForward(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error (an over-guardrail amount is a handled outcome, not a Go error): %v", err)
+	}
+	if store.markFailedReason != "amount_exceeds_guardrail" {
+		t.Errorf("markFailedReason = %q, want amount_exceeds_guardrail", store.markFailedReason)
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never sign/broadcast a resumed unsigned execution whose amount exceeds MAX_TESTNET_AMOUNT_WEI")
+	}
+	if store.persistedHash != "" {
+		t.Fatal("must never persist a signed tx built from an over-guardrail amount on resume")
+	}
+	if store.broadcastCalled || store.submittedCalled {
+		t.Fatal("must never mark broadcast/submitted when the amount exceeds the guardrail on resume")
+	}
+}
+
 func TestExecuteTestnetPayment_UnknownPersistedProviderIsHardError(t *testing.T) {
 	store := &fakeExecutorStore{
 		quoteFound: true,
