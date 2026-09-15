@@ -36,3 +36,28 @@ func DecimalToBaseUnits(amount string, decimals uint8) (*big.Int, error) {
 	}
 	return result, nil
 }
+
+// BaseUnitsToDecimal converts an integer base-units amount back into an
+// exact decimal string at the given token precision -- the inverse of
+// DecimalToBaseUnits, using big.Int exclusively. Trailing fractional
+// zeros are trimmed (e.g. 18-decimal "1000000000000000000" becomes "1",
+// not "1.000000000000000000"); a decimals of 0 produces the integer
+// string unchanged.
+func BaseUnitsToDecimal(amount *big.Int, decimals uint8) string {
+	neg := amount.Sign() < 0
+	s := new(big.Int).Abs(amount).String()
+	for len(s) <= int(decimals) {
+		s = "0" + s
+	}
+	splitAt := len(s) - int(decimals)
+	intPart, fracPart := s[:splitAt], strings.TrimRight(s[splitAt:], "0")
+
+	result := intPart
+	if fracPart != "" {
+		result += "." + fracPart
+	}
+	if neg && result != "0" {
+		result = "-" + result
+	}
+	return result
+}
