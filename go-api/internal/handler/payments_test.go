@@ -334,9 +334,19 @@ func TestPostPayments_TestnetModeRejectsUnsupportedRoute(t *testing.T) {
 }
 
 func TestPostPayments_TestnetModeRejectsAmountOverCeiling(t *testing.T) {
+	// A registered provider for the route is required so the request
+	// actually reaches the MaxTestnetAmountWei ceiling check instead of
+	// being rejected earlier at the registry-lookup step (an empty/nil
+	// registry also yields 400, but via the "unsupported route" branch,
+	// which would make this test a false positive for the ceiling logic
+	// it's named after).
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: true}})
+
 	h := &Handler{
 		Client: &fakeClient{}, Store: &fakePaymentStore{},
 		BlockchainEnv: "testnet", MaxTestnetAmountWei: big.NewInt(1), // absurdly low, guarantees rejection
+		QuoteRegistry: registry,
 	}
 	rec := doPaymentRequest(h, "POST", "/payments", "testnet-ceiling-key",
 		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
@@ -369,6 +379,24 @@ func TestPostPayments_TestnetMode_UnregisteredRouteReturns400(t *testing.T) {
 	}
 	rec := doPaymentRequest(h, "POST", "/payments", "test-unregistered-route",
 		`{"source_chain":"arbitrum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Unlike TestPostPayments_TestnetMode_UnregisteredRouteReturns400 (which
+// uses an unsupported chain -- arbitrum -- so it's rejected by the
+// chain/asset map lookup before ever consulting the registry), this uses
+// a chain/asset combination the maps DO resolve (ethereum/base/eth) but
+// for which the registry itself has nothing registered, exercising the
+// len(providers) == 0 branch on its own.
+func TestPostPayments_TestnetMode_ValidRouteButNoProviderRegisteredReturns400(t *testing.T) {
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: quote.NewRegistry(), // nothing registered for testnetChainKey
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-valid-route-no-provider",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
 	}
