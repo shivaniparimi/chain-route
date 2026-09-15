@@ -78,3 +78,49 @@ func TestDecimalToBaseUnits_RejectionProducesNoValue(t *testing.T) {
 		t.Fatalf("expected a nil result alongside the rejection error, got %v", got)
 	}
 }
+
+func TestBaseUnitsToDecimal_ExactRoundTrip(t *testing.T) {
+	cases := []struct {
+		amount   string
+		decimals uint8
+		want     string
+	}{
+		{"1000000000000000", 18, "0.001"},
+		{"1000000000000000000", 18, "1"},
+		{"1", 18, "0.000000000000000001"},
+		{"0", 18, "0"},
+		{"123456", 6, "0.123456"},
+		{"1000000", 6, "1"},
+		{"100", 0, "100"},
+	}
+	for _, c := range cases {
+		n, ok := new(big.Int).SetString(c.amount, 10)
+		if !ok {
+			t.Fatalf("bad test fixture amount %q", c.amount)
+		}
+		got := BaseUnitsToDecimal(n, c.decimals)
+		if got != c.want {
+			t.Errorf("BaseUnitsToDecimal(%s, %d) = %q, want %q", c.amount, c.decimals, got, c.want)
+		}
+	}
+}
+
+func TestBaseUnitsToDecimal_InverseOfDecimalToBaseUnits(t *testing.T) {
+	// Round-tripping through both conversions must be lossless for every
+	// amount DecimalToBaseUnits already accepts.
+	decimalsIn := []string{"1.5", "0.001", "1000.123456789012345678", "0"}
+	for _, d := range decimalsIn {
+		baseUnits, err := DecimalToBaseUnits(d, 18)
+		if err != nil {
+			t.Fatalf("DecimalToBaseUnits(%q): %v", d, err)
+		}
+		back := BaseUnitsToDecimal(baseUnits, 18)
+		reparsed, err := DecimalToBaseUnits(back, 18)
+		if err != nil {
+			t.Fatalf("DecimalToBaseUnits(%q) on round-trip: %v", back, err)
+		}
+		if reparsed.Cmp(baseUnits) != 0 {
+			t.Errorf("round-trip mismatch for %q: got base units %s back as %s", d, baseUnits, back)
+		}
+	}
+}

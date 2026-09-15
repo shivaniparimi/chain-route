@@ -2,6 +2,7 @@ package across
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -55,6 +56,36 @@ func TestSuggestedFees_RejectsAmountTooLow(t *testing.T) {
 	_, err := c.SuggestedFees(context.Background(), 11155111, 84532, "0xin", "0xout", "1")
 	if err == nil {
 		t.Fatal("expected an error when the API reports isAmountTooLow")
+	}
+}
+
+func TestSuggestedFees_AmountTooLowIsErrAmountTooLow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"isAmountTooLow":true,"outputAmount":"0","fillDeadline":"0","exclusivityDeadline":0,"exclusiveRelayer":"0x0","timestamp":"0","spokePoolAddress":"0x0"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	_, err := c.SuggestedFees(context.Background(), 11155111, 84532, "0xin", "0xout", "1")
+	if !errors.Is(err, ErrAmountTooLow) {
+		t.Fatalf("expected errors.Is(err, ErrAmountTooLow), got %v", err)
+	}
+}
+
+func TestSuggestedFees_ParsesEstimatedFillTimeSec(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(realSuggestedFeesFixture))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	resp, err := c.SuggestedFees(context.Background(), 11155111, 84532,
+		"0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14", "0x4200000000000000000000000000000000000006", "1000000000000000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.EstimatedFillTimeSec != 10 {
+		t.Fatalf("EstimatedFillTimeSec = %d, want 10 (per realSuggestedFeesFixture)", resp.EstimatedFillTimeSec)
 	}
 }
 

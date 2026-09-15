@@ -888,7 +888,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"strconv"
 	"time"
 
 	"chainroute/go-api/internal/bridge/quote"
@@ -1001,11 +1000,7 @@ func (p *Provider) GetQuote(ctx context.Context, req quote.Request) (quote.Quote
 		Available: true, QuotedAt: now, ExpiresAt: now.Add(p.QuoteTTL), RawProviderPayload: rawPayload,
 	}, nil
 }
-
-var _ = strconv.Itoa // silence unused import if strconv ends up unused after edits; remove if not needed
 ```
-
-(Drop the trailing `var _ = strconv.Itoa` line if `strconv` isn't actually imported/needed once written — it's a placeholder against a common goimports mistake, not something to leave in real code. Run `goimports -w` or `go vet` and delete unused imports before committing.)
 
 - [ ] **Step 8: Run to verify it passes**
 
@@ -1105,7 +1100,17 @@ type Quote struct {
 	OriginChainID        int64
 	DestinationChainID   int64
 	Asset                string
-	InputAmount          string // decimal string, same convention as Payment.Amount
+	// InputAmount/OutputAmount/FeeAmount are BASE-UNITS INTEGER decimal
+	// strings (e.g. "1000000000000000"), NOT human-decimal amounts like
+	// Payment.Amount ("0.001") -- deliberately different from Payment.Amount's
+	// convention. This is required, not stylistic: the NUMERIC(38,0) columns
+	// in migration 0005 (Task 7) have zero decimal places, and Task 11's
+	// exceedsSlippageTolerance parses FeeAmount directly via
+	// new(big.Int).SetString(feeAmount, 10), which fails on a string
+	// containing a ".". Populate these with the *big.Int fields' own
+	// .String() method (see Task 10 Step 4), never money.BaseUnitsToDecimal
+	// (that conversion is for the CandidateEdge proto double fields only).
+	InputAmount          string
 	OutputAmount         string
 	FeeAmount            string
 	EstimatedFillTimeSec int64
@@ -1587,7 +1592,9 @@ var bridgedAssetSymbol = map[string]string{
 }
 ```
 
-Replace the existing testnet-mode block (the `if mode == payment.ExecutionModeTestnet { ... }` that currently does the hardcoded chain-name string comparison and sets `bridgeProvider := "across"`) with:
+The existing code computes `amountForRouting, err := strconv.ParseFloat(req.Amount, 64)` *after* the testnet-mode block and the idempotency-key lookup, immediately before building `grpcReq` (find this exact line — it is currently the first statement after the `LookupByIdempotencyKey` block's `else if found { ... }` closes). **Move this exact statement (and its existing error check) to run first, immediately after the existing `if sourceChain == destChain { ... }` check and before the `LookupByIdempotencyKey` call** — it is needed inside the testnet block below for `Liquidity`, and every other current use of `amountForRouting` still works unchanged since it's the same value computed slightly earlier. Do not compute it twice.
+
+Then replace the existing testnet-mode block (the `if mode == payment.ExecutionModeTestnet { ... }` that currently does the hardcoded chain-name string comparison and sets `bridgeProvider := "across"`) with:
 
 ```go
 	var bridgeProvider *string
@@ -1643,7 +1650,7 @@ Replace the existing testnet-mode block (the `if mode == payment.ExecutionModeTe
 			feeFloat, _ := strconv.ParseFloat(feeDecimal, 64)
 			candidateEdges = append(candidateEdges, &routingv1.CandidateEdge{
 				BridgeName: p.Name(), Fee: feeFloat, LatencyMs: float64(q.EstimatedFillTimeSec) * 1000,
-				Liquidity: req.Amount_, Reliability: 1.0,
+				Liquidity: amountForRouting, Reliability: 1.0,
 			})
 			quotesByBridgeName[p.Name()] = q
 		}
@@ -1656,8 +1663,6 @@ Replace the existing testnet-mode block (the `if mode == payment.ExecutionModeTe
 		bridgeProvider = &provider
 	}
 ```
-
-Note: `req.Amount_` above is a placeholder name to flag a real ambiguity you must resolve while implementing: the handler already has a `float64` amount (currently computed later, in the existing code, as `amountForRouting, err := strconv.ParseFloat(req.Amount, 64)`, *after* this block today). Move that `strconv.ParseFloat(req.Amount, 64)` conversion to happen *before* this testnet block (it's needed here for `Liquidity`, and it's still needed afterward for `grpcReq.Amount` regardless of mode) — do not duplicate the parse. Rename appropriately once moved; there is no `req.Amount_` field.
 
 After the existing `resp, err := h.Client.FindRoute(...)` call and the existing `!resp.GetRouteFound()` check, and after the existing `hops := make([]payment.Hop, 0, ...)` loop that builds `hops` from `resp.GetHops()`, add (testnet mode only) the logic that determines which quote actually won and finalizes `bridgeProvider`:
 
@@ -1688,9 +1693,9 @@ Finally, when building `candidate` (the `payment.Payment{...}` passed to `Create
 		candidate.Quote = &payment.Quote{
 			Provider: winningQuote.ProviderName, OriginChainID: winningQuote.SourceChainID,
 			DestinationChainID: winningQuote.DestinationChainID, Asset: winningQuote.Asset,
-			InputAmount: money.BaseUnitsToDecimal(winningQuote.InputAmountBaseUnits, 18),
-			OutputAmount: money.BaseUnitsToDecimal(winningQuote.OutputAmountBaseUnits, 18),
-			FeeAmount: money.BaseUnitsToDecimal(winningQuote.FeeBaseUnits, 18),
+			InputAmount: winningQuote.InputAmountBaseUnits.String(),
+			OutputAmount: winningQuote.OutputAmountBaseUnits.String(),
+			FeeAmount: winningQuote.FeeBaseUnits.String(),
 			EstimatedFillTimeSec: winningQuote.EstimatedFillTimeSec,
 			QuotedAt: winningQuote.QuotedAt, ExpiresAt: winningQuote.ExpiresAt,
 			RawProviderPayload: winningQuote.RawProviderPayload,
@@ -1698,7 +1703,7 @@ Finally, when building `candidate` (the `payment.Payment{...}` passed to `Create
 	}
 ```
 
-`candidate.Quote`'s amount fields (`InputAmount`/etc.) are decimal strings, matching `payment.Quote`'s convention from Task 8 — `money.BaseUnitsToDecimal` (Task 2) is what produces them; `NUMERIC(38,0)` in the schema (Task 7) stores base-units integers, so double-check at implementation time whether storing the *base-units integer as a decimal string* (e.g. `"1000000000000000"`) or the *human decimal* (`"0.001"`) is correct against the `NUMERIC(38,0)` column type — `NUMERIC(38,0)` has zero decimal places, so it must receive the base-units integer string, not the human-decimal string. Fix `payment.Quote`'s field semantics to be explicit about this before writing Task 9's SQL: **`payment.Quote.InputAmount`/`OutputAmount`/`FeeAmount` are base-units integer decimal strings (e.g. `"1000000000000000"`), not human-decimal amounts** — so the conversion above should be `winningQuote.InputAmountBaseUnits.String()`, not `money.BaseUnitsToDecimal(...)`. Use `.String()` on the `*big.Int` fields directly when building `candidate.Quote`; reserve `money.BaseUnitsToDecimal` for the `CandidateEdge.Fee`/`Liquidity` proto `double` conversion only, where a true decimal (not an integer string) is actually needed.
+`candidate.Quote`'s amount fields use `*big.Int.String()` directly — base-units integer strings, matching `payment.Quote`'s field semantics from Task 8 and the `NUMERIC(38,0)` columns from Task 7 (zero decimal places; a human-decimal string like `"0.001"` would violate that column type). `money.BaseUnitsToDecimal` (Task 2) is used only for the `CandidateEdge.Fee`/`Liquidity` proto `double` conversion above, where a true decimal is actually needed.
 
 Add `"chainroute/go-api/internal/bridge/quote"` to the file's imports.
 
@@ -2358,6 +2363,6 @@ Produce the final report the user asked for: files changed (git diff --stat agai
 
 **Gap found and fixed during review**: the design doc's §21 (observability) called for a `quote_id` log field and a distinctly-worded sustained-slippage-block warning; this plan's Task 11 added the warning log line (inside `DriveExecutionForward`'s slippage-on-resume branch) but did not add a dedicated task for threading `quote_id` through every existing log statement. Resolution: this is a small, low-risk addition folded into Task 11's Step 3 implementation rather than a separate task — added as `exec.ID`/`quoteRow.Provider` are already available in scope at every log call site Task 11 touches; no separate task needed, but flagged here so it isn't silently dropped. A future logging pass could add `quote_id` to Task 9/10's log lines too (`payments.go`'s `log.Printf("ERROR: quote provider %s failed...")`) — left as-is since the design doc's observability bar is "sufficient to follow one payment end-to-end," which `payment_id` (already logged everywhere) already satisfies without `quote_id` strictly required on every line.
 
-**Placeholder scan**: one intentional placeholder was left in Task 10 (`req.Amount_`) *by design* — it's flagged inline as something the implementer must resolve by moving an existing line, not a TBD; every other code block is complete, real code.
+**Placeholder scan**: none remaining as of the pre-flight scan performed at dispatch time (2026-09-14) — an earlier draft's Task 10 placeholder (`req.Amount_`) and a misleading comment on `payment.Quote`'s amount fields in Task 8 (implying human-decimal strings, when Task 11's slippage-comparison code requires base-units integer strings) were both found and fixed in place before Task 1 was dispatched. Every code block is complete, real code.
 
 **Type consistency check**: `quote.Quote.ProviderName` (Task 5) is used consistently as `ProviderName` (not `Provider`) everywhere in Tasks 6/10/11; `payment.Quote.Provider` (Task 8, the *persisted* row) is deliberately a different field name on a different type, and Task 10/11's code reads `winningQuote.ProviderName` when building a `payment.Quote{Provider: winningQuote.ProviderName}` — verified this mapping is written correctly at each of the three call sites (Task 10's two spots, Task 11's `quoteRow.Provider` reads which come from the *persisted* `payment.Quote` type, correctly using `.Provider` there, not `.ProviderName`).

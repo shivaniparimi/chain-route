@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
 	"chainroute/go-api/internal/payment"
 )
@@ -312,6 +314,65 @@ func TestToPaymentResponse_CompletedAtSetWhenTerminal(t *testing.T) {
 	}
 }
 
+// TestToPaymentResponse_FailureReasonSetWhenFailed guards the fix for the
+// final-review finding that payment.FailureReason was persisted and read
+// internally but never exposed via GET /payments/{id} -- the whole
+// justification for the failure_reason column is that a caller can learn
+// WHY a payment failed. Mirrors
+// TestToPaymentResponse_CompletedAtSetWhenTerminal's null-vs-set pattern.
+func TestToPaymentResponse_FailureReasonSetWhenFailed(t *testing.T) {
+	reason := "fee_slippage_exceeded"
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-failure-reason-set", Status: payment.StatusFailed, FailureReason: &reason,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-failure-reason-set", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	got, ok := body["failure_reason"].(string)
+	if !ok {
+		t.Fatalf("expected failure_reason to be a string, got %v", body["failure_reason"])
+	}
+	if got != reason {
+		t.Fatalf("expected failure_reason = %q, got %q", reason, got)
+	}
+}
+
+// TestToPaymentResponse_FailureReasonNullWhenNotSet is the null-key
+// counterpart -- a payment with no failure reason must show
+// "failure_reason": null (present, not absent), matching the existing
+// completed_at convention this file already tests.
+func TestToPaymentResponse_FailureReasonNullWhenNotSet(t *testing.T) {
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-failure-reason-null", Status: payment.StatusRouted, FailureReason: nil,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-failure-reason-null", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	v, ok := body["failure_reason"]
+	if !ok {
+		t.Fatal("expected failure_reason key to be present in the response")
+	}
+	if v != nil {
+		t.Fatalf("expected failure_reason to be null, got %v", v)
+	}
+}
+
 func TestPostPayments_TestnetModeRejectedWhenServerNotConfigured(t *testing.T) {
 	// h.BlockchainEnv left at its zero value "" -- testnet mode is disabled.
 	h := &Handler{Client: &fakeClient{}, Store: &fakePaymentStore{}}
@@ -332,14 +393,144 @@ func TestPostPayments_TestnetModeRejectsUnsupportedRoute(t *testing.T) {
 }
 
 func TestPostPayments_TestnetModeRejectsAmountOverCeiling(t *testing.T) {
+	// A registered provider for the route is required so the request
+	// actually reaches the MaxTestnetAmountWei ceiling check instead of
+	// being rejected earlier at the registry-lookup step (an empty/nil
+	// registry also yields 400, but via the "unsupported route" branch,
+	// which would make this test a false positive for the ceiling logic
+	// it's named after).
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: true}})
+
 	h := &Handler{
 		Client: &fakeClient{}, Store: &fakePaymentStore{},
 		BlockchainEnv: "testnet", MaxTestnetAmountWei: big.NewInt(1), // absurdly low, guarantees rejection
+		QuoteRegistry: registry,
 	}
 	rec := doPaymentRequest(h, "POST", "/payments", "testnet-ceiling-key",
 		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an amount over the configured ceiling, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+type fakeQuoteProvider struct {
+	name  string
+	quote quote.Quote
+	err   error
+}
+
+func (f *fakeQuoteProvider) Name() string { return f.name }
+func (f *fakeQuoteProvider) GetQuote(_ context.Context, _ quote.Request) (quote.Quote, error) {
+	return f.quote, f.err
+}
+
+// testnetChainKey mirrors the ethereum->base, WETH route the handler
+// resolves for source_chain=ethereum, destination_chain=base, asset=eth
+// in testnet mode (see testnetChainIDByChain/bridgedAssetSymbol in
+// routes.go).
+var testnetChainKey = quote.RouteKey{SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH"}
+
+func TestPostPayments_TestnetMode_UnregisteredRouteReturns400(t *testing.T) {
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: quote.NewRegistry(), // nothing registered
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-unregistered-route",
+		`{"source_chain":"arbitrum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Unlike TestPostPayments_TestnetMode_UnregisteredRouteReturns400 (which
+// uses an unsupported chain -- arbitrum -- so it's rejected by the
+// chain/asset map lookup before ever consulting the registry), this uses
+// a chain/asset combination the maps DO resolve (ethereum/base/eth) but
+// for which the registry itself has nothing registered, exercising the
+// len(providers) == 0 branch on its own.
+func TestPostPayments_TestnetMode_ValidRouteButNoProviderRegisteredReturns400(t *testing.T) {
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: quote.NewRegistry(), // nothing registered for testnetChainKey
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-valid-route-no-provider",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_ProviderReportsUnavailableReturns422(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: false}})
+
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: registry,
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-unavailable",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_ProviderErrorReturns503(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", err: errors.New("connection refused")})
+
+	h := &Handler{
+		Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet",
+		QuoteRegistry: registry,
+	}
+	rec := doPaymentRequest(h, "POST", "/payments", "test-provider-error",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_CandidateEdgeBuiltFromLiveQuote(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{
+		ProviderName: "across", Available: true,
+		InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000), OutputAmountBaseUnits: big.NewInt(999_900_000_000_000),
+		FeeBaseUnits: big.NewInt(100_000_000_000), EstimatedFillTimeSec: 60,
+		QuotedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+		RawProviderPayload: json.RawMessage(`{"spokePoolAddress":"0xabc"}`),
+	}})
+
+	fakeRoute := &fakeClient{
+		response: &routingv1.FindRouteResponse{
+			RouteFound: true, TotalFee: 0.0001,
+			Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "across", Fee: 0.0001, LatencyMs: 60000, Liquidity: 0.001, Reliability: 1.0}},
+		},
+	}
+	store := &fakePaymentStore{}
+	h := &Handler{Client: fakeRoute, Store: store, BlockchainEnv: "testnet", QuoteRegistry: registry}
+
+	rec := doPaymentRequest(h, "POST", "/payments", "test-candidate-edge",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	if len(fakeRoute.lastReq.GetCandidateEdges()) != 1 {
+		t.Fatalf("expected exactly 1 candidate edge sent to FindRoute, got %d", len(fakeRoute.lastReq.GetCandidateEdges()))
+	}
+	edge := fakeRoute.lastReq.GetCandidateEdges()[0]
+	if edge.GetBridgeName() != "across" {
+		t.Errorf("bridge_name = %q, want across", edge.GetBridgeName())
+	}
+	if edge.GetLiquidity() != 0.001 {
+		t.Errorf("liquidity = %v, want 0.001 (the request amount, since Available=true)", edge.GetLiquidity())
+	}
+	if store.lastCreate.Quote == nil {
+		t.Fatal("expected the created payment to carry a Quote to persist")
+	}
+	if store.lastCreate.Quote.Provider != "across" {
+		t.Errorf("persisted Quote.Provider = %q, want across", store.lastCreate.Quote.Provider)
 	}
 }
 

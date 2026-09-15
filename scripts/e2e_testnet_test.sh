@@ -38,6 +38,15 @@ RESPONSE=$(curl -s -X POST "http://127.0.0.1:$HTTP_PORT/payments" \
 PAYMENT_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 echo "Payment created: $PAYMENT_ID"
 
+echo "Verifying the route was sourced from a live bridge quote..."
+HOP0_FEE=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin)['hops'][0]['fee'])")
+python3 -c "import sys; sys.exit(0 if float('$HOP0_FEE') > 0 else 1)" || { echo "FAIL: expected hops[0].fee to be a positive number, got: $HOP0_FEE" >&2; exit 1; }
+
+QUOTE_CHECK_RESPONSE=$(curl -s "http://127.0.0.1:$HTTP_PORT/payments/$PAYMENT_ID")
+BRIDGE_PROVIDER=$(echo "$QUOTE_CHECK_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('bridge_provider'))")
+[[ "$BRIDGE_PROVIDER" == "across" ]] || { echo "FAIL: expected bridge_provider=across, got: $BRIDGE_PROVIDER. Full response: $QUOTE_CHECK_RESPONSE" >&2; exit 1; }
+echo "OK: hops[0].fee=$HOP0_FEE (positive), bridge_provider=across"
+
 echo "Polling for COMPLETED (this can take a few minutes on testnet)..."
 for i in $(seq 1 120); do
     STATUS_RESPONSE=$(curl -s "http://127.0.0.1:$HTTP_PORT/payments/$PAYMENT_ID")

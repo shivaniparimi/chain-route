@@ -1,6 +1,9 @@
 package payment
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Status string
 
@@ -35,6 +38,36 @@ const (
 	ExternalStatusReverted ExternalStatus = "reverted"
 )
 
+// Quote is the normalized bridge quote that produced a testnet-mode
+// payment's winning route -- persisted once, atomically with the payment
+// (design doc §7). nil for simulated-mode payments.
+type Quote struct {
+	ID                 string
+	PaymentID          string
+	Provider           string
+	OriginChainID      int64
+	DestinationChainID int64
+	Asset              string
+	// InputAmount/OutputAmount/FeeAmount are BASE-UNITS INTEGER decimal
+	// strings (e.g. "1000000000000000"), NOT human-decimal amounts like
+	// Payment.Amount ("0.001") -- deliberately different from Payment.Amount's
+	// convention. This is required, not stylistic: the NUMERIC(38,0) columns
+	// in migration 0005 (Task 7) have zero decimal places, and Task 11's
+	// exceedsSlippageTolerance parses FeeAmount directly via
+	// new(big.Int).SetString(feeAmount, 10), which fails on a string
+	// containing a ".". Populate these with the *big.Int fields' own
+	// .String() method (see Task 10 Step 4), never money.BaseUnitsToDecimal
+	// (that conversion is for the CandidateEdge proto double fields only).
+	InputAmount          string
+	OutputAmount         string
+	FeeAmount            string
+	EstimatedFillTimeSec int64
+	QuotedAt             time.Time
+	ExpiresAt            time.Time
+	RawProviderPayload   json.RawMessage
+	CreatedAt            time.Time
+}
+
 type Payment struct {
 	ID               string
 	IdempotencyKey   string
@@ -47,6 +80,8 @@ type Payment struct {
 	Hops             []Hop
 	ExecutionMode    ExecutionMode
 	BridgeProvider   *string
+	FailureReason    *string // populated only for the Phase 8 reasons: routing_quote_expired, fee_slippage_exceeded, route_unavailable, amount_exceeds_guardrail
+	Quote            *Quote  // set by the caller before CreateOrGetPayment for testnet-mode; nil for simulated
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	CompletedAt      *time.Time
