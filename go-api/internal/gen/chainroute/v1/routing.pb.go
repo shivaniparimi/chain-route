@@ -128,19 +128,96 @@ func (Asset) EnumDescriptor() ([]byte, []int) {
 	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{1}
 }
 
+type CandidateEdge struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BridgeName    string                 `protobuf:"bytes,1,opt,name=bridge_name,json=bridgeName,proto3" json:"bridge_name,omitempty"`
+	Fee           float64                `protobuf:"fixed64,2,opt,name=fee,proto3" json:"fee,omitempty"`
+	LatencyMs     float64                `protobuf:"fixed64,3,opt,name=latency_ms,json=latencyMs,proto3" json:"latency_ms,omitempty"`
+	Liquidity     float64                `protobuf:"fixed64,4,opt,name=liquidity,proto3" json:"liquidity,omitempty"`
+	Reliability   float64                `protobuf:"fixed64,5,opt,name=reliability,proto3" json:"reliability,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CandidateEdge) Reset() {
+	*x = CandidateEdge{}
+	mi := &file_chainroute_v1_routing_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CandidateEdge) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CandidateEdge) ProtoMessage() {}
+
+func (x *CandidateEdge) ProtoReflect() protoreflect.Message {
+	mi := &file_chainroute_v1_routing_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CandidateEdge.ProtoReflect.Descriptor instead.
+func (*CandidateEdge) Descriptor() ([]byte, []int) {
+	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *CandidateEdge) GetBridgeName() string {
+	if x != nil {
+		return x.BridgeName
+	}
+	return ""
+}
+
+func (x *CandidateEdge) GetFee() float64 {
+	if x != nil {
+		return x.Fee
+	}
+	return 0
+}
+
+func (x *CandidateEdge) GetLatencyMs() float64 {
+	if x != nil {
+		return x.LatencyMs
+	}
+	return 0
+}
+
+func (x *CandidateEdge) GetLiquidity() float64 {
+	if x != nil {
+		return x.Liquidity
+	}
+	return 0
+}
+
+func (x *CandidateEdge) GetReliability() float64 {
+	if x != nil {
+		return x.Reliability
+	}
+	return 0
+}
+
 type FindRouteRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	SourceChain      Chain                  `protobuf:"varint,1,opt,name=source_chain,json=sourceChain,proto3,enum=chainroute.v1.Chain" json:"source_chain,omitempty"`
 	DestinationChain Chain                  `protobuf:"varint,2,opt,name=destination_chain,json=destinationChain,proto3,enum=chainroute.v1.Chain" json:"destination_chain,omitempty"`
 	Asset            Asset                  `protobuf:"varint,3,opt,name=asset,proto3,enum=chainroute.v1.Asset" json:"asset,omitempty"`
 	Amount           float64                `protobuf:"fixed64,4,opt,name=amount,proto3" json:"amount,omitempty"`
+	CandidateEdges   []*CandidateEdge       `protobuf:"bytes,5,rep,name=candidate_edges,json=candidateEdges,proto3" json:"candidate_edges,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
 
 func (x *FindRouteRequest) Reset() {
 	*x = FindRouteRequest{}
-	mi := &file_chainroute_v1_routing_proto_msgTypes[0]
+	mi := &file_chainroute_v1_routing_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -152,7 +229,7 @@ func (x *FindRouteRequest) String() string {
 func (*FindRouteRequest) ProtoMessage() {}
 
 func (x *FindRouteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_chainroute_v1_routing_proto_msgTypes[0]
+	mi := &file_chainroute_v1_routing_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -165,7 +242,7 @@ func (x *FindRouteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FindRouteRequest.ProtoReflect.Descriptor instead.
 func (*FindRouteRequest) Descriptor() ([]byte, []int) {
-	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{0}
+	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *FindRouteRequest) GetSourceChain() Chain {
@@ -196,6 +273,13 @@ func (x *FindRouteRequest) GetAmount() float64 {
 	return 0
 }
 
+func (x *FindRouteRequest) GetCandidateEdges() []*CandidateEdge {
+	if x != nil {
+		return x.CandidateEdges
+	}
+	return nil
+}
+
 type RouteHop struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FromChain     Chain                  `protobuf:"varint,1,opt,name=from_chain,json=fromChain,proto3,enum=chainroute.v1.Chain" json:"from_chain,omitempty"`
@@ -211,7 +295,7 @@ type RouteHop struct {
 
 func (x *RouteHop) Reset() {
 	*x = RouteHop{}
-	mi := &file_chainroute_v1_routing_proto_msgTypes[1]
+	mi := &file_chainroute_v1_routing_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -223,7 +307,7 @@ func (x *RouteHop) String() string {
 func (*RouteHop) ProtoMessage() {}
 
 func (x *RouteHop) ProtoReflect() protoreflect.Message {
-	mi := &file_chainroute_v1_routing_proto_msgTypes[1]
+	mi := &file_chainroute_v1_routing_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -236,7 +320,7 @@ func (x *RouteHop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteHop.ProtoReflect.Descriptor instead.
 func (*RouteHop) Descriptor() ([]byte, []int) {
-	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{1}
+	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *RouteHop) GetFromChain() Chain {
@@ -299,7 +383,7 @@ type FindRouteResponse struct {
 
 func (x *FindRouteResponse) Reset() {
 	*x = FindRouteResponse{}
-	mi := &file_chainroute_v1_routing_proto_msgTypes[2]
+	mi := &file_chainroute_v1_routing_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -311,7 +395,7 @@ func (x *FindRouteResponse) String() string {
 func (*FindRouteResponse) ProtoMessage() {}
 
 func (x *FindRouteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_chainroute_v1_routing_proto_msgTypes[2]
+	mi := &file_chainroute_v1_routing_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -324,7 +408,7 @@ func (x *FindRouteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FindRouteResponse.ProtoReflect.Descriptor instead.
 func (*FindRouteResponse) Descriptor() ([]byte, []int) {
-	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{2}
+	return file_chainroute_v1_routing_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *FindRouteResponse) GetRouteFound() bool {
@@ -352,12 +436,21 @@ var File_chainroute_v1_routing_proto protoreflect.FileDescriptor
 
 const file_chainroute_v1_routing_proto_rawDesc = "" +
 	"\n" +
-	"\x1bchainroute/v1/routing.proto\x12\rchainroute.v1\"\xd2\x01\n" +
+	"\x1bchainroute/v1/routing.proto\x12\rchainroute.v1\"\xa1\x01\n" +
+	"\rCandidateEdge\x12\x1f\n" +
+	"\vbridge_name\x18\x01 \x01(\tR\n" +
+	"bridgeName\x12\x10\n" +
+	"\x03fee\x18\x02 \x01(\x01R\x03fee\x12\x1d\n" +
+	"\n" +
+	"latency_ms\x18\x03 \x01(\x01R\tlatencyMs\x12\x1c\n" +
+	"\tliquidity\x18\x04 \x01(\x01R\tliquidity\x12 \n" +
+	"\vreliability\x18\x05 \x01(\x01R\vreliability\"\x99\x02\n" +
 	"\x10FindRouteRequest\x127\n" +
 	"\fsource_chain\x18\x01 \x01(\x0e2\x14.chainroute.v1.ChainR\vsourceChain\x12A\n" +
 	"\x11destination_chain\x18\x02 \x01(\x0e2\x14.chainroute.v1.ChainR\x10destinationChain\x12*\n" +
 	"\x05asset\x18\x03 \x01(\x0e2\x14.chainroute.v1.AssetR\x05asset\x12\x16\n" +
-	"\x06amount\x18\x04 \x01(\x01R\x06amount\"\x82\x02\n" +
+	"\x06amount\x18\x04 \x01(\x01R\x06amount\x12E\n" +
+	"\x0fcandidate_edges\x18\x05 \x03(\v2\x1c.chainroute.v1.CandidateEdgeR\x0ecandidateEdges\"\x82\x02\n" +
 	"\bRouteHop\x123\n" +
 	"\n" +
 	"from_chain\x18\x01 \x01(\x0e2\x14.chainroute.v1.ChainR\tfromChain\x12/\n" +
@@ -403,28 +496,30 @@ func file_chainroute_v1_routing_proto_rawDescGZIP() []byte {
 }
 
 var file_chainroute_v1_routing_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_chainroute_v1_routing_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_chainroute_v1_routing_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_chainroute_v1_routing_proto_goTypes = []any{
 	(Chain)(0),                // 0: chainroute.v1.Chain
 	(Asset)(0),                // 1: chainroute.v1.Asset
-	(*FindRouteRequest)(nil),  // 2: chainroute.v1.FindRouteRequest
-	(*RouteHop)(nil),          // 3: chainroute.v1.RouteHop
-	(*FindRouteResponse)(nil), // 4: chainroute.v1.FindRouteResponse
+	(*CandidateEdge)(nil),     // 2: chainroute.v1.CandidateEdge
+	(*FindRouteRequest)(nil),  // 3: chainroute.v1.FindRouteRequest
+	(*RouteHop)(nil),          // 4: chainroute.v1.RouteHop
+	(*FindRouteResponse)(nil), // 5: chainroute.v1.FindRouteResponse
 }
 var file_chainroute_v1_routing_proto_depIdxs = []int32{
 	0, // 0: chainroute.v1.FindRouteRequest.source_chain:type_name -> chainroute.v1.Chain
 	0, // 1: chainroute.v1.FindRouteRequest.destination_chain:type_name -> chainroute.v1.Chain
 	1, // 2: chainroute.v1.FindRouteRequest.asset:type_name -> chainroute.v1.Asset
-	0, // 3: chainroute.v1.RouteHop.from_chain:type_name -> chainroute.v1.Chain
-	0, // 4: chainroute.v1.RouteHop.to_chain:type_name -> chainroute.v1.Chain
-	3, // 5: chainroute.v1.FindRouteResponse.hops:type_name -> chainroute.v1.RouteHop
-	2, // 6: chainroute.v1.RoutingService.FindRoute:input_type -> chainroute.v1.FindRouteRequest
-	4, // 7: chainroute.v1.RoutingService.FindRoute:output_type -> chainroute.v1.FindRouteResponse
-	7, // [7:8] is the sub-list for method output_type
-	6, // [6:7] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	2, // 3: chainroute.v1.FindRouteRequest.candidate_edges:type_name -> chainroute.v1.CandidateEdge
+	0, // 4: chainroute.v1.RouteHop.from_chain:type_name -> chainroute.v1.Chain
+	0, // 5: chainroute.v1.RouteHop.to_chain:type_name -> chainroute.v1.Chain
+	4, // 6: chainroute.v1.FindRouteResponse.hops:type_name -> chainroute.v1.RouteHop
+	3, // 7: chainroute.v1.RoutingService.FindRoute:input_type -> chainroute.v1.FindRouteRequest
+	5, // 8: chainroute.v1.RoutingService.FindRoute:output_type -> chainroute.v1.FindRouteResponse
+	8, // [8:9] is the sub-list for method output_type
+	7, // [7:8] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_chainroute_v1_routing_proto_init() }
@@ -438,7 +533,7 @@ func file_chainroute_v1_routing_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_chainroute_v1_routing_proto_rawDesc), len(file_chainroute_v1_routing_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   3,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

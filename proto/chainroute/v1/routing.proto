@@ -19,11 +19,20 @@ enum Asset {
   ASSET_ETH = 2;
 }
 
+message CandidateEdge {
+  string bridge_name = 1;
+  double fee = 2;
+  double latency_ms = 3;
+  double liquidity = 4;
+  double reliability = 5;
+}
+
 message FindRouteRequest {
   Chain source_chain = 1;
   Chain destination_chain = 2;
   Asset asset = 3;
   double amount = 4;
+  repeated CandidateEdge candidate_edges = 5;
 }
 
 message RouteHop {
