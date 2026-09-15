@@ -124,6 +124,9 @@ echo "Ensuring database schema is up to date..."
 /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
     "SELECT 1 FROM information_schema.tables WHERE table_name='payment_executions'" | grep -q 1 || \
     /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0004_across_testnet_execution.sql"
+/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
+    "SELECT 1 FROM information_schema.tables WHERE table_name='payment_quotes'" | grep -q 1 || \
+    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0005_realtime_bridge_routing.sql"
 
 # Resolve a way to talk to Redpanda's rpk. The upstream project ships rpk
 # directly on PATH when Redpanda is installed natively (e.g. via Homebrew),
