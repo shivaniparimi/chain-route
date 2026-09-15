@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"chainroute/go-api/internal/bridge/across"
+	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/grpcclient"
 	"chainroute/go-api/internal/handler"
 	"chainroute/go-api/internal/postgres"
@@ -31,6 +34,21 @@ func main() {
 
 	blockchainEnv := os.Getenv("BLOCKCHAIN_ENV")
 	maxTestnetAmountWei := envBigIntServer("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000))
+
+	var registry *quote.Registry
+	if blockchainEnv == "testnet" {
+		acrossBaseURL := envOrDefaultServer("ACROSS_TESTNET_API_URL", "https://testnet.across.to/api")
+		routingQuoteTTL := envDurationServer("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second)
+		acrossClient := across.NewClient(acrossBaseURL)
+		acrossClient.APIKey = os.Getenv("ACROSS_API_KEY")
+		acrossClient.IntegratorID = os.Getenv("ACROSS_INTEGRATOR_ID")
+
+		registry = quote.NewRegistry()
+		registry.Register(
+			quote.RouteKey{SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH"},
+			across.NewProvider(acrossClient, routingQuoteTTL),
+		)
+	}
 
 	client, err := grpcclient.Dial(*grpcAddr)
 	if err != nil {
@@ -54,7 +72,7 @@ func main() {
 
 	store := postgres.New(db)
 
-	h := &handler.Handler{Client: client, Store: store, BlockchainEnv: blockchainEnv, MaxTestnetAmountWei: maxTestnetAmountWei}
+	h := &handler.Handler{Client: client, Store: store, BlockchainEnv: blockchainEnv, MaxTestnetAmountWei: maxTestnetAmountWei, QuoteRegistry: registry}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /routes", h.PostRoutes)
 	mux.HandleFunc("POST /payments", h.PostPayments)
@@ -93,4 +111,23 @@ func envBigIntServer(key string, def *big.Int) *big.Int {
 		log.Fatalf("invalid %s: not a valid base-10 integer", key)
 	}
 	return n
+}
+
+func envOrDefaultServer(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envDurationServer(key string, def time.Duration, unit time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("invalid %s: %v", key, err)
+	}
+	return time.Duration(n) * unit
 }

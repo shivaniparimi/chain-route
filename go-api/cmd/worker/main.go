@@ -18,6 +18,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"chainroute/go-api/internal/bridge/across"
+	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/kafka"
@@ -127,6 +128,12 @@ func main() {
 		acrossClient.APIKey = os.Getenv("ACROSS_API_KEY")
 		acrossClient.IntegratorID = os.Getenv("ACROSS_INTEGRATOR_ID")
 
+		maxFeeSlippageBps := envInt64("MAX_FEE_SLIPPAGE_BPS", 500) // 5% default
+		routingQuoteTTL := envDuration("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second)
+		quoteProviders := map[string]quote.Provider{
+			"across": across.NewProvider(acrossClient, routingQuoteTTL),
+		}
+
 		executor = &worker.Executor{
 			Store: store, Wallet: wallet, OriginClient: sepoliaClient, Across: acrossClient,
 			BridgeProvider: "across", OriginChainID: 11155111, DestChainID: 84532,
@@ -134,6 +141,7 @@ func main() {
 			WETHOrigin:       common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
 			WETHDestination:  common.HexToAddress("0x4200000000000000000000000000000000000006"),
 			MaxAmountWei:     maxTestnetAmountWei,
+			QuoteProviders:   quoteProviders, MaxFeeSlippageBps: maxFeeSlippageBps,
 		}
 		reconciler = &worker.Reconciler{
 			Store: store, Executor: executor, OriginClient: sepoliaClient, Across: acrossClient,
@@ -280,6 +288,18 @@ func envBigInt(key string, def *big.Int) *big.Int {
 	n, ok := new(big.Int).SetString(v, 10)
 	if !ok {
 		log.Fatalf("invalid %s: not a valid base-10 integer", key)
+	}
+	return n
+}
+
+func envInt64(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		log.Fatalf("invalid %s: %v", key, err)
 	}
 	return n
 }
