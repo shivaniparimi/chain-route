@@ -42,7 +42,7 @@ func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (ex
 	mode := normalizeExecutionMode(p.ExecutionMode)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_chain, destination_chain, asset, amount::text,
-		       total_fee, status, execution_mode, bridge_provider, completed_at, created_at, updated_at,
+		       total_fee, status, execution_mode, bridge_provider, failure_reason, completed_at, created_at, updated_at,
 		       (source_chain = $2 AND destination_chain = $3
 		        AND asset = $4 AND amount = $5::NUMERIC AND execution_mode = $6) AS request_matches
 		FROM payments
@@ -51,10 +51,11 @@ func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (ex
 
 	var status, execMode string
 	var bridgeProvider sql.NullString
+	var failureReason sql.NullString
 	var completedAt sql.NullTime
 	err = row.Scan(&existing.ID, &existing.SourceChain, &existing.DestinationChain,
 		&existing.Asset, &existing.Amount, &existing.TotalFee, &status, &execMode, &bridgeProvider,
-		&completedAt, &existing.CreatedAt, &existing.UpdatedAt, &matches)
+		&failureReason, &completedAt, &existing.CreatedAt, &existing.UpdatedAt, &matches)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Payment{}, false, false, nil
 	}
@@ -65,6 +66,9 @@ func (s *Store) findByIdempotencyKey(ctx context.Context, p payment.Payment) (ex
 	existing.ExecutionMode = payment.ExecutionMode(execMode)
 	if bridgeProvider.Valid {
 		existing.BridgeProvider = &bridgeProvider.String
+	}
+	if failureReason.Valid {
+		existing.FailureReason = &failureReason.String
 	}
 	if completedAt.Valid {
 		existing.CompletedAt = &completedAt.Time
@@ -101,15 +105,16 @@ func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, boo
 	var p payment.Payment
 	var status, execMode string
 	var bridgeProvider sql.NullString
+	var failureReason sql.NullString
 	var completedAt sql.NullTime
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, idempotency_key, source_chain, destination_chain, asset, amount::text,
-		       total_fee, status, execution_mode, bridge_provider, completed_at, created_at, updated_at
+		       total_fee, status, execution_mode, bridge_provider, failure_reason, completed_at, created_at, updated_at
 		FROM payments
 		WHERE id = $1
 	`, id)
 	err := row.Scan(&p.ID, &p.IdempotencyKey, &p.SourceChain, &p.DestinationChain, &p.Asset,
-		&p.Amount, &p.TotalFee, &status, &execMode, &bridgeProvider, &completedAt, &p.CreatedAt, &p.UpdatedAt)
+		&p.Amount, &p.TotalFee, &status, &execMode, &bridgeProvider, &failureReason, &completedAt, &p.CreatedAt, &p.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Payment{}, false, nil
 	}
@@ -124,6 +129,9 @@ func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, boo
 	p.ExecutionMode = payment.ExecutionMode(execMode)
 	if bridgeProvider.Valid {
 		p.BridgeProvider = &bridgeProvider.String
+	}
+	if failureReason.Valid {
+		p.FailureReason = &failureReason.String
 	}
 	if completedAt.Valid {
 		p.CompletedAt = &completedAt.Time
@@ -233,6 +241,12 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		`, created.ID, h.HopIndex, h.FromChain, h.ToChain, h.BridgeName, h.Fee, h.LatencyMs, h.Liquidity, h.Reliability); err != nil {
 			return payment.Payment{}, 0, fmt.Errorf("insert hop %d: %w", h.HopIndex, err)
+		}
+	}
+
+	if p.Quote != nil {
+		if err := insertPaymentQuote(ctx, tx, created.ID, p.Quote); err != nil {
+			return payment.Payment{}, 0, err
 		}
 	}
 
