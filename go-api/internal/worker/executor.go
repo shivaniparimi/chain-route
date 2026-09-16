@@ -2,11 +2,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math/big"
-	"strconv"
 	"time"
 
 	gethereum "github.com/ethereum/go-ethereum"
@@ -50,19 +50,16 @@ type ExecutorEthClient interface {
 // resuming an existing execution row after a crash or via the reconciler
 // (DriveExecutionForward directly) -- design spec §15.
 type Executor struct {
-	Store             ExecutorStore
-	Wallet            *evm.Wallet
-	OriginClient      ExecutorEthClient
-	Across            *across.Client
-	QuoteProviders    map[string]quote.Provider // keyed by provider name, e.g. "across"
-	MaxFeeSlippageBps int64
-	BridgeProvider    string
-	OriginChainID     int64
-	DestChainID       int64
-	SpokePoolAddress  common.Address
-	WETHOrigin        common.Address
-	WETHDestination   common.Address
-	MaxAmountWei      *big.Int
+	Store                      ExecutorStore
+	Wallet                     *evm.Wallet
+	OriginClient               ExecutorEthClient
+	QuoteProviders             map[string]quote.Provider // keyed by provider name, e.g. "across"
+	Signers                    map[string]quote.Signer   // keyed by provider name, e.g. "across", "relay"
+	ExpectedContractByProvider map[string]common.Address // independently configured -- NEVER derived from a Signer instance (design doc §12)
+	MaxFeeSlippageBps          int64
+	OriginChainID              int64
+	DestChainID                int64
+	MaxAmountWei               *big.Int
 }
 
 // ExecuteTestnetPayment runs the expiry/provider-lookup/fresh-quote/
@@ -138,7 +135,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	}
 
 	exec, created, err := e.Store.TryCreateExecution(ctx, postgres.CreateExecutionParams{
-		PaymentID: paymentID, WalletAddress: e.Wallet.Address.Hex(), BridgeProvider: e.BridgeProvider,
+		PaymentID: paymentID, WalletAddress: e.Wallet.Address.Hex(), BridgeProvider: quoteRow.Provider,
 		OriginChainID: e.OriginChainID, DestinationChainID: e.DestChainID,
 	})
 	if err != nil {
@@ -279,60 +276,51 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 	return e.signAndBroadcastFresh(ctx, exec, quoteRow, freshQuote)
 }
 
-// signAndBroadcastFresh builds DepositV3Params from freshQuote (via
-// across.DecodeQuotePayload) instead of calling e.Across.SuggestedFees or
-// re-validating anything itself -- the validation across.Provider.GetQuote
-// already performed (Task 6) is what makes this safe: signAndBroadcastFresh
-// trusts freshQuote came from a provider call, not raw user input.
+// signAndBroadcastFresh dispatches to whichever quote.Signer was actually
+// selected and persisted for this execution (quoteRow.Provider) -- design
+// doc §11/§12. It no longer knows anything Across-specific: building the
+// unsigned transaction is entirely the Signer's job (BuildTransaction),
+// while Executor remains the sole owner of gas estimation, nonce
+// assignment, and wallet.SignTx for every provider.
 //
-// It also re-asserts, right before building the transaction, that the
-// persisted routing-time quote (quoteRow) actually agrees with this
-// Executor's own fixed chain/SpokePool constants. Nothing else in this call
-// chain ties "the route that was quoted and persisted" to "the route this
-// Executor is hardwired to sign for" -- across.Provider.GetQuote only checks
-// its own request against its own response, which says nothing about
-// whether quoteRow.OriginChainID/DestinationChainID (the persisted,
-// routing-time selection) match e.OriginChainID/e.DestChainID. If a second
-// route were ever registered for the same provider name but a different
-// destination, the provider-name lookup upstream would still succeed and
-// this would otherwise silently sign against the WRONG chain/SpokePool. Not
-// reachable today (exactly one route is registered), but this is the exact
-// class of bug design spec §21 exists to prevent, so it is a hard,
-// should-be-unreachable error, never a silent substitution.
+// Before ever calling wallet.SignTx, it runs validateEnvelope -- an
+// independent, provider-agnostic checkpoint that re-asserts the envelope's
+// chain ID, target contract, and value against this Executor's own
+// separately-configured expectations (e.OriginChainID,
+// e.ExpectedContractByProvider, freshQuote.InputAmountBaseUnits). Nothing
+// else in this call chain ties "the route that was quoted and persisted" to
+// "the transaction this Executor is about to sign" -- a Signer's own
+// internal validation (e.g. across.Provider.BuildTransaction's SpokePool
+// check) only checks its own request against its own response, which says
+// nothing about whether the Signer itself is misconfigured or misbehaving.
+// This is the exact class of bug design spec §21 exists to prevent, so it
+// is a hard, should-be-unreachable error, never a silent substitution.
 func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, quoteRow payment.Quote, freshQuote quote.Quote) error {
-	if quoteRow.OriginChainID != e.OriginChainID || quoteRow.DestinationChainID != e.DestChainID {
-		return fmt.Errorf("execution %s: persisted quote route (origin=%d, dest=%d) does not match this executor's configured route (origin=%d, dest=%d) -- refusing to sign against a mismatched route",
-			exec.ID, quoteRow.OriginChainID, quoteRow.DestinationChainID, e.OriginChainID, e.DestChainID)
+	signer, ok := e.Signers[quoteRow.Provider]
+	if !ok {
+		return fmt.Errorf("execution %s uses provider %q, which this worker has no configured signer for", exec.ID, quoteRow.Provider)
+	}
+	envelope, err := signer.BuildTransaction(ctx, freshQuote)
+	if err != nil {
+		return fmt.Errorf("build transaction for execution %s: %w", exec.ID, err)
+	}
+	if err := e.validateEnvelope(envelope, quoteRow, freshQuote); err != nil {
+		return fmt.Errorf("execution %s: %w", exec.ID, err)
 	}
 
-	payload, err := across.DecodeQuotePayload(freshQuote.RawProviderPayload)
+	gasPrice, err := e.OriginClient.SuggestGasPrice(ctx)
 	if err != nil {
-		return fmt.Errorf("decode across quote payload for execution %s: %w", exec.ID, err)
+		return fmt.Errorf("suggest gas price: %w", err)
 	}
-
-	if quotedSpokePool := common.HexToAddress(payload.SpokePoolAddress); quotedSpokePool != e.SpokePoolAddress {
-		return fmt.Errorf("execution %s: quoted SpokePool address %s does not match this executor's configured SpokePool %s -- refusing to sign against a mismatched route",
-			exec.ID, quotedSpokePool.Hex(), e.SpokePoolAddress.Hex())
-	}
-
-	quoteTimestamp, err := strconv.ParseUint(payload.QuoteTimestamp, 10, 32)
+	const fallbackGasLimit = 500_000
+	gasLimit, err := e.OriginClient.EstimateGas(ctx, gethereum.CallMsg{From: e.Wallet.Address, To: &envelope.To, Value: envelope.Value, Data: envelope.Data})
 	if err != nil {
-		return fmt.Errorf("parse quote timestamp %q: %w", payload.QuoteTimestamp, err)
+		gasLimit = fallbackGasLimit
 	}
-	fillDeadline, err := strconv.ParseUint(payload.FillDeadline, 10, 32)
+	unsignedTx := types.NewTx(&types.LegacyTx{Nonce: uint64(exec.Nonce), To: &envelope.To, Value: envelope.Value, Gas: gasLimit, GasPrice: gasPrice, Data: envelope.Data})
+	signedTx, err := e.Wallet.SignTx(unsignedTx, big.NewInt(envelope.ChainID))
 	if err != nil {
-		return fmt.Errorf("parse fill deadline %q: %w", payload.FillDeadline, err)
-	}
-
-	signedTx, err := across.BuildAndSignDepositV3Tx(ctx, e.OriginClient, e.Wallet, e.OriginChainID, e.SpokePoolAddress, uint64(exec.Nonce), across.DepositV3Params{
-		Recipient: e.Wallet.Address, InputToken: e.WETHOrigin, OutputToken: e.WETHDestination,
-		InputAmount: freshQuote.InputAmountBaseUnits, OutputAmount: freshQuote.OutputAmountBaseUnits,
-		DestinationChainID: big.NewInt(e.DestChainID), ExclusiveRelayer: common.HexToAddress(payload.ExclusiveRelayer),
-		QuoteTimestamp: uint32(quoteTimestamp), FillDeadline: uint32(fillDeadline),
-		ExclusivityDeadline: uint32(payload.ExclusivityDeadline),
-	})
-	if err != nil {
-		return fmt.Errorf("build/sign tx: %w", err)
+		return fmt.Errorf("sign tx for execution %s: %w", exec.ID, err)
 	}
 
 	rawTx, err := signedTx.MarshalBinary()
@@ -340,7 +328,8 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 		return fmt.Errorf("marshal signed tx: %w", err)
 	}
 	hash := signedTx.Hash().Hex()
-	if err := e.Store.PersistSignedExecution(ctx, exec.ID, rawTx, hash, nil); err != nil {
+	providerReferenceID := extractProviderReferenceID(freshQuote)
+	if err := e.Store.PersistSignedExecution(ctx, exec.ID, rawTx, hash, providerReferenceID); err != nil {
 		return fmt.Errorf("persist signed execution: %w", err)
 	}
 	exec.SignedTxHash = &hash
@@ -356,6 +345,43 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 		return fmt.Errorf("mark payment %s submitted: %w", exec.PaymentID, err)
 	}
 	return nil
+}
+
+// validateEnvelope is the independent, provider-agnostic checkpoint that
+// runs before wallet.SignTx for every provider (design doc §12). It is
+// deliberately NOT told anything by the Signer that built envelope --
+// e.ExpectedContractByProvider is populated from a separate configuration
+// source (cmd/worker/main.go), so this can catch a genuine bug or a
+// misbehaving provider rather than comparing a value against itself.
+func (e *Executor) validateEnvelope(envelope quote.TxEnvelope, quoteRow payment.Quote, freshQuote quote.Quote) error {
+	if envelope.ChainID != e.OriginChainID {
+		return fmt.Errorf("envelope chainId %d does not match configured origin chain %d", envelope.ChainID, e.OriginChainID)
+	}
+	expectedTo, ok := e.ExpectedContractByProvider[quoteRow.Provider]
+	if !ok || envelope.To != expectedTo {
+		return fmt.Errorf("envelope target %s does not match the pinned contract for provider %q", envelope.To.Hex(), quoteRow.Provider)
+	}
+	if envelope.Value == nil || freshQuote.InputAmountBaseUnits == nil || envelope.Value.Cmp(freshQuote.InputAmountBaseUnits) != 0 {
+		return fmt.Errorf("envelope value %s does not match the validated input amount %s", envelope.Value, freshQuote.InputAmountBaseUnits)
+	}
+	return nil
+}
+
+// extractProviderReferenceID pulls Relay's requestId (if this quote came
+// from Relay) out of RawProviderPayload for persistence alongside the
+// signed bytes (design doc §16) -- returns nil for Across, which has no
+// separate reference ID (its reconciliation keys on the origin tx hash).
+func extractProviderReferenceID(freshQuote quote.Quote) *string {
+	if freshQuote.ProviderName != "relay" {
+		return nil
+	}
+	var payload struct {
+		RequestID string `json:"requestId"`
+	}
+	if err := json.Unmarshal(freshQuote.RawProviderPayload, &payload); err != nil || payload.RequestID == "" {
+		return nil
+	}
+	return &payload.RequestID
 }
 
 // broadcastWithRecovery implements design spec §8 step 4 / §14: on ANY

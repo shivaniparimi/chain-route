@@ -165,13 +165,28 @@ func newTestExecutorWithAcrossBody(t *testing.T, store *fakeExecutorStore, ethCl
 		store.pmt = payment.Payment{ID: "default-test-payment", Amount: "0.001"}
 	}
 
-	return &Executor{
-		Store: store, Wallet: wallet, OriginClient: ethClient, Across: acrossClient,
-		QuoteProviders: map[string]quote.Provider{"across": across.NewProvider(acrossClient, time.Hour)},
-		BridgeProvider: "across", OriginChainID: 11155111, DestChainID: 84532,
+	// The same real *across.Provider instance is wired as both the
+	// QuoteProviders entry (GetQuote against the fake HTTP server) and the
+	// Signers entry (BuildTransaction, which needs WalletAddress/
+	// SpokePoolAddress/WETHOrigin/WETHDestination/OriginChainID populated) --
+	// exactly how cmd/worker/main.go wires a live *across.Provider (Task 11).
+	acrossProvider := &across.Provider{
+		Client: acrossClient, QuoteTTL: time.Hour,
+		WalletAddress:    wallet.Address,
 		SpokePoolAddress: common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662"),
 		WETHOrigin:       common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
 		WETHDestination:  common.HexToAddress("0x4200000000000000000000000000000000000006"),
+		OriginChainID:    11155111,
+	}
+
+	return &Executor{
+		Store: store, Wallet: wallet, OriginClient: ethClient,
+		QuoteProviders: map[string]quote.Provider{"across": acrossProvider},
+		Signers:        map[string]quote.Signer{"across": acrossProvider},
+		ExpectedContractByProvider: map[string]common.Address{
+			"across": common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662"),
+		},
+		OriginChainID: 11155111, DestChainID: 84532,
 	}
 }
 
@@ -195,6 +210,32 @@ type fakeExecutorQuoteProvider struct {
 func (f *fakeExecutorQuoteProvider) Name() string { return "across" }
 func (f *fakeExecutorQuoteProvider) GetQuote(ctx context.Context, req quote.Request) (quote.Quote, error) {
 	return f.quote, f.err
+}
+
+// fakeSigner is a local stand-in for quote.Signer, used by tests that need
+// to control the exact TxEnvelope BuildTransaction returns -- independent
+// of any real provider's own internal validation (e.g. across.Provider's
+// SpokePool check) -- so that Executor's own validateEnvelope guard can be
+// exercised in isolation.
+type fakeSigner struct {
+	name     string
+	envelope quote.TxEnvelope
+	buildErr error
+	quote    quote.Quote
+	quoteErr error
+}
+
+func (f *fakeSigner) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "across"
+}
+func (f *fakeSigner) GetQuote(ctx context.Context, req quote.Request) (quote.Quote, error) {
+	return f.quote, f.quoteErr
+}
+func (f *fakeSigner) BuildTransaction(ctx context.Context, freshQuote quote.Quote) (quote.TxEnvelope, error) {
+	return f.envelope, f.buildErr
 }
 
 func TestExecuteTestnetPayment_HappyPath(t *testing.T) {
@@ -655,6 +696,13 @@ func TestExecuteTestnetPayment_FeeDecreaseAlwaysPasses(t *testing.T) {
 	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{
 		quote: quote.Quote{
 			ProviderName: "across", Available: true,
+			// SourceChainID must be set to e.OriginChainID: since Task 9,
+			// across.Provider.BuildTransaction's returned envelope.ChainID
+			// comes directly from freshQuote.SourceChainID (not from a
+			// separately-passed origin chain constant), and Executor's
+			// validateEnvelope independently checks envelope.ChainID against
+			// e.OriginChainID before ever signing.
+			SourceChainID: 11155111,
 			// InputAmountBaseUnits set (unlike the ExcessiveSlippage fixture
 			// above, which never reaches signing) because this test proceeds
 			// all the way through signAndBroadcastFresh, which builds the
@@ -799,5 +847,168 @@ func TestExecuteTestnetPayment_UnknownPersistedProviderIsHardError(t *testing.T)
 	}
 	if store.tryCreateCalled {
 		t.Fatal("must never allocate a nonce for a provider this worker cannot execute")
+	}
+}
+
+// The tests below guard Task 9's core safety property: validateEnvelope is
+// an independent, provider-agnostic checkpoint that runs immediately before
+// wallet.SignTx, for EVERY provider -- it is deliberately never told
+// anything by the Signer that built the envelope, so a genuine bug or a
+// misbehaving Signer (not just a malicious external API response) is
+// still caught. Each test drives the full ExecuteTestnetPayment path with a
+// fakeSigner returning a deliberately-wrong envelope in exactly one
+// dimension, and asserts BOTH that a hard error is returned AND that
+// SendTransaction is never called -- an execution row's nonce may already
+// be allocated by this point (TryCreateExecution has already succeeded),
+// but this must never be signed and broadcast against a corrupted envelope.
+//
+// Note on error expectations: unlike the pre-nonce-allocation checks
+// (expiry/slippage/guardrail), which are "handled outcomes" (nil error +
+// MarkProcessingFailed), a validateEnvelope rejection happens AFTER the
+// nonce is allocated -- exactly the same "should be unreachable" hard-error
+// category as TestExecuteTestnetPayment_QuoteRouteMismatchIsHardError and
+// TestExecuteTestnetPayment_UnknownPersistedProviderIsHardError above, both
+// of which assert a non-nil error. These tests follow that same, consistent
+// pattern.
+
+func TestExecuteTestnetPayment_WrongEnvelopeChainIDIsHardError(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound:       true,
+		quoteRow:         payment.Quote{Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour)},
+		tryCreateCreated: true, tryCreateExec: payment.Execution{ID: "exec-badchain", PaymentID: "pay-badchain", Nonce: 1},
+		pmt: payment.Payment{ID: "pay-badchain", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	e.Signers = map[string]quote.Signer{"across": &fakeSigner{envelope: quote.TxEnvelope{To: e.ExpectedContractByProvider["across"], Value: big.NewInt(1_000_000_000_000_000), ChainID: 999999}}}
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000)}}}
+
+	err := e.ExecuteTestnetPayment(context.Background(), "pay-badchain")
+	if err == nil {
+		t.Fatal("expected a hard error when the envelope's ChainID doesn't match e.OriginChainID")
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never sign/broadcast an envelope whose ChainID doesn't match e.OriginChainID")
+	}
+}
+
+func TestExecuteTestnetPayment_WrongEnvelopeTargetIsHardError(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound:       true,
+		quoteRow:         payment.Quote{Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour)},
+		tryCreateCreated: true, tryCreateExec: payment.Execution{ID: "exec-badtarget", PaymentID: "pay-badtarget", Nonce: 1},
+		pmt: payment.Payment{ID: "pay-badtarget", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	// Envelope.To is some other address than e.ExpectedContractByProvider["across"].
+	e.Signers = map[string]quote.Signer{"across": &fakeSigner{envelope: quote.TxEnvelope{
+		To: common.HexToAddress("0x000000000000000000000000000000000000dEaD"), Value: big.NewInt(1_000_000_000_000_000), ChainID: e.OriginChainID,
+	}}}
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000)}}}
+
+	err := e.ExecuteTestnetPayment(context.Background(), "pay-badtarget")
+	if err == nil {
+		t.Fatal("expected a hard error when the envelope's target doesn't match the pinned contract for the provider")
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never sign/broadcast an envelope whose target doesn't match the pinned contract for the provider")
+	}
+}
+
+func TestExecuteTestnetPayment_WrongEnvelopeValueIsHardError(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound:       true,
+		quoteRow:         payment.Quote{Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour)},
+		tryCreateCreated: true, tryCreateExec: payment.Execution{ID: "exec-badvalue", PaymentID: "pay-badvalue", Nonce: 1},
+		pmt: payment.Payment{ID: "pay-badvalue", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	// Envelope.Value != the fresh quote's InputAmountBaseUnits (1_000_000_000_000_000).
+	e.Signers = map[string]quote.Signer{"across": &fakeSigner{envelope: quote.TxEnvelope{
+		To: e.ExpectedContractByProvider["across"], Value: big.NewInt(1), ChainID: e.OriginChainID,
+	}}}
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000)}}}
+
+	err := e.ExecuteTestnetPayment(context.Background(), "pay-badvalue")
+	if err == nil {
+		t.Fatal("expected a hard error when the envelope's value doesn't match the validated input amount")
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never sign/broadcast an envelope whose value doesn't match the validated input amount")
+	}
+}
+
+func TestExecuteTestnetPayment_UnknownSignerIsHardError(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound:       true,
+		quoteRow:         payment.Quote{Provider: "relay", OriginChainID: 11155111, DestinationChainID: 84532, FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour)},
+		tryCreateCreated: true, tryCreateExec: payment.Execution{ID: "exec-unknown-signer", PaymentID: "pay-unknown-signer", Nonce: 1},
+		pmt: payment.Payment{ID: "pay-unknown-signer", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	// QuoteProviders has an entry for "relay" (so the pre-nonce-allocation
+	// provider lookup in ExecuteTestnetPayment succeeds and a nonce gets
+	// allocated), but e.Signers only has "across" configured -- the later,
+	// sign-time lookup in signAndBroadcastFresh must independently reject
+	// this rather than silently substituting the "across" signer.
+	e.QuoteProviders["relay"] = &fakeExecutorQuoteProvider{quote: quote.Quote{
+		ProviderName: "relay", Available: true,
+		FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000),
+	}}
+
+	err := e.ExecuteTestnetPayment(context.Background(), "pay-unknown-signer")
+	if err == nil {
+		t.Fatal("expected a hard error when the persisted provider has no configured signer -- never a silent substitution")
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never sign/broadcast for a provider this worker has no configured signer for")
+	}
+}
+
+// TestExecuteTestnetPayment_RelayShapedEnvelopePassesValidationAndSigns is
+// the full happy-path proof that validateEnvelope (and the rest of
+// signAndBroadcastFresh) is genuinely provider-agnostic, not secretly
+// Across-shaped: it wires a Relay-shaped fakeSigner (its own contract
+// address, distinct from Across's SpokePool) into e.Signers/
+// e.ExpectedContractByProvider under "relay" and asserts the complete
+// sign/persist/broadcast/submit sequence completes exactly as it would for
+// Across.
+func TestExecuteTestnetPayment_RelayShapedEnvelopePassesValidationAndSigns(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound:       true,
+		quoteRow:         payment.Quote{Provider: "relay", OriginChainID: 11155111, DestinationChainID: 84532, FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour)},
+		tryCreateCreated: true, tryCreateExec: payment.Execution{ID: "exec-relay-happy", PaymentID: "pay-relay-happy", Nonce: 7},
+		pmt: payment.Payment{ID: "pay-relay-happy", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{txByHashFound: false, txByHashErr: gethereum.NotFound}
+	e := newTestExecutor(t, store, ethClient)
+
+	relayContract := common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	e.ExpectedContractByProvider["relay"] = relayContract
+	e.QuoteProviders["relay"] = &fakeExecutorQuoteProvider{quote: quote.Quote{
+		ProviderName: "relay", Available: true,
+		FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000),
+	}}
+	e.Signers["relay"] = &fakeSigner{name: "relay", envelope: quote.TxEnvelope{
+		To: relayContract, Value: big.NewInt(1_000_000_000_000_000), ChainID: e.OriginChainID, Data: []byte{0xde, 0xad, 0xbe, 0xef},
+	}}
+
+	if err := e.ExecuteTestnetPayment(context.Background(), "pay-relay-happy"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.persistedHash == "" {
+		t.Fatal("expected the signed tx hash to be persisted before broadcast")
+	}
+	if !ethClient.sendCalled {
+		t.Fatal("expected SendTransaction to be called")
+	}
+	if !store.broadcastCalled {
+		t.Fatal("expected MarkExecutionBroadcast to be called")
+	}
+	if !store.submittedCalled {
+		t.Fatal("expected MarkSubmitted to be called")
 	}
 }
