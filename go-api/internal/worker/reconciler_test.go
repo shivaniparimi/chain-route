@@ -17,14 +17,14 @@ import (
 
 type fakeReconcilerStore struct {
 	fakeExecutorStore
-	staleNoExecIDs    []string
-	candidates        []payment.Execution
+	staleNoExecIDs       []string
+	candidates           []payment.Execution
 	getExecByPayment     map[string]payment.Execution
 	updateStatusCalls    []payment.ExternalStatus
 	updateRawStatusCalls []string
 	completeCalls        []payment.Status
-	lowestNonce       int64
-	lowestNonceFound  bool
+	lowestNonce          int64
+	lowestNonceFound     bool
 
 	// completeSubmittedFails, when true, makes CompleteSubmittedPayment
 	// report completed=false (as if its own WHERE status = 'SUBMITTED'
@@ -346,6 +346,48 @@ func TestCheckAndUpdateOutcome_RelayFailureFailsPayment(t *testing.T) {
 	}
 	if !reflect.DeepEqual(store.updateStatusCalls, []payment.ExternalStatus{payment.ExternalStatusFillFailed}) {
 		t.Fatalf("UpdateExecutionExternalStatus calls: got %v", store.updateStatusCalls)
+	}
+	if !reflect.DeepEqual(store.completeCalls, []payment.Status{payment.StatusFailed}) {
+		t.Fatalf("CompleteSubmittedPayment calls: got %v", store.completeCalls)
+	}
+}
+
+// TestCheckAndUpdateOutcome_RefundedFailsPayment asserts that a
+// StatusChecker reporting quote.StateRefunded (raw status "refunded" here --
+// Across's "expired"/"refunded" raw statuses and Relay's "refund" raw status
+// both map to this same shared state) drives the Reconciler's own terminal
+// switch (reconciler.go's `case quote.StateRefunded, quote.StateReverted,
+// quote.StateFillFailed:`) end-to-end: markTerminal is called with
+// payment.StatusFailed, the persisted external status is the
+// externalStateToStatus(quote.StateRefunded) mapping
+// (payment.ExternalStatusRefunded), and the configured raw status string is
+// what UpdateExecutionExternalStatus persists as rawStatus. Prior to this
+// test, no test anywhere in the package drove a fakeStatusChecker to return
+// quote.StateRefunded and asserted the Reconciler's resulting behavior --
+// across/status_test.go and relay/status_test.go cover only the raw-string
+// -> quote.ExternalState mapping at the provider layer, not this switch.
+func TestCheckAndUpdateOutcome_RefundedFailsPayment(t *testing.T) {
+	hash := "0x6060606060606060606060606060606060606060606060606060606060606060"
+	store := &fakeReconcilerStore{}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{
+		common.HexToHash(hash): {Status: 1},
+	}}
+	acrossChecker := &fakeStatusChecker{name: "across", checkResult: quote.StatusResult{State: quote.StateRefunded, RawStatus: "refunded"}}
+	r := &Reconciler{
+		Store: store, OriginClient: ethClient,
+		StatusCheckers: map[string]quote.StatusChecker{"across": acrossChecker},
+		OriginChainID:  11155111, Staleness: time.Hour,
+	}
+
+	exec := payment.Execution{ID: "exec-refunded", PaymentID: "pay-refunded", SignedTxHash: &hash, BridgeProvider: "across"}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(store.updateStatusCalls, []payment.ExternalStatus{payment.ExternalStatusRefunded}) {
+		t.Fatalf("UpdateExecutionExternalStatus calls: got %v", store.updateStatusCalls)
+	}
+	if !reflect.DeepEqual(store.updateRawStatusCalls, []string{"refunded"}) {
+		t.Fatalf("expected raw status \"refunded\" to be persisted, got %v", store.updateRawStatusCalls)
 	}
 	if !reflect.DeepEqual(store.completeCalls, []payment.Status{payment.StatusFailed}) {
 		t.Fatalf("CompleteSubmittedPayment calls: got %v", store.completeCalls)
