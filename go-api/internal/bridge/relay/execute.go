@@ -19,8 +19,8 @@ func (p *Provider) BuildTransaction(ctx context.Context, freshQuote quote.Quote)
 		return quote.TxEnvelope{}, fmt.Errorf("relay: decode quote payload: %w", err)
 	}
 
-	if payload.Recipient != "" && common.HexToAddress(payload.Recipient) != p.WalletAddress {
-		return quote.TxEnvelope{}, fmt.Errorf("relay: quoted recipient %s does not match this wallet %s -- refusing to build a transaction for someone else's funds", payload.Recipient, p.WalletAddress.Hex())
+	if payload.Recipient == "" || common.HexToAddress(payload.Recipient) != p.WalletAddress {
+		return quote.TxEnvelope{}, fmt.Errorf("relay: quote payload has no verifiable recipient (got %q) -- refusing to build a transaction without recipient verification", payload.Recipient)
 	}
 
 	value, ok := new(big.Int).SetString(payload.Value, 10)
