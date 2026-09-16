@@ -209,5 +209,128 @@ TEST(RoutingServiceTest, EmptyCandidateEdgesFallsBackToSimulator) {
     // topology, not asserted true/false here, only that no crash/error occurs.
 }
 
+TEST(RoutingServiceTest, TwoRealProviders_AcrossCheaper_AcrossSelected) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* across = request.add_candidate_edges();
+    across->set_bridge_name("across"); across->set_fee(0.0001);
+    across->set_latency_ms(60000.0); across->set_liquidity(0.001); across->set_reliability(1.0);
+    auto* relay = request.add_candidate_edges();
+    relay->set_bridge_name("relay"); relay->set_fee(0.0005);
+    relay->set_latency_ms(4000.0); relay->set_liquidity(0.001); relay->set_reliability(1.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service.FindRoute(&context, &request, &response).ok());
+    ASSERT_TRUE(response.route_found());
+    ASSERT_EQ(response.hops_size(), 1);
+    EXPECT_EQ(response.hops(0).bridge_name(), "across");
+}
+
+TEST(RoutingServiceTest, TwoRealProviders_RelayCheaper_RelaySelected) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* across = request.add_candidate_edges();
+    across->set_bridge_name("across"); across->set_fee(0.0005);
+    across->set_latency_ms(60000.0); across->set_liquidity(0.001); across->set_reliability(1.0);
+    auto* relay = request.add_candidate_edges();
+    relay->set_bridge_name("relay"); relay->set_fee(0.0001);
+    relay->set_latency_ms(4000.0); relay->set_liquidity(0.001); relay->set_reliability(1.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service.FindRoute(&context, &request, &response).ok());
+    ASSERT_TRUE(response.route_found());
+    EXPECT_EQ(response.hops(0).bridge_name(), "relay");
+}
+
+TEST(RoutingServiceTest, TwoRealProviders_EqualFee_FirstInsertedWins) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* across = request.add_candidate_edges();
+    across->set_bridge_name("across"); across->set_fee(0.0002);
+    across->set_latency_ms(60000.0); across->set_liquidity(0.001); across->set_reliability(1.0);
+    auto* relay = request.add_candidate_edges();
+    relay->set_bridge_name("relay"); relay->set_fee(0.0002); // exactly equal
+    relay->set_latency_ms(4000.0); relay->set_liquidity(0.001); relay->set_reliability(1.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service.FindRoute(&context, &request, &response).ok());
+    ASSERT_TRUE(response.route_found());
+    // Documents the existing, non-business tie-break (design doc §9): the
+    // FIRST-inserted edge wins ties, not a deliberate provider preference.
+    EXPECT_EQ(response.hops(0).bridge_name(), "across");
+}
+
+TEST(RoutingServiceTest, TwoRealProviders_RelayUnavailable_AcrossSelected) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* across = request.add_candidate_edges();
+    across->set_bridge_name("across"); across->set_fee(0.0001);
+    across->set_latency_ms(60000.0); across->set_liquidity(0.001); across->set_reliability(1.0);
+    auto* relay = request.add_candidate_edges();
+    relay->set_bridge_name("relay"); relay->set_fee(0.00001); // cheaper, but unavailable
+    relay->set_latency_ms(4000.0); relay->set_liquidity(0.0); relay->set_reliability(1.0); // Available=false -> liquidity=0
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service.FindRoute(&context, &request, &response).ok());
+    ASSERT_TRUE(response.route_found());
+    EXPECT_EQ(response.hops(0).bridge_name(), "across");
+}
+
+TEST(RoutingServiceTest, TwoRealProviders_NeitherViable_NoRoute) {
+    chainroute::sim::NetworkSimulator simulator(1001);
+    RoutingServiceImpl service(simulator);
+
+    chainroute::v1::FindRouteRequest request;
+    request.set_source_chain(chainroute::v1::CHAIN_ETHEREUM);
+    request.set_destination_chain(chainroute::v1::CHAIN_BASE);
+    request.set_asset(chainroute::v1::ASSET_ETH);
+    request.set_amount(0.001);
+
+    auto* across = request.add_candidate_edges();
+    across->set_bridge_name("across"); across->set_fee(0.0001);
+    across->set_latency_ms(60000.0); across->set_liquidity(0.0); across->set_reliability(1.0);
+    auto* relay = request.add_candidate_edges();
+    relay->set_bridge_name("relay"); relay->set_fee(0.0001);
+    relay->set_latency_ms(4000.0); relay->set_liquidity(0.0); relay->set_reliability(1.0);
+
+    chainroute::v1::FindRouteResponse response;
+    grpc::ServerContext context;
+    ASSERT_TRUE(service.FindRoute(&context, &request, &response).ok());
+    EXPECT_FALSE(response.route_found());
+    EXPECT_EQ(response.hops_size(), 0);
+}
+
 }  // namespace
 }  // namespace chainroute_service
