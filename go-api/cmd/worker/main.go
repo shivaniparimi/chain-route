@@ -19,6 +19,7 @@ import (
 
 	"chainroute/go-api/internal/bridge/across"
 	"chainroute/go-api/internal/bridge/quote"
+	"chainroute/go-api/internal/bridge/relay"
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/kafka"
@@ -130,21 +131,42 @@ func main() {
 
 		maxFeeSlippageBps := envInt64("MAX_FEE_SLIPPAGE_BPS", 500) // 5% default
 		routingQuoteTTL := envDuration("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second)
-		quoteProviders := map[string]quote.Provider{
-			"across": across.NewProvider(acrossClient, routingQuoteTTL),
-		}
+
+		spokePoolAddress := common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662")
+		wethOrigin := common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14")
+		wethDestination := common.HexToAddress("0x4200000000000000000000000000000000000006")
+
+		acrossProvider := across.NewProvider(acrossClient, routingQuoteTTL)
+		acrossProvider.WalletAddress = wallet.Address
+		acrossProvider.OriginChainID = 11155111
+		acrossProvider.SpokePoolAddress = spokePoolAddress
+		acrossProvider.WETHOrigin = wethOrigin
+		acrossProvider.WETHDestination = wethDestination
+
+		relayBaseURL := envOrDefault("RELAY_TESTNET_API_URL", "https://api.testnets.relay.link")
+		relayClient := relay.NewClient(relayBaseURL)
+		relayClient.APIKey = os.Getenv("RELAY_API_KEY")
+		relayProvider := relay.NewProvider(relayClient, wallet.Address, routingQuoteTTL)
+
+		// RELAY_DEPOSIT_CONTRACT_SEPOLIA: pinned independently of
+		// relayProvider itself (design doc §12) -- Task 1 re-verified this
+		// address is stable across varying `user` addresses before this
+		// plan trusted it as a hard security pin.
+		relayDepositContract := common.HexToAddress(envOrDefault("RELAY_DEPOSIT_CONTRACT_SEPOLIA", "0x5feaB8db4534f9F7e2669bb260C57A01aD1c12E3"))
+
+		quoteProviders := map[string]quote.Provider{"across": acrossProvider, "relay": relayProvider}
+		signers := map[string]quote.Signer{"across": acrossProvider, "relay": relayProvider}
+		statusCheckers := map[string]quote.StatusChecker{"across": acrossProvider, "relay": relayProvider}
+		expectedContracts := map[string]common.Address{"across": spokePoolAddress, "relay": relayDepositContract}
 
 		executor = &worker.Executor{
-			Store: store, Wallet: wallet, OriginClient: sepoliaClient, Across: acrossClient,
-			BridgeProvider: "across", OriginChainID: 11155111, DestChainID: 84532,
-			SpokePoolAddress: common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662"),
-			WETHOrigin:       common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
-			WETHDestination:  common.HexToAddress("0x4200000000000000000000000000000000000006"),
-			MaxAmountWei:     maxTestnetAmountWei,
-			QuoteProviders:   quoteProviders, MaxFeeSlippageBps: maxFeeSlippageBps,
+			Store: store, Wallet: wallet, OriginClient: sepoliaClient,
+			QuoteProviders: quoteProviders, Signers: signers, ExpectedContractByProvider: expectedContracts,
+			OriginChainID: 11155111, DestChainID: 84532,
+			MaxAmountWei: maxTestnetAmountWei, MaxFeeSlippageBps: maxFeeSlippageBps,
 		}
 		reconciler = &worker.Reconciler{
-			Store: store, Executor: executor, OriginClient: sepoliaClient, Across: acrossClient,
+			Store: store, Executor: executor, OriginClient: sepoliaClient, StatusCheckers: statusCheckers,
 			WalletAddress: wallet.Address, OriginChainID: 11155111, Staleness: reconcileStaleness,
 		}
 	}
