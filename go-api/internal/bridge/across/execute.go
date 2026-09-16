@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 
 	"github.com/ethereum/go-ethereum"
@@ -11,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
+	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/evm"
 )
 
@@ -122,4 +124,42 @@ func BuildAndSignDepositV3Tx(ctx context.Context, client EthClient, wallet *evm.
 		return nil, fmt.Errorf("sign depositV3 tx: %w", err)
 	}
 	return signed, nil
+}
+
+// BuildTransaction implements quote.Signer. It is the same depositV3
+// native-ETH-deposit calldata BuildAndSignDepositV3Tx packs (msg.value =
+// freshQuote.InputAmountBaseUnits, WalletAddress as both depositor and
+// recipient, no separate approve() transaction), relocated behind the
+// shared Signer interface so Executor no longer needs an Across-specific
+// code path to build a transaction to sign. Unlike
+// BuildAndSignDepositV3Tx, it does not estimate gas, suggest a gas price,
+// or sign -- Executor (design doc §11) is the sole owner of those steps
+// for every provider.
+func (p *Provider) BuildTransaction(ctx context.Context, freshQuote quote.Quote) (quote.TxEnvelope, error) {
+	payload, err := DecodeQuotePayload(freshQuote.RawProviderPayload)
+	if err != nil {
+		return quote.TxEnvelope{}, fmt.Errorf("across: decode quote payload: %w", err)
+	}
+	quoteTimestamp, err := strconv.ParseUint(payload.QuoteTimestamp, 10, 32)
+	if err != nil {
+		return quote.TxEnvelope{}, fmt.Errorf("across: parse quote timestamp %q: %w", payload.QuoteTimestamp, err)
+	}
+	fillDeadline, err := strconv.ParseUint(payload.FillDeadline, 10, 32)
+	if err != nil {
+		return quote.TxEnvelope{}, fmt.Errorf("across: parse fill deadline %q: %w", payload.FillDeadline, err)
+	}
+
+	calldata, err := spokePoolABI.Pack("depositV3",
+		p.WalletAddress, p.WalletAddress, p.WETHOrigin, p.WETHDestination,
+		freshQuote.InputAmountBaseUnits, freshQuote.OutputAmountBaseUnits, big.NewInt(freshQuote.DestinationChainID),
+		common.HexToAddress(payload.ExclusiveRelayer), uint32(quoteTimestamp), uint32(fillDeadline), uint32(payload.ExclusivityDeadline),
+		[]byte{},
+	)
+	if err != nil {
+		return quote.TxEnvelope{}, fmt.Errorf("across: pack depositV3 calldata: %w", err)
+	}
+
+	return quote.TxEnvelope{
+		To: p.SpokePoolAddress, Value: freshQuote.InputAmountBaseUnits, Data: calldata, ChainID: freshQuote.SourceChainID,
+	}, nil
 }
