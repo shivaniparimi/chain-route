@@ -418,10 +418,14 @@ type fakeQuoteProvider struct {
 	name  string
 	quote quote.Quote
 	err   error
+	delay time.Duration
 }
 
 func (f *fakeQuoteProvider) Name() string { return f.name }
 func (f *fakeQuoteProvider) GetQuote(_ context.Context, _ quote.Request) (quote.Quote, error) {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 	return f.quote, f.err
 }
 
@@ -531,6 +535,115 @@ func TestPostPayments_TestnetMode_CandidateEdgeBuiltFromLiveQuote(t *testing.T) 
 	}
 	if store.lastCreate.Quote.Provider != "across" {
 		t.Errorf("persisted Quote.Provider = %q, want across", store.lastCreate.Quote.Provider)
+	}
+}
+
+func TestPostPayments_TestnetMode_BothProvidersHealthy_RoutesOverBoth(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(200), OutputAmountBaseUnits: big.NewInt(999_999_999_999_800), RawProviderPayload: json.RawMessage(`{}`)}})
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "relay", quote: quote.Quote{ProviderName: "relay", Available: true, FeeBaseUnits: big.NewInt(100), OutputAmountBaseUnits: big.NewInt(999_999_999_999_900), RawProviderPayload: json.RawMessage(`{}`)}})
+
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "relay", Fee: 0.0001}}}}
+	h := &Handler{Client: fakeRoute, Store: &fakePaymentStore{}, BlockchainEnv: "testnet", QuoteRegistry: registry}
+
+	rec := doPaymentRequest(h, "POST", "/payments", "both-healthy",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(fakeRoute.lastReq.GetCandidateEdges()) != 2 {
+		t.Fatalf("expected 2 candidate edges, got %d", len(fakeRoute.lastReq.GetCandidateEdges()))
+	}
+	// Registration order (§9's tie-break basis): across registered first, so its edge must appear first.
+	if fakeRoute.lastReq.GetCandidateEdges()[0].GetBridgeName() != "across" {
+		t.Errorf("edge[0].bridge_name = %q, want across (registration order)", fakeRoute.lastReq.GetCandidateEdges()[0].GetBridgeName())
+	}
+	if fakeRoute.lastReq.GetCandidateEdges()[1].GetBridgeName() != "relay" {
+		t.Errorf("edge[1].bridge_name = %q, want relay (registration order)", fakeRoute.lastReq.GetCandidateEdges()[1].GetBridgeName())
+	}
+}
+
+func TestPostPayments_TestnetMode_OneProviderErrors_RoutesOverTheOther(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", err: errors.New("connection refused")})
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "relay", quote: quote.Quote{ProviderName: "relay", Available: true, FeeBaseUnits: big.NewInt(100), OutputAmountBaseUnits: big.NewInt(999_999_999_999_900), RawProviderPayload: json.RawMessage(`{}`)}})
+
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "relay", Fee: 0.0001}}}}
+	h := &Handler{Client: fakeRoute, Store: &fakePaymentStore{}, BlockchainEnv: "testnet", QuoteRegistry: registry}
+
+	rec := doPaymentRequest(h, "POST", "/payments", "one-errors",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (routing over the healthy provider), got %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_BothProvidersError_Returns503(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", err: errors.New("connection refused")})
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "relay", err: errors.New("timeout")})
+
+	h := &Handler{Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet", QuoteRegistry: registry}
+	rec := doPaymentRequest(h, "POST", "/payments", "both-error",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPostPayments_TestnetMode_BothUnavailable_Returns422(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: false}})
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "relay", quote: quote.Quote{ProviderName: "relay", Available: false}})
+
+	h := &Handler{Client: &fakeClient{}, Store: &fakePaymentStore{}, BlockchainEnv: "testnet", QuoteRegistry: registry}
+	rec := doPaymentRequest(h, "POST", "/payments", "both-unavailable",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPostPayments_TestnetMode_OrderingIndependentOfCompletionTime proves
+// the concurrent quote-fetch aggregation orders candidate edges by
+// registration order, never completion order: across (registered first)
+// is the slow provider here, yet must still land at index 0 even though
+// relay (registered second, with no delay) finishes first. This is the
+// property the sequential loop's replacement must preserve so C++
+// Dijkstra's tie-break behavior stays reproducible regardless of network
+// timing.
+func TestPostPayments_TestnetMode_OrderingIndependentOfCompletionTime(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{
+		name: "across", delay: 50 * time.Millisecond,
+		quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(200), OutputAmountBaseUnits: big.NewInt(999_999_999_999_800), RawProviderPayload: json.RawMessage(`{}`)},
+	})
+	registry.Register(testnetChainKey, &fakeQuoteProvider{
+		name: "relay", delay: 0,
+		quote: quote.Quote{ProviderName: "relay", Available: true, FeeBaseUnits: big.NewInt(100), OutputAmountBaseUnits: big.NewInt(999_999_999_999_900), RawProviderPayload: json.RawMessage(`{}`)},
+	})
+
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{RouteFound: true, Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "relay", Fee: 0.0001}}}}
+	h := &Handler{Client: fakeRoute, Store: &fakePaymentStore{}, BlockchainEnv: "testnet", QuoteRegistry: registry}
+
+	rec := doPaymentRequest(h, "POST", "/payments", "ordering-independent",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(fakeRoute.lastReq.GetCandidateEdges()) != 2 {
+		t.Fatalf("expected 2 candidate edges, got %d", len(fakeRoute.lastReq.GetCandidateEdges()))
+	}
+	if fakeRoute.lastReq.GetCandidateEdges()[0].GetBridgeName() != "across" {
+		t.Errorf("edge[0].bridge_name = %q, want across (registration order, despite being the slower provider)", fakeRoute.lastReq.GetCandidateEdges()[0].GetBridgeName())
+	}
+	if fakeRoute.lastReq.GetCandidateEdges()[1].GetBridgeName() != "relay" {
+		t.Errorf("edge[1].bridge_name = %q, want relay (registration order)", fakeRoute.lastReq.GetCandidateEdges()[1].GetBridgeName())
 	}
 }
 
