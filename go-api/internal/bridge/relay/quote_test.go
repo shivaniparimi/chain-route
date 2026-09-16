@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -110,5 +112,61 @@ func TestGetQuote_UnsupportedAssetIsError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error for an unsupported asset")
+	}
+}
+
+// TestGetQuote_RequestBodyHasNativeInWETHOutAsymmetry pins the one piece of
+// package-invisible business logic this whole task exists to encode: the
+// outbound /quote request must ask for ETH-in/WETH-out (design doc §7), not
+// WETH-in/WETH-out or any other combination. A regression that swapped
+// originCurrency/destinationCurrency or hardcoded the wrong constant would
+// not be caught by any response-handling test above.
+func TestGetQuote_RequestBodyHasNativeInWETHOutAsymmetry(t *testing.T) {
+	var captured quoteRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Fatalf("unmarshal request body: %v", err)
+		}
+		w.Write([]byte(realQuoteFixture))
+	}))
+	defer srv.Close()
+
+	p := NewProvider(NewClient(srv.URL), common.HexToAddress("0x000000000000000000000000000000000000dEaD"), 0)
+	_, err := p.GetQuote(context.Background(), quote.Request{
+		SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+		AmountBaseUnits: big.NewInt(1_000_000_000_000_000),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured.OriginCurrency != nativeAddress {
+		t.Errorf("OriginCurrency = %q, want the native address %q", captured.OriginCurrency, nativeAddress)
+	}
+	if captured.DestinationCurrency != "0x4200000000000000000000000000000000000006" {
+		t.Errorf("DestinationCurrency = %q, want Base Sepolia WETH 0x4200000000000000000000000000000000000006", captured.DestinationCurrency)
+	}
+}
+
+// TestGetQuote_ImplausibleOutputAmountIsError guards against a malformed or
+// adversarial provider response where minimumAmount >= the input amount,
+// which would otherwise silently produce a negative (or zero) FeeBaseUnits
+// that flows into downstream cost comparison and signing logic.
+func TestGetQuote_ImplausibleOutputAmountIsError(t *testing.T) {
+	fixture := `{"requestId":"0xabc","steps":[{"id":"deposit","kind":"transaction","items":[{"data":{"to":"0x1","data":"0x","value":"1000000000000000","chainId":11155111}}]}],"details":{"currencyIn":{"currency":{"chainId":11155111,"address":"0x0000000000000000000000000000000000000000"},"amount":"1000000000000000"},"currencyOut":{"currency":{"chainId":84532,"address":"0x4200000000000000000000000000000000000006"},"minimumAmount":"1000000000000000","amount":"1000000000000000"},"timeEstimate":1}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(fixture))
+	}))
+	defer srv.Close()
+
+	p := NewProvider(NewClient(srv.URL), common.HexToAddress("0x000000000000000000000000000000000000dEaD"), 0)
+	_, err := p.GetQuote(context.Background(), quote.Request{
+		SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH", AmountBaseUnits: big.NewInt(1_000_000_000_000_000),
+	})
+	if err == nil {
+		t.Fatal("expected an error when minimumAmount >= the input amount -- an implausible quote")
 	}
 }

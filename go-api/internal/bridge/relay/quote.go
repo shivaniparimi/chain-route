@@ -164,6 +164,9 @@ func (p *Provider) GetQuote(ctx context.Context, req quote.Request) (quote.Quote
 	if !ok {
 		return quote.Quote{}, fmt.Errorf("relay provider: minimumAmount %q is not a valid integer", resp.Details.CurrencyOut.MinimumAmount)
 	}
+	if outputAmount.Cmp(req.AmountBaseUnits) >= 0 {
+		return quote.Quote{}, fmt.Errorf("relay provider: quoted output amount %s is not less than the input amount %s -- refusing an implausible quote", outputAmount, req.AmountBaseUnits)
+	}
 	feeAmount := new(big.Int).Sub(req.AmountBaseUnits, outputAmount)
 
 	payload := QuotePayload{To: item.To, Data: item.Data, Value: item.Value, ChainID: item.ChainID,
