@@ -147,6 +147,44 @@ func TestProvider_BuildTransaction_ProducesExpectedEnvelope(t *testing.T) {
 	}
 }
 
+// rawAcrossPayloadMismatchedSpokePoolFixture is identical to
+// rawAcrossPayloadFixture except its spokePoolAddress is a different
+// contract address than the one this package's tests configure on
+// Provider.SpokePoolAddress -- used to prove BuildTransaction refuses to
+// sign against a live quote that echoes a different SpokePool than what
+// is configured.
+const rawAcrossPayloadMismatchedSpokePoolFixture = `{"exclusiveRelayer":"0x0000000000000000000000000000000000000000","quoteTimestamp":"1789340112","fillDeadline":"1789347312","exclusivityDeadline":0,"spokePoolAddress":"0x1234567890123456789012345678901234567890"}`
+
+// TestProvider_BuildTransaction_RejectsSpokePoolMismatch is the extraction
+// of signAndBroadcastFresh's pre-refactor SpokePool echo-validation check
+// (design spec §21) -- BuildTransaction must refuse to sign when the live
+// quote's own echoed spokePoolAddress does not match p.SpokePoolAddress,
+// the same defense-in-depth GetQuote already applies to echoed chain
+// IDs/token addresses. This must happen BEFORE calldata is packed, so a
+// passing spokePoolABI.Pack call is never reached with a mismatched
+// SpokePool.
+func TestProvider_BuildTransaction_RejectsSpokePoolMismatch(t *testing.T) {
+	p := &Provider{
+		WalletAddress:    common.HexToAddress("0xAbC0000000000000000000000000000000000001"),
+		SpokePoolAddress: common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662"),
+		WETHOrigin:       common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"),
+		WETHDestination:  common.HexToAddress("0x4200000000000000000000000000000000000006"),
+	}
+	fresh := quote.Quote{
+		ProviderName: "across", SourceChainID: 11155111, DestinationChainID: 84532,
+		InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000), OutputAmountBaseUnits: big.NewInt(997_592_172_330_233),
+		RawProviderPayload: json.RawMessage(rawAcrossPayloadMismatchedSpokePoolFixture),
+	}
+
+	env, err := p.BuildTransaction(context.Background(), fresh)
+	if err == nil {
+		t.Fatal("expected an error when the quoted SpokePool address does not match Provider.SpokePoolAddress, got nil")
+	}
+	if env.Data != nil {
+		t.Errorf("expected a zero-value envelope on error, got Data = %x", env.Data)
+	}
+}
+
 // TestProvider_CheckStatus_MapsAcrossStatusesToSharedStates also asserts
 // that Provider.OriginChainID (not a hardcoded placeholder) is the value
 // sent as the originChainId query parameter -- the fix called for in this

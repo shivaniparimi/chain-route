@@ -140,6 +140,23 @@ func (p *Provider) BuildTransaction(ctx context.Context, freshQuote quote.Quote)
 	if err != nil {
 		return quote.TxEnvelope{}, fmt.Errorf("across: decode quote payload: %w", err)
 	}
+
+	// Re-validate the live quote's own echoed SpokePool address against
+	// this Provider's configured one before signing anything -- the same
+	// defense-in-depth principle GetQuote already applies to the echoed
+	// chain IDs/token addresses (design spec §21: an unvalidated external
+	// response never flows directly into a signing call). This is the
+	// pre-refactor signAndBroadcastFresh check, relocated here since this
+	// is where the decoded payload is actually available; it catches
+	// Across's live API ever returning a different SpokePool contract
+	// than what ChainRoute has hardcoded (e.g. a contract migration or
+	// config drift) -- something a later, purely-configured comparison in
+	// Executor cannot catch.
+	if quotedSpokePool := common.HexToAddress(payload.SpokePoolAddress); quotedSpokePool != p.SpokePoolAddress {
+		return quote.TxEnvelope{}, fmt.Errorf("across: quoted SpokePool address %s does not match configured SpokePool %s",
+			quotedSpokePool.Hex(), p.SpokePoolAddress.Hex())
+	}
+
 	quoteTimestamp, err := strconv.ParseUint(payload.QuoteTimestamp, 10, 32)
 	if err != nil {
 		return quote.TxEnvelope{}, fmt.Errorf("across: parse quote timestamp %q: %w", payload.QuoteTimestamp, err)
