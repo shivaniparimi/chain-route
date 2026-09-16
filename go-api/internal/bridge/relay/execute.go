@@ -27,9 +27,16 @@ func (p *Provider) BuildTransaction(ctx context.Context, freshQuote quote.Quote)
 	if !ok {
 		return quote.TxEnvelope{}, fmt.Errorf("relay: value %q is not a valid integer", payload.Value)
 	}
-	dataHex := strings.TrimPrefix(payload.Data, "0x")
+	dataHex := payload.Data
+	if len(dataHex) >= 2 && strings.EqualFold(dataHex[:2], "0x") {
+		dataHex = dataHex[2:]
+	}
 	if len(dataHex)%2 != 0 {
-		dataHex = "0" + dataHex
+		// This is provider-opaque calldata about to be signed and
+		// broadcast -- an odd-length hex string is malformed, and silently
+		// left-padding it with a guessed "0" nibble would sign a
+		// different, unverifiable payload rather than rejecting it (M1).
+		return quote.TxEnvelope{}, fmt.Errorf("relay: data %q has an odd-length hex payload -- refusing to guess a padding for unverifiable calldata about to be signed", payload.Data)
 	}
 	data, err := hex.DecodeString(dataHex)
 	if err != nil {

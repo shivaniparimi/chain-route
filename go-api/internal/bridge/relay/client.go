@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -54,29 +55,38 @@ func (c *Client) post(ctx context.Context, path string, body any, out any) error
 	return nil
 }
 
-func (c *Client) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+// get issues a GET request against path, with query (if non-empty) properly
+// URL-escaped and appended -- mirrors across.Client.DepositStatusByTxHash's
+// url.Values convention rather than building query strings via raw
+// concatenation (M5), which would mis-encode a value containing reserved
+// characters.
+func (c *Client) get(ctx context.Context, path string, query url.Values, out any) error {
+	fullPath := path
+	if len(query) > 0 {
+		fullPath = path + "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+fullPath, nil)
 	if err != nil {
-		return fmt.Errorf("build request for %s: %w", path, err)
+		return fmt.Errorf("build request for %s: %w", fullPath, err)
 	}
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request %s: %w", path, err)
+		return fmt.Errorf("request %s: %w", fullPath, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response body from %s: %w", path, err)
+		return fmt.Errorf("read response body from %s: %w", fullPath, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &APIError{Path: path, StatusCode: resp.StatusCode, Body: string(body)}
+		return &APIError{Path: fullPath, StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("decode response from %s: %w", path, err)
+		return fmt.Errorf("decode response from %s: %w", fullPath, err)
 	}
 	return nil
 }

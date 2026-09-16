@@ -9,6 +9,29 @@ import (
 	"chainroute/go-api/internal/bridge/quote"
 )
 
+// TestCheckStatus_EscapesProviderReferenceIDInQueryString guards M5: the
+// requestId must be sent through url.Values (properly percent-encoded),
+// not raw string concatenation, which would corrupt a reference ID
+// containing a reserved query-string character like "&" or "=" into a
+// different (or additional) query parameter entirely.
+func TestCheckStatus_EscapesProviderReferenceIDInQueryString(t *testing.T) {
+	const trickyRequestID = "0xabc&evil=1"
+	var gotRequestID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequestID = r.URL.Query().Get("requestId")
+		w.Write([]byte(`{"status":"pending"}`))
+	}))
+	defer srv.Close()
+
+	p := &Provider{Client: NewClient(srv.URL)}
+	if _, err := p.CheckStatus(context.Background(), quote.StatusRequest{ProviderReferenceID: trickyRequestID}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotRequestID != trickyRequestID {
+		t.Errorf("server received requestId %q, want %q -- raw concatenation would have split this into a separate query parameter", gotRequestID, trickyRequestID)
+	}
+}
+
 func TestCheckStatus_MapsRelayStatusesToSharedStates(t *testing.T) {
 	cases := []struct {
 		relayStatus string

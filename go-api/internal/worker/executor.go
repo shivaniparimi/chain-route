@@ -134,6 +134,23 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 		return nil
 	}
 
+	// Signer lookup, BuildTransaction, and validateEnvelope all happen
+	// BEFORE TryCreateExecution (final-review finding I1): none of them
+	// touch or need the nonce that TryCreateExecution allocates -- the
+	// nonce is only consumed later, when signAndBroadcastFresh builds the
+	// actual types.LegacyTx. An unconfigured signer, a bad/stale
+	// ExpectedContractByProvider pin, or a malformed provider payload are
+	// all should-be-unreachable hard errors, and allocating a nonce for a
+	// payment that is about to hit one of them would permanently block
+	// every higher nonce on this wallet (see the nonce-allocation
+	// invariant documented on DriveExecutionForward below) for BOTH
+	// providers, instead of cleanly rejecting the payment before any state
+	// is allocated.
+	envelope, err := e.buildValidatedEnvelope(ctx, paymentID, quoteRow, freshQuote)
+	if err != nil {
+		return err
+	}
+
 	exec, created, err := e.Store.TryCreateExecution(ctx, postgres.CreateExecutionParams{
 		PaymentID: paymentID, WalletAddress: e.Wallet.Address.Hex(), BridgeProvider: quoteRow.Provider,
 		OriginChainID: e.OriginChainID, DestinationChainID: e.DestChainID,
@@ -144,7 +161,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	if !created {
 		return nil
 	}
-	return e.signAndBroadcastFresh(ctx, exec, quoteRow, freshQuote)
+	return e.signAndBroadcastFresh(ctx, exec, envelope, freshQuote)
 }
 
 // exceedsSlippageTolerance reports whether freshFee exceeds baselineFee
@@ -273,41 +290,49 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 		return nil
 	}
 
-	return e.signAndBroadcastFresh(ctx, exec, quoteRow, freshQuote)
+	envelope, err := e.buildValidatedEnvelope(ctx, exec.ID, quoteRow, freshQuote)
+	if err != nil {
+		return err
+	}
+	return e.signAndBroadcastFresh(ctx, exec, envelope, freshQuote)
 }
 
-// signAndBroadcastFresh dispatches to whichever quote.Signer was actually
-// selected and persisted for this execution (quoteRow.Provider) -- design
-// doc §11/§12. It no longer knows anything Across-specific: building the
-// unsigned transaction is entirely the Signer's job (BuildTransaction),
-// while Executor remains the sole owner of gas estimation, nonce
-// assignment, and wallet.SignTx for every provider.
-//
-// Before ever calling wallet.SignTx, it runs validateEnvelope -- an
-// independent, provider-agnostic checkpoint that re-asserts the envelope's
-// chain ID, target contract, and value against this Executor's own
-// separately-configured expectations (e.OriginChainID,
-// e.ExpectedContractByProvider, freshQuote.InputAmountBaseUnits). Nothing
-// else in this call chain ties "the route that was quoted and persisted" to
-// "the transaction this Executor is about to sign" -- a Signer's own
-// internal validation (e.g. across.Provider.BuildTransaction's SpokePool
-// check) only checks its own request against its own response, which says
-// nothing about whether the Signer itself is misconfigured or misbehaving.
-// This is the exact class of bug design spec §21 exists to prevent, so it
-// is a hard, should-be-unreachable error, never a silent substitution.
-func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, quoteRow payment.Quote, freshQuote quote.Quote) error {
+// buildValidatedEnvelope looks up the Signer configured for
+// quoteRow.Provider, builds the unsigned transaction envelope from
+// freshQuote, and runs it through validateEnvelope -- the complete
+// pre-signing checkpoint (design doc §12), factored out so callers can run
+// it BEFORE allocating a wallet nonce (final-review finding I1): nothing
+// in this sequence reads or needs a nonce. idForErrors is either a payment
+// ID (ExecuteTestnetPayment, before an execution row exists) or an
+// execution ID (DriveExecutionForward's resume path, where one already
+// does) -- purely for error-message context.
+func (e *Executor) buildValidatedEnvelope(ctx context.Context, idForErrors string, quoteRow payment.Quote, freshQuote quote.Quote) (quote.TxEnvelope, error) {
 	signer, ok := e.Signers[quoteRow.Provider]
 	if !ok {
-		return fmt.Errorf("execution %s uses provider %q, which this worker has no configured signer for", exec.ID, quoteRow.Provider)
+		return quote.TxEnvelope{}, fmt.Errorf("%s uses provider %q, which this worker has no configured signer for", idForErrors, quoteRow.Provider)
 	}
 	envelope, err := signer.BuildTransaction(ctx, freshQuote)
 	if err != nil {
-		return fmt.Errorf("build transaction for execution %s: %w", exec.ID, err)
+		return quote.TxEnvelope{}, fmt.Errorf("build transaction for %s: %w", idForErrors, err)
 	}
 	if err := e.validateEnvelope(envelope, quoteRow, freshQuote); err != nil {
-		return fmt.Errorf("execution %s: %w", exec.ID, err)
+		return quote.TxEnvelope{}, fmt.Errorf("%s: %w", idForErrors, err)
 	}
+	return envelope, nil
+}
 
+// signAndBroadcastFresh takes an ALREADY-BUILT, ALREADY-VALIDATED envelope
+// (produced by buildValidatedEnvelope, run by the caller before this is
+// invoked -- final-review finding I1) and estimates gas, assigns the
+// already-allocated nonce, signs, persists, and broadcasts. It no longer
+// looks up the Signer or calls BuildTransaction/validateEnvelope itself:
+// that entire checkpoint -- design doc §12's independent, provider-agnostic
+// re-assertion of the envelope's chain ID, target contract, and value
+// against this Executor's own separately-configured expectations
+// (e.OriginChainID, e.ExpectedContractByProvider,
+// freshQuote.InputAmountBaseUnits) -- has already run by the time this is
+// called, deliberately before nonce allocation for a fresh execution.
+func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, envelope quote.TxEnvelope, freshQuote quote.Quote) error {
 	gasPrice, err := e.OriginClient.SuggestGasPrice(ctx)
 	if err != nil {
 		return fmt.Errorf("suggest gas price: %w", err)
@@ -354,6 +379,9 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 // source (cmd/worker/main.go), so this can catch a genuine bug or a
 // misbehaving provider rather than comparing a value against itself.
 func (e *Executor) validateEnvelope(envelope quote.TxEnvelope, quoteRow payment.Quote, freshQuote quote.Quote) error {
+	if freshQuote.ProviderName != quoteRow.Provider {
+		return fmt.Errorf("fresh quote provider %q does not match persisted provider %q", freshQuote.ProviderName, quoteRow.Provider)
+	}
 	if envelope.ChainID != e.OriginChainID {
 		return fmt.Errorf("envelope chainId %d does not match configured origin chain %d", envelope.ChainID, e.OriginChainID)
 	}

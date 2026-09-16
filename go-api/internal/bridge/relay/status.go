@@ -3,6 +3,8 @@ package relay
 import (
 	"context"
 	"fmt"
+	"log"
+	"net/url"
 
 	"chainroute/go-api/internal/bridge/quote"
 )
@@ -23,7 +25,15 @@ func relayStatusToState(raw string) quote.ExternalState {
 		return quote.StateRefunded
 	case "failure":
 		return quote.StateFillFailed
-	default: // waiting, depositing, pending, submitted, delayed, unknown, or anything unrecognized
+	case "waiting", "depositing", "pending", "submitted", "delayed":
+		return quote.StatePending
+	default:
+		// A genuinely unrecognized status (not one of Relay's documented
+		// eight values, design doc §2) -- treated the same as pending
+		// (never a silent crash, per the reconciler's must-never-fail
+		// contract), but logged loudly (M8) so a future Relay API change
+		// this client has never seen doesn't go unnoticed indefinitely.
+		log.Printf("WARNING: relay: unrecognized status %q -- treating as pending", raw)
 		return quote.StatePending
 	}
 }
@@ -32,8 +42,10 @@ func (p *Provider) CheckStatus(ctx context.Context, req quote.StatusRequest) (qu
 	if req.ProviderReferenceID == "" {
 		return quote.StatusResult{}, fmt.Errorf("relay: CheckStatus requires a ProviderReferenceID (requestId)")
 	}
+	q := url.Values{}
+	q.Set("requestId", req.ProviderReferenceID)
 	var resp intentStatusResponse
-	if err := p.Client.get(ctx, "/intents/status?requestId="+req.ProviderReferenceID, &resp); err != nil {
+	if err := p.Client.get(ctx, "/intents/status", q, &resp); err != nil {
 		return quote.StatusResult{}, err
 	}
 	result := quote.StatusResult{State: relayStatusToState(resp.Status), RawStatus: resp.Status}

@@ -297,9 +297,6 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, "no route available for the requested payment")
 			return
 		}
-
-		provider := "across" // overwritten below once the winning hop is known; placeholder to keep bridgeProvider non-nil until then
-		bridgeProvider = &provider
 	}
 
 	grpcReq := &routingv1.FindRouteRequest{

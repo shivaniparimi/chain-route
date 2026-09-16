@@ -29,20 +29,21 @@ import (
 const testExecutorKey = "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291"
 
 type fakeExecutorStore struct {
-	tryCreateExec    payment.Execution
-	tryCreateCreated bool
-	tryCreateErr     error
-	tryCreateCalled  bool
-	pmt              payment.Payment
-	pmtFound         bool
-	persistedRawTx   []byte
-	persistedHash    string
-	broadcastCalled  bool
-	submittedCalled  bool
-	quoteRow         payment.Quote
-	quoteFound       bool
-	quoteErr         error
-	markFailedReason string
+	tryCreateExec              payment.Execution
+	tryCreateCreated           bool
+	tryCreateErr               error
+	tryCreateCalled            bool
+	pmt                        payment.Payment
+	pmtFound                   bool
+	persistedRawTx             []byte
+	persistedHash              string
+	persistedProviderReference *string
+	broadcastCalled            bool
+	submittedCalled            bool
+	quoteRow                   payment.Quote
+	quoteFound                 bool
+	quoteErr                   error
+	markFailedReason           string
 }
 
 func (f *fakeExecutorStore) TryCreateExecution(ctx context.Context, p postgres.CreateExecutionParams) (payment.Execution, bool, error) {
@@ -61,6 +62,7 @@ func (f *fakeExecutorStore) MarkProcessingFailed(ctx context.Context, paymentID,
 }
 func (f *fakeExecutorStore) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string, providerReferenceID *string) error {
 	f.persistedRawTx, f.persistedHash = rawTx, txHash
+	f.persistedProviderReference = providerReferenceID
 	return nil
 }
 func (f *fakeExecutorStore) MarkExecutionBroadcast(ctx context.Context, executionID string) error {
@@ -887,6 +889,9 @@ func TestExecuteTestnetPayment_WrongEnvelopeChainIDIsHardError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a hard error when the envelope's ChainID doesn't match e.OriginChainID")
 	}
+	if store.tryCreateCalled {
+		t.Fatal("must never allocate a nonce (call TryCreateExecution) for an envelope whose ChainID doesn't match e.OriginChainID -- buildValidatedEnvelope runs before TryCreateExecution")
+	}
 	if ethClient.sendCalled {
 		t.Fatal("must never sign/broadcast an envelope whose ChainID doesn't match e.OriginChainID")
 	}
@@ -910,6 +915,9 @@ func TestExecuteTestnetPayment_WrongEnvelopeTargetIsHardError(t *testing.T) {
 	err := e.ExecuteTestnetPayment(context.Background(), "pay-badtarget")
 	if err == nil {
 		t.Fatal("expected a hard error when the envelope's target doesn't match the pinned contract for the provider")
+	}
+	if store.tryCreateCalled {
+		t.Fatal("must never allocate a nonce (call TryCreateExecution) for an envelope whose target doesn't match the pinned contract -- buildValidatedEnvelope runs before TryCreateExecution")
 	}
 	if ethClient.sendCalled {
 		t.Fatal("must never sign/broadcast an envelope whose target doesn't match the pinned contract for the provider")
@@ -935,6 +943,9 @@ func TestExecuteTestnetPayment_WrongEnvelopeValueIsHardError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a hard error when the envelope's value doesn't match the validated input amount")
 	}
+	if store.tryCreateCalled {
+		t.Fatal("must never allocate a nonce (call TryCreateExecution) for an envelope whose value doesn't match the validated input amount -- buildValidatedEnvelope runs before TryCreateExecution")
+	}
 	if ethClient.sendCalled {
 		t.Fatal("must never sign/broadcast an envelope whose value doesn't match the validated input amount")
 	}
@@ -949,11 +960,12 @@ func TestExecuteTestnetPayment_UnknownSignerIsHardError(t *testing.T) {
 	}
 	ethClient := &fakeExecutorEthClient{}
 	e := newTestExecutor(t, store, ethClient)
-	// QuoteProviders has an entry for "relay" (so the pre-nonce-allocation
-	// provider lookup in ExecuteTestnetPayment succeeds and a nonce gets
-	// allocated), but e.Signers only has "across" configured -- the later,
-	// sign-time lookup in signAndBroadcastFresh must independently reject
-	// this rather than silently substituting the "across" signer.
+	// QuoteProviders has an entry for "relay" (so the earlier
+	// GetQuote/provider-map lookup in ExecuteTestnetPayment succeeds), but
+	// e.Signers only has "across" configured -- buildValidatedEnvelope's
+	// signer lookup, which now runs BEFORE TryCreateExecution, must
+	// independently reject this rather than silently substituting the
+	// "across" signer, and must do so without ever allocating a nonce.
 	e.QuoteProviders["relay"] = &fakeExecutorQuoteProvider{quote: quote.Quote{
 		ProviderName: "relay", Available: true,
 		FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000),
@@ -962,6 +974,9 @@ func TestExecuteTestnetPayment_UnknownSignerIsHardError(t *testing.T) {
 	err := e.ExecuteTestnetPayment(context.Background(), "pay-unknown-signer")
 	if err == nil {
 		t.Fatal("expected a hard error when the persisted provider has no configured signer -- never a silent substitution")
+	}
+	if store.tryCreateCalled {
+		t.Fatal("must never allocate a nonce (call TryCreateExecution) for a provider this worker has no configured signer for -- buildValidatedEnvelope runs before TryCreateExecution")
 	}
 	if ethClient.sendCalled {
 		t.Fatal("must never sign/broadcast for a provider this worker has no configured signer for")
@@ -987,10 +1002,12 @@ func TestExecuteTestnetPayment_RelayShapedEnvelopePassesValidationAndSigns(t *te
 	e := newTestExecutor(t, store, ethClient)
 
 	relayContract := common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	const relayRequestID = "0x1789582942e8e6519cfd826bc708bcf799f4705ca98482b0159b34b4297604ae"
 	e.ExpectedContractByProvider["relay"] = relayContract
 	e.QuoteProviders["relay"] = &fakeExecutorQuoteProvider{quote: quote.Quote{
 		ProviderName: "relay", Available: true,
 		FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000),
+		RawProviderPayload: []byte(`{"requestId":"` + relayRequestID + `"}`),
 	}}
 	e.Signers["relay"] = &fakeSigner{name: "relay", envelope: quote.TxEnvelope{
 		To: relayContract, Value: big.NewInt(1_000_000_000_000_000), ChainID: e.OriginChainID, Data: []byte{0xde, 0xad, 0xbe, 0xef},
@@ -1010,5 +1027,15 @@ func TestExecuteTestnetPayment_RelayShapedEnvelopePassesValidationAndSigns(t *te
 	}
 	if !store.submittedCalled {
 		t.Fatal("expected MarkSubmitted to be called")
+	}
+	// extractProviderReferenceID (design doc §16) must actually thread
+	// Relay's requestId from RawProviderPayload through to
+	// PersistSignedExecution's providerReferenceID argument, end to end --
+	// not just in extractProviderReferenceID's own unit tests.
+	if store.persistedProviderReference == nil {
+		t.Fatal("expected a non-nil providerReferenceID to be persisted for a Relay-provided quote")
+	}
+	if *store.persistedProviderReference != relayRequestID {
+		t.Fatalf("persistedProviderReference = %q, want %q", *store.persistedProviderReference, relayRequestID)
 	}
 }

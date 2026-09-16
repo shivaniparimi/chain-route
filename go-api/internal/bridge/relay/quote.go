@@ -150,6 +150,9 @@ func (p *Provider) GetQuote(ctx context.Context, req quote.Request) (quote.Quote
 	}
 	item := resp.Steps[0].Items[0].Data
 
+	if resp.RequestID == "" {
+		return quote.Quote{}, fmt.Errorf("relay provider: response requestId is empty -- refusing a quote we cannot reference for reconciliation later")
+	}
 	if resp.Details.CurrencyIn.Currency.ChainID != req.SourceChainID || resp.Details.CurrencyIn.Currency.Address != nativeAddress {
 		return quote.Quote{}, fmt.Errorf("relay provider: response currencyIn %+v does not match request", resp.Details.CurrencyIn)
 	}

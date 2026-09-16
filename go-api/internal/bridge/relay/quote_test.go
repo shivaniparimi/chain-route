@@ -105,6 +105,22 @@ func TestGetQuote_WrongEchoedChainOrAddressIsHardError(t *testing.T) {
 	}
 }
 
+func TestGetQuote_EmptyRequestIDIsHardError(t *testing.T) {
+	emptyRequestID := `{"requestId":"","steps":[{"id":"deposit","kind":"transaction","items":[{"data":{"to":"0x1","data":"0x","value":"1000000000000000","chainId":11155111}}]}],"details":{"currencyIn":{"currency":{"chainId":11155111,"address":"0x0000000000000000000000000000000000000000"},"amount":"1000000000000000"},"currencyOut":{"currency":{"chainId":84532,"address":"0x4200000000000000000000000000000000000006"},"minimumAmount":"1","amount":"1"},"timeEstimate":1}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(emptyRequestID))
+	}))
+	defer srv.Close()
+
+	p := NewProvider(NewClient(srv.URL), common.HexToAddress("0x000000000000000000000000000000000000dEaD"), 0)
+	_, err := p.GetQuote(context.Background(), quote.Request{
+		SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH", AmountBaseUnits: big.NewInt(1_000_000_000_000_000),
+	})
+	if err == nil {
+		t.Fatal("expected an error when the response's requestId is empty -- we cannot reference this quote for reconciliation later")
+	}
+}
+
 func TestGetQuote_UnsupportedAssetIsError(t *testing.T) {
 	p := NewProvider(NewClient("http://unused"), common.HexToAddress("0x0"), 0)
 	_, err := p.GetQuote(context.Background(), quote.Request{

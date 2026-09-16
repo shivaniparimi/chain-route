@@ -78,14 +78,35 @@ func TestBuildTransaction_EmptyRecipientIsHardError(t *testing.T) {
 	}
 }
 
-// TestBuildTransaction_OddLengthHexDataIsZeroPadded covers the leading-zero
-// calldata edge case: an odd-length hex string (one that lost a leading "0"
-// somewhere upstream) must be zero-padded to an even length BEFORE decoding,
-// not silently misaligned into the wrong bytes -- this calldata ends up
-// signed and broadcast with real funds behind it.
-func TestBuildTransaction_OddLengthHexDataIsZeroPadded(t *testing.T) {
+// TestBuildTransaction_OddLengthHexDataIsHardError covers the odd-length
+// calldata edge case: an odd-length hex string is malformed, unverifiable,
+// provider-opaque calldata about to be signed and broadcast with real funds
+// behind it -- guessing a leading-zero padding could silently sign a
+// different payload than the provider actually intended, so this must be
+// rejected outright rather than "corrected" (M1).
+func TestBuildTransaction_OddLengthHexDataIsHardError(t *testing.T) {
 	wallet := common.HexToAddress("0x000000000000000000000000000000000000dEaD")
 	payload := QuotePayload{To: "0x5feaB8db4534f9F7e2669bb260C57A01aD1c12E3", Data: "0xabc", Value: "1000000000000000", ChainID: 11155111, Recipient: wallet.Hex()}
+	raw, _ := json.Marshal(payload)
+	fresh := quote.Quote{RawProviderPayload: raw, InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000)}
+
+	p := &Provider{WalletAddress: wallet}
+	env, err := p.BuildTransaction(context.Background(), fresh)
+	if err == nil {
+		t.Fatal("expected an error for odd-length hex calldata, not a guessed zero-padding")
+	}
+	if env.To != (common.Address{}) || env.Value != nil || env.Data != nil || env.ChainID != 0 {
+		t.Errorf("expected zero-value TxEnvelope on hard error, got %+v", env)
+	}
+}
+
+// TestBuildTransaction_UppercaseHexPrefixIsTrimmed covers M2: the "0x"
+// prefix trim must be case-insensitive, since an "0X"-prefixed hex string is
+// equally valid hex and must not be misinterpreted as having no prefix at
+// all (which would then also misalign the odd/even length check above).
+func TestBuildTransaction_UppercaseHexPrefixIsTrimmed(t *testing.T) {
+	wallet := common.HexToAddress("0x000000000000000000000000000000000000dEaD")
+	payload := QuotePayload{To: "0x5feaB8db4534f9F7e2669bb260C57A01aD1c12E3", Data: "0XDEADBEEF", Value: "1000000000000000", ChainID: 11155111, Recipient: wallet.Hex()}
 	raw, _ := json.Marshal(payload)
 	fresh := quote.Quote{RawProviderPayload: raw, InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000)}
 
@@ -94,8 +115,8 @@ func TestBuildTransaction_OddLengthHexDataIsZeroPadded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []byte{0x0a, 0xbc}
+	want := []byte{0xde, 0xad, 0xbe, 0xef}
 	if !bytes.Equal(env.Data, want) {
-		t.Errorf("Data = %x, want %x (i.e. \"0xabc\" zero-padded to \"0xabc\" -> \"0abc\")", env.Data, want)
+		t.Errorf("Data = %x, want %x (uppercase \"0X\" prefix should be trimmed like \"0x\")", env.Data, want)
 	}
 }
