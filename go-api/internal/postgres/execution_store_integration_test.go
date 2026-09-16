@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -404,5 +405,131 @@ func TestLowestUnconfirmedNonce(t *testing.T) {
 	}
 	if !found || nonce != execA.Nonce+1 {
 		t.Fatalf("expected lowest unconfirmed nonce to advance to %d, got %d (found=%v)", execA.Nonce+1, nonce, found)
+	}
+}
+
+// TestTryCreateExecution_NonceUniqueAcrossAcrossAndRelayExecutions proves
+// wallet_nonces allocates a strictly-unique sequence across concurrent
+// executions regardless of which provider each execution belongs to
+// (design doc §15/§24: nonce allocation is provider-agnostic -- both
+// Across and Relay executions draw from the same per-wallet sequence).
+//
+// payment_executions.payment_id has REFERENCES payments(id) ON DELETE
+// CASCADE (migration 0004, confirmed by reading the schema directly), so
+// unlike the brief's original sketch, each goroutine below first inserts
+// a minimal real payments row via insertRawTestnetPayment -- a synthetic,
+// non-existent payment ID would be rejected by the foreign key before
+// TryCreateExecution's nonce/race behavior is even exercised.
+func TestTryCreateExecution_NonceUniqueAcrossAcrossAndRelayExecutions(t *testing.T) {
+	s := newTestStore(t)
+	wallet := "0xCrossProviderNonceTest" + t.Name()
+
+	const n = 10
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = fmt.Sprintf("test-cross-provider-nonce-%s-%d", t.Name(), i)
+	}
+	cleanup := func() {
+		for _, key := range keys {
+			s.db.ExecContext(context.Background(), `DELETE FROM payments WHERE idempotency_key = $1`, key)
+		}
+		s.db.ExecContext(context.Background(), `DELETE FROM wallet_nonces WHERE wallet_address = $1`, wallet)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	if err := s.SeedWalletNonce(context.Background(), wallet, 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	paymentIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		paymentIDs[i] = insertRawTestnetPayment(t, s, keys[i])
+	}
+
+	var wg sync.WaitGroup
+	nonces := make(chan int64, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		provider := "across"
+		if i%2 == 0 {
+			provider = "relay"
+		}
+		go func(paymentID, provider string) {
+			defer wg.Done()
+			exec, created, err := s.TryCreateExecution(context.Background(), CreateExecutionParams{
+				PaymentID: paymentID, WalletAddress: wallet, BridgeProvider: provider, OriginChainID: 11155111, DestinationChainID: 84532,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !created {
+				errs <- fmt.Errorf("payment %s: expected created=true", paymentID)
+				return
+			}
+			nonces <- exec.Nonce
+		}(paymentIDs[i], provider)
+	}
+	wg.Wait()
+	close(nonces)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	seen := map[int64]bool{}
+	for nonce := range nonces {
+		if seen[nonce] {
+			t.Fatalf("nonce %d allocated twice", nonce)
+		}
+		seen[nonce] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d unique nonces, got %d", n, len(seen))
+	}
+}
+
+// TestPersistSignedExecution_PersistsProviderReferenceIDAtomicallyWithSignedBytes
+// proves PersistSignedExecution's single UPDATE lands SignedTxHash and
+// ProviderReferenceID together -- there is no intermediate durable state
+// where one is set without the other (relevant to Relay executions, whose
+// provider_reference_id carries Relay's requestId; Across executions pass
+// nil here and are covered by the pre-existing
+// TestPersistSignedExecution_AndMarkBroadcast above).
+func TestPersistSignedExecution_PersistsProviderReferenceIDAtomicallyWithSignedBytes(t *testing.T) {
+	s := newTestStore(t)
+	key, wallet := "test-persist-provider-ref-key", "0xPersistProviderRefWallet00000000000007"
+	cleanup := func() {
+		s.db.ExecContext(context.Background(), `DELETE FROM payments WHERE idempotency_key = $1`, key)
+		s.db.ExecContext(context.Background(), `DELETE FROM wallet_nonces WHERE wallet_address = $1`, wallet)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	paymentID := insertRawTestnetPayment(t, s, key)
+	if err := s.SeedWalletNonce(context.Background(), wallet, 0); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	exec, created, err := s.TryCreateExecution(context.Background(), CreateExecutionParams{
+		PaymentID: paymentID, WalletAddress: wallet, BridgeProvider: "relay", OriginChainID: 11155111, DestinationChainID: 84532,
+	})
+	if err != nil || !created {
+		t.Fatalf("setup: created=%v err=%v", created, err)
+	}
+
+	if err := s.PersistSignedExecution(context.Background(), exec.ID, []byte{0x01, 0x02, 0x03}, "0xrelaysignedtx", strPtr("0xrelayrequestid123")); err != nil {
+		t.Fatalf("persist signed: %v", err)
+	}
+
+	got, found, err := s.GetExecutionByPaymentID(context.Background(), paymentID)
+	if err != nil || !found {
+		t.Fatalf("get: found=%v err=%v", found, err)
+	}
+	if got.SignedTxHash == nil || *got.SignedTxHash != "0xrelaysignedtx" {
+		t.Fatalf("expected SignedTxHash to be persisted, got %v", got.SignedTxHash)
+	}
+	if got.ProviderReferenceID == nil || *got.ProviderReferenceID != "0xrelayrequestid123" {
+		t.Fatalf("expected ProviderReferenceID to be persisted atomically with SignedTxHash, got %v", got.ProviderReferenceID)
 	}
 }
