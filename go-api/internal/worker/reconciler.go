@@ -22,7 +22,7 @@ type ReconcilerStore interface {
 	GetExecutionByPaymentID(ctx context.Context, paymentID string) (payment.Execution, bool, error)
 	StaleTestnetProcessingWithoutExecutionIDs(ctx context.Context, staleness time.Duration) ([]string, error)
 	ReconciliationCandidates(ctx context.Context, staleness time.Duration) ([]payment.Execution, error)
-	UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, confirmedAt *sql.NullTime) error
+	UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, rawStatus string, confirmedAt *sql.NullTime) error
 	CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
 	LowestUnconfirmedNonce(ctx context.Context, walletAddress string) (int64, bool, error)
 }
@@ -199,7 +199,7 @@ func (r *Reconciler) checkAndUpdateOutcome(ctx context.Context, exec payment.Exe
 
 func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, external payment.ExternalStatus, terminal payment.Status) error {
 	confirmedAt := &sql.NullTime{Time: time.Now().UTC(), Valid: true}
-	if err := r.Store.UpdateExecutionExternalStatus(ctx, exec.ID, external, confirmedAt); err != nil {
+	if err := r.Store.UpdateExecutionExternalStatus(ctx, exec.ID, external, "", confirmedAt); err != nil {
 		return fmt.Errorf("record %s: %w", external, err)
 	}
 	completed, err := r.Store.CompleteSubmittedPayment(ctx, exec.PaymentID, terminal)

@@ -152,7 +152,7 @@ func TestPersistSignedExecution_AndMarkBroadcast(t *testing.T) {
 		t.Fatalf("setup: created=%v err=%v", created, err)
 	}
 
-	if err := s.PersistSignedExecution(context.Background(), exec.ID, []byte{0x01, 0x02}, "0xdeadbeef"); err != nil {
+	if err := s.PersistSignedExecution(context.Background(), exec.ID, []byte{0x01, 0x02}, "0xdeadbeef", nil); err != nil {
 		t.Fatalf("persist signed: %v", err)
 	}
 	got, found, err := s.GetExecutionByPaymentID(context.Background(), paymentID)
@@ -189,7 +189,7 @@ func TestReconciliationCandidates_TwoClauseSelection(t *testing.T) {
 	// Row A: broadcast, unconfirmed -- must ALWAYS be a candidate.
 	idA := insertRawTestnetPayment(t, s, keyPending)
 	execA, _, _ := s.TryCreateExecution(context.Background(), CreateExecutionParams{PaymentID: idA, WalletAddress: wallet, BridgeProvider: "across", OriginChainID: 11155111, DestinationChainID: 84532})
-	s.PersistSignedExecution(context.Background(), execA.ID, []byte{0x01}, "0xaaa")
+	s.PersistSignedExecution(context.Background(), execA.ID, []byte{0x01}, "0xaaa", nil)
 	s.MarkExecutionBroadcast(context.Background(), execA.ID)
 
 	// Row B: not yet broadcast, freshly created -- must NOT be a candidate yet.
@@ -330,7 +330,7 @@ func TestUpdateExecutionExternalStatus(t *testing.T) {
 	}
 
 	// nil confirmedAt: still pending, no confirmed_at set.
-	if err := s.UpdateExecutionExternalStatus(context.Background(), exec.ID, payment.ExternalStatusPending, nil); err != nil {
+	if err := s.UpdateExecutionExternalStatus(context.Background(), exec.ID, payment.ExternalStatusPending, "", nil); err != nil {
 		t.Fatalf("update status (pending): %v", err)
 	}
 	got, _, err := s.GetExecutionByPaymentID(context.Background(), paymentID)
@@ -346,7 +346,7 @@ func TestUpdateExecutionExternalStatus(t *testing.T) {
 
 	// A real time: terminal, confirmed_at set.
 	now := time.Now().UTC().Truncate(time.Second)
-	if err := s.UpdateExecutionExternalStatus(context.Background(), exec.ID, payment.ExternalStatusFilled, &sql.NullTime{Time: now, Valid: true}); err != nil {
+	if err := s.UpdateExecutionExternalStatus(context.Background(), exec.ID, payment.ExternalStatusFilled, "", &sql.NullTime{Time: now, Valid: true}); err != nil {
 		t.Fatalf("update status (filled): %v", err)
 	}
 	got, _, err = s.GetExecutionByPaymentID(context.Background(), paymentID)
@@ -395,7 +395,7 @@ func TestLowestUnconfirmedNonce(t *testing.T) {
 	}
 
 	// Confirm the lowest-nonce execution; the lowest unconfirmed nonce must advance.
-	if err := s.UpdateExecutionExternalStatus(context.Background(), execA.ID, payment.ExternalStatusFilled, &sql.NullTime{Time: time.Now(), Valid: true}); err != nil {
+	if err := s.UpdateExecutionExternalStatus(context.Background(), execA.ID, payment.ExternalStatusFilled, "", &sql.NullTime{Time: time.Now(), Valid: true}); err != nil {
 		t.Fatalf("confirm execA: %v", err)
 	}
 	nonce, found, err = s.LowestUnconfirmedNonce(context.Background(), wallet)

@@ -29,7 +29,7 @@ type ExecutorStore interface {
 	GetPayment(ctx context.Context, id string) (payment.Payment, bool, error)
 	GetQuoteByPaymentID(ctx context.Context, paymentID string) (payment.Quote, bool, error)
 	MarkProcessingFailed(ctx context.Context, paymentID, reason string) (bool, error)
-	PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string) error
+	PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string, providerReferenceID *string) error
 	MarkExecutionBroadcast(ctx context.Context, executionID string) error
 	MarkSubmitted(ctx context.Context, paymentID string) (bool, error)
 }
@@ -340,7 +340,7 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 		return fmt.Errorf("marshal signed tx: %w", err)
 	}
 	hash := signedTx.Hash().Hex()
-	if err := e.Store.PersistSignedExecution(ctx, exec.ID, rawTx, hash); err != nil {
+	if err := e.Store.PersistSignedExecution(ctx, exec.ID, rawTx, hash, nil); err != nil {
 		return fmt.Errorf("persist signed execution: %w", err)
 	}
 	exec.SignedTxHash = &hash

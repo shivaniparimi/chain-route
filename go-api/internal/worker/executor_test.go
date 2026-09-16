@@ -59,7 +59,7 @@ func (f *fakeExecutorStore) MarkProcessingFailed(ctx context.Context, paymentID,
 	f.markFailedReason = reason
 	return true, nil
 }
-func (f *fakeExecutorStore) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string) error {
+func (f *fakeExecutorStore) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string, providerReferenceID *string) error {
 	f.persistedRawTx, f.persistedHash = rawTx, txHash
 	return nil
 }
@@ -412,9 +412,9 @@ type callOrderStore struct {
 	calls *[]string
 }
 
-func (f *callOrderStore) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string) error {
+func (f *callOrderStore) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string, providerReferenceID *string) error {
 	*f.calls = append(*f.calls, "persist")
-	return f.fakeExecutorStore.PersistSignedExecution(ctx, executionID, rawTx, txHash)
+	return f.fakeExecutorStore.PersistSignedExecution(ctx, executionID, rawTx, txHash, providerReferenceID)
 }
 
 type callOrderEthClient struct {

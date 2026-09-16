@@ -42,7 +42,7 @@ func (f *fakeReconcilerStore) StaleTestnetProcessingWithoutExecutionIDs(ctx cont
 func (f *fakeReconcilerStore) ReconciliationCandidates(ctx context.Context, staleness time.Duration) ([]payment.Execution, error) {
 	return f.candidates, nil
 }
-func (f *fakeReconcilerStore) UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, confirmedAt *sql.NullTime) error {
+func (f *fakeReconcilerStore) UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, rawStatus string, confirmedAt *sql.NullTime) error {
 	f.updateStatusCalls = append(f.updateStatusCalls, status)
 	return nil
 }

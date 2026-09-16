@@ -31,11 +31,12 @@ const (
 type ExternalStatus string
 
 const (
-	ExternalStatusPending  ExternalStatus = "pending"
-	ExternalStatusFilled   ExternalStatus = "filled"
-	ExternalStatusExpired  ExternalStatus = "expired"
-	ExternalStatusRefunded ExternalStatus = "refunded"
-	ExternalStatusReverted ExternalStatus = "reverted"
+	ExternalStatusPending    ExternalStatus = "pending"
+	ExternalStatusFilled     ExternalStatus = "filled"
+	ExternalStatusExpired    ExternalStatus = "expired"
+	ExternalStatusRefunded   ExternalStatus = "refunded"
+	ExternalStatusReverted   ExternalStatus = "reverted"
+	ExternalStatusFillFailed ExternalStatus = "fill_failed" // Relay's "failure" (unsuccessful fill), distinct from reverted/refunded/expired
 )
 
 // Quote is the normalized bridge quote that produced a testnet-mode
@@ -102,21 +103,22 @@ type Hop struct {
 // external side effect for one testnet-mode payment. UNIQUE(payment_id) in
 // the schema guarantees at most one Execution ever exists per payment.
 type Execution struct {
-	ID                 string
-	PaymentID          string
-	BridgeProvider     string
-	OriginChainID      int64
-	DestinationChainID int64
-	WalletAddress      string
-	Nonce              int64
-	SignedTxHash       *string
-	RawSignedTx        []byte
-	BroadcastAt        *time.Time
-	AcrossDepositID    *string
-	ExternalStatus     ExternalStatus
-	ConfirmedAt        *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID                  string
+	PaymentID           string
+	BridgeProvider      string
+	OriginChainID       int64
+	DestinationChainID  int64
+	WalletAddress       string
+	Nonce               int64
+	SignedTxHash        *string
+	RawSignedTx         []byte
+	BroadcastAt         *time.Time
+	ProviderReferenceID *string // provider-agnostic external reference (Relay's requestId; unused/nil for Across)
+	ExternalStatus      ExternalStatus
+	RawExternalStatus   *string // the provider's own literal status string, for observability (design doc §16)
+	ConfirmedAt         *time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // CreateResult reports what Store.CreateOrGetPayment actually did.
