@@ -82,7 +82,7 @@
       "id": 10, "title": "Payments Currently Processing", "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
       "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [{"expr": "chainroute_payments_processing", "legendFormat": "{{execution_mode}}"}]
+      "targets": [{"expr": "sum by (execution_mode) (chainroute_payments_processing)", "legendFormat": "{{execution_mode}}"}]
     }
   ]
 }

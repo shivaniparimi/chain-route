@@ -135,6 +135,17 @@ Prometheus's scrape config (`observability/prometheus/prometheus.yml`) and
 5 seconds under the job names `chainroute-go-api`, `chainroute-worker`,
 and `chainroute-router`.
 
+Note the port mismatch this implies with the "Running locally" section
+above: the committed `prometheus.yml` scrapes go-api on its bare default
+port `:8080`, but `scripts/e2e_test.sh` (and the benchmark command below)
+start the server on `:8099` instead, specifically to avoid colliding with
+a real port 8080. The two are independent conventions and don't need to
+agree, but if you follow the e2e script's port, the `chainroute-go-api`
+scrape target will show as `down` in Prometheus with no explanation. To
+fix it, either start a second/direct server instance on `:8080` for the
+observability stack to scrape, or edit `prometheus.yml`'s
+`chainroute-go-api` target to `host.docker.internal:8099` to match.
+
 ### Grafana
 
 `http://localhost:3000`. This compose file enables anonymous access with
@@ -181,8 +192,20 @@ unbounded label cardinality.
 | `chainroute_payments_created_total` | Counter | `execution_mode` | Total payments created via `POST /payments`. |
 | `chainroute_payments_completed_total` | Counter | `execution_mode` | Total payments that reached `COMPLETED`. |
 | `chainroute_payments_failed_total` | Counter | `execution_mode`, `failure_reason_class` | Total payments that reached `FAILED`. |
-| `chainroute_payments_processing` | Gauge | `execution_mode` | Payments currently in `PROCESSING`. |
+| `chainroute_payments_processing` | Gauge | `execution_mode` | Payments created but not yet in a terminal state. **Split across two processes** — see note below. |
 | `chainroute_payment_duration_seconds` | Histogram | `execution_mode`, `outcome` | Wall time from payment creation to a terminal state. |
+
+> `chainroute_payments_processing` is `Inc()`'d in the `go-api` server
+> process (on payment creation) and `Dec()`'d only in the `go-api` worker
+> process (on reaching a terminal state). Those are two separate binaries
+> with two separate, isolated Prometheus registries, so neither process's
+> own scraped series is meaningful on its own — the server's series only
+> ever climbs and the worker's series only ever falls into negative
+> numbers. Query it with `sum by (execution_mode)
+> (chainroute_payments_processing)` (as the Grafana dashboard's "Payments
+> Currently Processing" panel already does) to recover the true in-flight
+> count; querying either scrape target's value directly will look wrong
+> by design.
 
 **Routing (Go server -> C++ router)**
 
@@ -262,20 +285,24 @@ The JSON written to `-out` has this shape:
 
 ```json
 {
-  "timestamp": "2026-09-17T00:00:00Z",
-  "duration_seconds": 30.01,
-  "concurrency": 8,
+  "timestamp": "<RFC3339 timestamp of the run>",
+  "duration_seconds": 0,
+  "concurrency": 0,
   "base_url": "http://localhost:8099",
-  "hardware": { "num_cpu": 10, "goos": "darwin", "goarch": "arm64" },
-  "total_requests": 1234,
-  "successful": 1200,
-  "failed": 34,
-  "throughput_accept_per_sec": 41.1,
-  "throughput_processed_per_sec": 40.0,
-  "accept_latency_ms": { "p50": 3.2, "p95": 6.1, "p99": 9.8 },
-  "e2e_latency_ms": { "p50": 210.4, "p95": 480.2, "p99": 720.9 }
+  "hardware": { "num_cpu": 0, "goos": "<GOOS>", "goarch": "<GOARCH>" },
+  "total_requests": 0,
+  "successful": 0,
+  "failed": 0,
+  "throughput_accept_per_sec": 0,
+  "throughput_processed_per_sec": 0,
+  "accept_latency_ms": { "p50": 0, "p95": 0, "p99": 0 },
+  "e2e_latency_ms": { "p50": 0, "p95": 0, "p99": 0 }
 }
 ```
+
+(All-zero/placeholder values above — this block shows the JSON's shape
+only, not an actual measurement. Do not quote any number from this block
+as a real result; run the benchmark yourself to get one.)
 
 ### Interpreting benchmark output
 
@@ -283,9 +310,9 @@ The benchmark distinguishes two different things, and the report is
 useless if they're conflated:
 
 - **Accept** is `POST /payments` returning `201`/`200`. `accept_latency_ms`
-  and `throughput_accept_per_sec` describe only this — the HTTP round
-  trip plus the DB write of the payment and its outbox row. A payment
-  counted here has *not* necessarily executed yet.
+  measures only this — the HTTP round trip plus the DB write of the
+  payment and its outbox row. A payment counted here has *not*
+  necessarily executed yet.
 - **Processed** means the benchmark polled `GET /payments/{id}` until the
   payment reached a terminal status. Only `COMPLETED` counts as
   `successful`; both `FAILED` and any payment that never reached a
@@ -295,6 +322,23 @@ useless if they're conflated:
   observed completion — i.e. it captures outbox-publish + Kafka +
   worker-processing + simulated-execution latency, not just the HTTP
   call.
+
+`throughput_accept_per_sec` is **not** an HTTP-accept-only rate, despite
+its name — it does not describe only the accept phase the way
+`accept_latency_ms` does. It is `total_requests / duration_seconds`,
+where `total_requests` counts fully-completed benchmark iterations —
+each one accept *plus* its own poll-to-terminal-or-timeout loop (see
+`runOnePayment` in `go-api/cmd/benchmark/main.go`: the counter increments
+only after that whole function returns, gated by up to ~5s of polling per
+iteration, not right after the accept call completes). At
+`-concurrency=N`, at most `N` iterations are ever in flight at once, so
+this number is fundamentally bounded by how long each iteration's polling
+takes, not by how fast the server can accept HTTP requests alone — it can
+be one to two orders of magnitude lower than the server's actual HTTP
+accept rate. If you want a number that isolates HTTP accept throughput,
+compute it yourself from `accept_latency_ms` and the concurrency setting,
+or measure accept latency under load with a separate tool; don't read
+`throughput_accept_per_sec` as that number.
 
 The `hardware` object records the exact machine the run measured
 (`num_cpu`, `goos`, `goarch`). Any number this benchmark reports is a
