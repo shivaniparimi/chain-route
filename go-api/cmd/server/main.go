@@ -124,13 +124,7 @@ func main() {
 	mux.HandleFunc("GET /payments/{id}", h.GetPayment)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
-	instrumentedMux := otelhttp.NewHandler(mux, "http.server", otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
-		// Without this, every HTTP server span shares the literal name
-		// "http.server" regardless of route, making Jaeger's
-		// operation-name filter unable to distinguish POST /payments
-		// from GET /metrics or POST /routes.
-		return r.Method + " " + r.URL.Path
-	}))
+	instrumentedMux := otelhttp.NewHandler(mux, "http.server", otelhttp.WithSpanNameFormatter(spanNameFormatter))
 	server := &http.Server{Addr: *httpAddr, Handler: instrumentedMux}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -186,4 +180,20 @@ func envDurationServer(key string, def time.Duration, unit time.Duration, logger
 		os.Exit(1)
 	}
 	return time.Duration(n) * unit
+}
+
+// spanNameFormatter names each HTTP server span by its bounded route
+// pattern (e.g. "GET /payments/{id}"), not the raw request path -- using
+// r.URL.Path would give GET /payments/{id} a distinct span name per
+// payment UUID, trading the original "everything is named http.server"
+// cardinality problem for a worse one in Jaeger's operation index.
+// r.Pattern is populated by net/http's ServeMux from the registered
+// pattern (e.g. "GET /payments/{id}") once routing has matched; it is
+// empty on the pre-routing call otelhttp itself makes before dispatching
+// to the mux, hence the fallback.
+func spanNameFormatter(_ string, r *http.Request) string {
+	if r.Pattern != "" {
+		return r.Pattern
+	}
+	return r.Method + " " + r.URL.Path
 }
