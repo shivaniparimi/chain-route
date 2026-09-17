@@ -2,10 +2,19 @@
 
 #include "chainroute/route.hpp"
 #include "chainroute_service/chain_asset_convert.hpp"
+#include "metrics.hpp"
 
 namespace chainroute_service {
 
 namespace {
+
+// Process-wide default RouteMetrics instance backing the single-arg
+// RoutingServiceImpl constructor, for callers (existing tests) that don't
+// care about observing metrics and predate Phase 10 instrumentation.
+chainroute::RouteMetrics& defaultRouteMetrics() {
+    static chainroute::RouteMetrics metrics;
+    return metrics;
+}
 
 chainroute::Graph buildGraphFromCandidates(
     chainroute::ChainId source, chainroute::ChainId dest, chainroute::AssetId asset,
@@ -23,26 +32,35 @@ chainroute::Graph buildGraphFromCandidates(
 }  // namespace
 
 RoutingServiceImpl::RoutingServiceImpl(chainroute::sim::NetworkSimulator& simulator)
-    : simulator_(simulator) {}
+    : RoutingServiceImpl(simulator, defaultRouteMetrics()) {}
+
+RoutingServiceImpl::RoutingServiceImpl(chainroute::sim::NetworkSimulator& simulator, chainroute::RouteMetrics& metrics)
+    : simulator_(simulator), metrics_(metrics) {}
 
 grpc::Status RoutingServiceImpl::FindRoute(
     grpc::ServerContext* /*context*/,
     const chainroute::v1::FindRouteRequest* request,
     chainroute::v1::FindRouteResponse* response) {
+    chainroute::MetricsScope scope(metrics_, request->candidate_edges_size());
+
     const auto sourceChain = toChainId(request->source_chain());
     const auto destChain = toChainId(request->destination_chain());
     const auto asset = toAssetId(request->asset());
 
     if (!sourceChain.has_value()) {
+        scope.SetOutcome(chainroute::RouteOutcome::kError);
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid source_chain");
     }
     if (!destChain.has_value()) {
+        scope.SetOutcome(chainroute::RouteOutcome::kError);
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid destination_chain");
     }
     if (!asset.has_value()) {
+        scope.SetOutcome(chainroute::RouteOutcome::kError);
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid asset");
     }
     if (!(request->amount() > 0.0)) {
+        scope.SetOutcome(chainroute::RouteOutcome::kError);
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "amount must be positive");
     }
 
@@ -53,12 +71,14 @@ grpc::Status RoutingServiceImpl::FindRoute(
     const auto sourceNode = graph.findNode(chainroute::Node{*sourceChain, *asset});
     const auto destNode = graph.findNode(chainroute::Node{*destChain, *asset});
     if (!sourceNode.has_value() || !destNode.has_value()) {
+        scope.SetOutcome(chainroute::RouteOutcome::kError);
         return grpc::Status(grpc::StatusCode::INTERNAL, "node not present in snapshot");
     }
 
     const auto route = chainroute::findCheapestRoute(graph, *sourceNode, *destNode, request->amount());
 
     if (!route.has_value()) {
+        scope.SetOutcome(chainroute::RouteOutcome::kNoRoute);
         response->set_route_found(false);
         response->set_total_fee(0.0);
         return grpc::Status::OK;
@@ -80,6 +100,7 @@ grpc::Status RoutingServiceImpl::FindRoute(
         current = edge.to;
     }
 
+    scope.SetOutcome(chainroute::RouteOutcome::kSuccess);
     return grpc::Status::OK;
 }
 

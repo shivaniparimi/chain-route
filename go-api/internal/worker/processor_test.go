@@ -2,23 +2,29 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/execution"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
 type fakeStore struct {
-	claimResult    bool
-	claimMode      payment.ExecutionMode
-	claimErr       error
-	completeResult bool
-	completeErr    error
-	claimCalls     int
-	completeCalls  int
-	lastTerminal   payment.Status
+	claimResult       bool
+	claimMode         payment.ExecutionMode
+	claimErr          error
+	completeResult    bool
+	completeErr       error
+	completeCreatedAt time.Time
+	claimCalls        int
+	completeCalls     int
+	lastTerminal      payment.Status
 }
 
 func (f *fakeStore) ClaimPayment(ctx context.Context, paymentID string) (bool, payment.ExecutionMode, error) {
@@ -30,10 +36,14 @@ func (f *fakeStore) ClaimPayment(ctx context.Context, paymentID string) (bool, p
 	return f.claimResult, mode, f.claimErr
 }
 
-func (f *fakeStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error) {
+func (f *fakeStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error) {
 	f.completeCalls++
 	f.lastTerminal = terminal
-	return f.completeResult, f.completeErr
+	createdAt := f.completeCreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	return f.completeResult, createdAt, f.completeErr
 }
 
 // findIDWithOutcome brute-forces a payment ID string for which the pure,
@@ -170,5 +180,38 @@ func TestHandleRoutedPayment_TestnetModeWithNilExecutorErrors(t *testing.T) {
 	err := proc.HandleRoutedPayment(context.Background(), events.RoutedPayment{PaymentID: "any"})
 	if err == nil {
 		t.Fatal("expected an error when a testnet-mode payment reaches a Processor with no Executor configured")
+	}
+}
+
+func TestHandleRoutedPayment_SimulatedMode_RecordsProcessingMetricsAndPaymentDuration(t *testing.T) {
+	id := findIDWithOutcome(t, true)
+	metrics := observability.NewMetrics()
+	store := &fakeStore{claimResult: true, claimMode: payment.ExecutionModeSimulated, completeResult: true, completeCreatedAt: time.Now().Add(-2 * time.Second)}
+	proc := &Processor{Store: store, Metrics: metrics, Logger: observability.NewLogger("test")}
+
+	if err := proc.HandleRoutedPayment(context.Background(), events.RoutedPayment{PaymentID: id}); err != nil {
+		t.Fatalf("HandleRoutedPayment: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.EventsConsumed); got != 1 {
+		t.Errorf("EventsConsumed = %v, want 1", got)
+	}
+	if got := testutil.CollectAndCount(metrics.PaymentDuration); got == 0 {
+		t.Error("expected at least one PaymentDuration observation")
+	}
+	if got := testutil.CollectAndCount(metrics.ProcessingDuration); got == 0 {
+		t.Error("expected at least one ProcessingDuration observation")
+	}
+}
+
+func TestHandleRoutedPayment_ClaimFailure_RecordsProcessingFailure(t *testing.T) {
+	metrics := observability.NewMetrics()
+	store := &fakeStore{claimErr: errors.New("db down")}
+	proc := &Processor{Store: store, Metrics: metrics, Logger: observability.NewLogger("test")}
+
+	if err := proc.HandleRoutedPayment(context.Background(), events.RoutedPayment{PaymentID: "pay-1"}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := testutil.ToFloat64(metrics.ProcessingFailures.WithLabelValues("unknown", "claim_conflict")); got != 1 {
+		t.Errorf("ProcessingFailures{unknown,claim_conflict} = %v, want 1", got)
 	}
 }

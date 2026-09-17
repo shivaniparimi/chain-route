@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -11,12 +10,14 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
 	"chainroute/go-api/internal/money"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -120,6 +121,10 @@ func isZeroAmount(amount string) bool {
 }
 
 func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.Tracer("payment").Start(r.Context(), "payment.create")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idempotencyKey == "" {
 		writeError(w, http.StatusBadRequest, "Idempotency-Key header is required")
@@ -170,6 +175,13 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	span.SetAttributes(
+		attribute.String("payment.source_chain", req.SourceChain),
+		attribute.String("payment.destination_chain", req.DestinationChain),
+		attribute.String("payment.asset", req.Asset),
+		attribute.String("payment.execution_mode", string(mode)),
+	)
+
 	// This float64 conversion feeds only the pre-existing (Phase 2-4,
 	// unmodified) FindRouteRequest.amount `double` field, which has
 	// always been a liquidity-filter threshold for the C++ simulator --
@@ -196,7 +208,7 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		Amount: req.Amount, ExecutionMode: mode,
 	}
 	if existing, outcome, found, err := h.Store.LookupByIdempotencyKey(r.Context(), lookupCandidate); err != nil {
-		log.Printf("ERROR: failed to look up payment by idempotency key: %v", err)
+		h.logger().ErrorContext(r.Context(), "failed to look up payment by idempotency key", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	} else if found {
@@ -256,24 +268,41 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 
 		quoteCtx, quoteCancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer quoteCancel()
+		aggCtx, aggSpan := observability.Tracer("quote").Start(quoteCtx, "quote.aggregate")
 		results := make([]quoteResult, len(providers))
 		var wg sync.WaitGroup
 		for i, p := range providers {
 			wg.Add(1)
 			go func(i int, p quote.Provider) {
 				defer wg.Done()
-				q, err := p.GetQuote(quoteCtx, quote.Request{
+				providerLabel := observability.SanitizeProviderLabel(p.Name())
+				spanCtx, qSpan := observability.Tracer("quote").Start(aggCtx, "quote."+providerLabel+".get")
+				defer qSpan.End()
+				h.metrics().QuoteRequests.WithLabelValues(providerLabel).Inc()
+				start := time.Now()
+				q, err := p.GetQuote(spanCtx, quote.Request{
 					SourceChainID: originChainID, DestinationChainID: destChainID, Asset: bridgedAsset, AmountBaseUnits: amountWei,
 				})
+				h.metrics().QuoteDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
+				if err != nil {
+					h.metrics().QuoteFailures.WithLabelValues(providerLabel, "http_error").Inc()
+				} else {
+					available := "false"
+					if q.Available {
+						available = "true"
+					}
+					h.metrics().QuoteAvailable.WithLabelValues(providerLabel, available).Inc()
+				}
 				results[i] = quoteResult{provider: p, q: q, err: err}
 			}(i, p)
 		}
 		wg.Wait()
+		aggSpan.End()
 
 		anySucceeded, anyAvailable := false, false
 		for _, res := range results { // index order, never completion order -- keeps the C++ tie-break deterministic
 			if res.err != nil {
-				log.Printf("WARNING: quote provider %s failed: %v", res.provider.Name(), res.err)
+				h.logger().WarnContext(r.Context(), "quote provider failed", "provider", res.provider.Name(), "error", res.err)
 				continue
 			}
 			anySucceeded = true
@@ -304,25 +333,35 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		Asset: asset, Amount: amountForRouting, CandidateEdges: candidateEdges,
 	}
 
-	resp, err := h.Client.FindRoute(r.Context(), grpcReq)
+	routingCtx, routingSpan := observability.Tracer("routing").Start(r.Context(), "routing.find")
+	h.metrics().RoutingRequests.WithLabelValues(string(mode)).Inc()
+	routingStart := time.Now()
+	resp, err := h.Client.FindRoute(routingCtx, grpcReq)
+	h.metrics().RoutingDuration.WithLabelValues(string(mode)).Observe(time.Since(routingStart).Seconds())
+	routingSpan.End()
 	if err != nil {
 		st, _ := status.FromError(err)
 		switch st.Code() {
 		case codes.InvalidArgument:
-			log.Printf("WARNING: routing service rejected a request that passed Go validation (possible validation drift): %v", st.Message())
+			h.metrics().RoutingFailures.WithLabelValues("invalid_request").Inc()
+			h.logger().WarnContext(r.Context(), "routing service rejected a request that passed Go validation (possible validation drift)", "error", st.Message())
 			writeError(w, http.StatusBadRequest, st.Message())
 		case codes.Unavailable:
+			h.metrics().RoutingFailures.WithLabelValues("grpc_error").Inc()
 			writeError(w, http.StatusServiceUnavailable, "routing service unavailable")
 		case codes.DeadlineExceeded:
+			h.metrics().RoutingFailures.WithLabelValues("grpc_error").Inc()
 			writeError(w, http.StatusGatewayTimeout, "routing service timed out")
 		default:
-			log.Printf("ERROR: routing service call failed: %v", err)
+			h.metrics().RoutingFailures.WithLabelValues("grpc_error").Inc()
+			h.logger().ErrorContext(r.Context(), "routing service call failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 		}
 		return
 	}
 
 	if !resp.GetRouteFound() {
+		h.metrics().RoutingFailures.WithLabelValues("no_route").Inc()
 		writeError(w, http.StatusUnprocessableEntity, "no route available for the requested payment")
 		return
 	}
@@ -339,12 +378,18 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 	if mode == payment.ExecutionModeTestnet && len(hops) > 0 {
 		winningQuote, ok := quotesByBridgeName[hops[0].BridgeName]
 		if !ok {
-			log.Printf("ERROR: winning hop bridge_name %q has no matching fetched quote -- this should be unreachable", hops[0].BridgeName)
+			h.logger().ErrorContext(r.Context(), "winning hop bridge_name has no matching fetched quote -- this should be unreachable", "bridge_name", hops[0].BridgeName)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		provider := winningQuote.ProviderName
 		bridgeProvider = &provider
+
+		providerLabel := observability.SanitizeProviderLabel(provider)
+		h.metrics().RoutingSelectedProvider.WithLabelValues(providerLabel).Inc()
+		h.metrics().QuoteSelected.WithLabelValues(providerLabel).Inc()
+		h.metrics().RoutingSelectedFee.WithLabelValues(providerLabel).Observe(float64(winningQuote.FeeBaseUnits.Int64()))
+		span.SetAttributes(attribute.String("payment.provider", providerLabel))
 	}
 
 	candidate := payment.Payment{
@@ -369,13 +414,16 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 
 	result, outcome, err := h.Store.CreateOrGetPayment(r.Context(), candidate)
 	if err != nil {
-		log.Printf("ERROR: failed to persist payment: %v", err)
+		h.logger().ErrorContext(r.Context(), "failed to persist payment", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
 	switch outcome {
 	case payment.Created:
+		h.metrics().PaymentsCreated.WithLabelValues(string(mode)).Inc()
+		h.metrics().PaymentsProcessing.WithLabelValues(string(mode)).Inc()
+		span.SetAttributes(attribute.String("payment.id", result.ID), attribute.String("payment.status", string(result.Status)))
 		w.Header().Set("Location", "/payments/"+result.ID)
 		writeJSON(w, http.StatusCreated, toPaymentResponse(result, payment.Execution{}, false))
 	case payment.Replayed:
@@ -390,7 +438,7 @@ func (h *Handler) GetPayment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p, found, err := h.Store.GetPayment(r.Context(), id)
 	if err != nil {
-		log.Printf("ERROR: failed to read payment: %v", err)
+		h.logger().ErrorContext(r.Context(), "failed to read payment", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -400,7 +448,7 @@ func (h *Handler) GetPayment(w http.ResponseWriter, r *http.Request) {
 	}
 	exec, execFound, err := h.Store.GetExecutionByPaymentID(r.Context(), id)
 	if err != nil {
-		log.Printf("ERROR: failed to read payment execution: %v", err)
+		h.logger().ErrorContext(r.Context(), "failed to read payment execution", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}

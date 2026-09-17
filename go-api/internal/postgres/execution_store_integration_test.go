@@ -285,12 +285,15 @@ func TestMarkSubmitted_AndCompleteSubmittedPayment(t *testing.T) {
 		t.Fatal("expected second MarkSubmitted call to report submitted=false")
 	}
 
-	completed, err := s.CompleteSubmittedPayment(context.Background(), id, payment.StatusCompleted)
+	completed, createdAt, err := s.CompleteSubmittedPayment(context.Background(), id, payment.StatusCompleted)
 	if err != nil {
 		t.Fatalf("complete submitted payment: %v", err)
 	}
 	if !completed {
 		t.Fatal("expected CompleteSubmittedPayment to succeed for a SUBMITTED payment")
+	}
+	if createdAt.IsZero() {
+		t.Fatal("expected CompleteSubmittedPayment to return a non-zero created_at")
 	}
 
 	var status string
@@ -302,7 +305,7 @@ func TestMarkSubmitted_AndCompleteSubmittedPayment(t *testing.T) {
 	}
 
 	// A second call must be a safe no-op: the payment is no longer SUBMITTED.
-	completedAgain, err := s.CompleteSubmittedPayment(context.Background(), id, payment.StatusCompleted)
+	completedAgain, _, err := s.CompleteSubmittedPayment(context.Background(), id, payment.StatusCompleted)
 	if err != nil {
 		t.Fatalf("complete submitted payment again: %v", err)
 	}

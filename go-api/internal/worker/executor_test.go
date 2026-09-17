@@ -14,10 +14,12 @@ import (
 	gethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"chainroute/go-api/internal/bridge/across"
 	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/evm"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 	"chainroute/go-api/internal/postgres"
 )
@@ -298,6 +300,53 @@ func TestDriveExecutionForward_AmbiguousBroadcastFoundOnChainNeverResends(t *tes
 	}
 	if !store.broadcastCalled {
 		t.Fatal("expected MarkExecutionBroadcast even on the found-on-chain path -- it is now confirmed broadcast, whoever sent it")
+	}
+}
+
+// TestDriveExecutionForward_ResumedAlreadyBroadcastTxDoesNotDoubleCountBroadcasts
+// guards the code-review finding that Broadcasts{provider} could be
+// double-incremented for a single physical broadcast: signAndBroadcastFresh
+// increments Broadcasts right after a genuine SendTransaction succeeds, but
+// if the subsequent MarkExecutionBroadcast DB write then fails (a transient
+// DB error, independent of the chain RPC succeeding), broadcast_at never
+// gets persisted even though the tx is already on chain. The reconciler
+// later resumes this row via DriveExecutionForward's already-signed branch,
+// whose broadcastWithRecovery call finds the tx already on chain (via
+// TransactionByHash) and correctly returns without resending -- but must NOT
+// count that as a second broadcast. This test simulates exactly that
+// resumed state directly (an already-signed exec whose tx TransactionByHash
+// reports as already on chain) and asserts Broadcasts{across} stays at 0
+// after DriveExecutionForward runs, even though the call succeeds and marks
+// the execution broadcast/submitted.
+func TestDriveExecutionForward_ResumedAlreadyBroadcastTxDoesNotDoubleCountBroadcasts(t *testing.T) {
+	hash := "0xabcd000000000000000000000000000000000000000000000000000000000000"[:66]
+	store := &fakeExecutorStore{}
+	ethClient := &fakeExecutorEthClient{txByHashFound: true} // simulates the resumed-crash-recovery scenario: already on chain
+	e := newTestExecutor(t, store, ethClient)
+	metrics := observability.NewMetrics()
+	e.Metrics = metrics
+
+	exec := payment.Execution{
+		ID: "exec-resumed-already-broadcast", PaymentID: "pay-resumed-already-broadcast", Nonce: 1,
+		BridgeProvider: "across", SignedTxHash: &hash, RawSignedTx: []byte{0xde, 0xad},
+	}
+	if err := e.DriveExecutionForward(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never rebroadcast when the hash is already found on-chain")
+	}
+	if !store.broadcastCalled {
+		t.Fatal("expected MarkExecutionBroadcast even on the found-on-chain path -- it is now confirmed broadcast, whoever sent it")
+	}
+	if !store.submittedCalled {
+		t.Fatal("expected MarkSubmitted to be called")
+	}
+	if got := testutil.ToFloat64(metrics.Broadcasts.WithLabelValues("across")); got != 0 {
+		t.Errorf("Broadcasts{across} = %v, want 0 -- the idempotent already-on-chain short-circuit must never increment Broadcasts, only a genuine new SendTransaction may", got)
+	}
+	if got := testutil.CollectAndCount(metrics.ExecutionDuration); got != 0 {
+		t.Errorf("ExecutionDuration observations = %v, want 0 -- a resumed already-broadcast no-op must not record a near-zero-duration sample that deflates the histogram's p50, gated the same as Broadcasts above", got)
 	}
 }
 
@@ -980,6 +1029,69 @@ func TestExecuteTestnetPayment_UnknownSignerIsHardError(t *testing.T) {
 	}
 	if ethClient.sendCalled {
 		t.Fatal("must never sign/broadcast for a provider this worker has no configured signer for")
+	}
+}
+
+// TestExecuteTestnetPayment_HappyPath_RecordsExecutionMetrics guards Task
+// 9's core metrics contract: a successful ExecuteTestnetPayment run must
+// record exactly one ExecutionAttempts and one Broadcasts increment under
+// the "across" provider label, plus at least one ExecutionDuration
+// observation.
+func TestExecuteTestnetPayment_HappyPath_RecordsExecutionMetrics(t *testing.T) {
+	store := &fakeExecutorStore{
+		tryCreateCreated: true,
+		tryCreateExec:    payment.Execution{ID: "exec-metrics-happy", PaymentID: "pay-metrics-happy", Nonce: 3},
+		pmt:              payment.Payment{ID: "pay-metrics-happy", Amount: "0.001"},
+		pmtFound:         true,
+	}
+	ethClient := &fakeExecutorEthClient{txByHashFound: false, txByHashErr: gethereum.NotFound}
+	e := newTestExecutor(t, store, ethClient)
+	metrics := observability.NewMetrics()
+	e.Metrics = metrics
+
+	if err := e.ExecuteTestnetPayment(context.Background(), "pay-metrics-happy"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.ExecutionAttempts.WithLabelValues("across")); got != 1 {
+		t.Errorf("ExecutionAttempts{across} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.Broadcasts.WithLabelValues("across")); got != 1 {
+		t.Errorf("Broadcasts{across} = %v, want 1", got)
+	}
+	if got := testutil.CollectAndCount(metrics.ExecutionDuration); got == 0 {
+		t.Error("expected an ExecutionDuration observation")
+	}
+}
+
+// TestExecuteTestnetPayment_EnvelopeValidationFailure_RecordsFailureMetricNotAttempt
+// mirrors TestExecuteTestnetPayment_WrongEnvelopeChainIDIsHardError, adding
+// Metrics, and asserts ExecutionAttempts is NOT incremented -- the attempt
+// only counts once TryCreateExecution actually wins the race, and a
+// rejected envelope (buildValidatedEnvelope runs BEFORE TryCreateExecution)
+// never reaches that point -- while ExecutionsFailed IS incremented with
+// reason "envelope_invalid".
+func TestExecuteTestnetPayment_EnvelopeValidationFailure_RecordsFailureMetricNotAttempt(t *testing.T) {
+	store := &fakeExecutorStore{
+		quoteFound:       true,
+		quoteRow:         payment.Quote{Provider: "across", OriginChainID: 11155111, DestinationChainID: 84532, FeeAmount: "100000000000", ExpiresAt: time.Now().Add(time.Hour)},
+		tryCreateCreated: true, tryCreateExec: payment.Execution{ID: "exec-metrics-badchain", PaymentID: "pay-metrics-badchain", Nonce: 1},
+		pmt: payment.Payment{ID: "pay-metrics-badchain", Amount: "0.001"}, pmtFound: true,
+	}
+	ethClient := &fakeExecutorEthClient{}
+	e := newTestExecutor(t, store, ethClient)
+	e.Signers = map[string]quote.Signer{"across": &fakeSigner{envelope: quote.TxEnvelope{To: e.ExpectedContractByProvider["across"], Value: big.NewInt(1_000_000_000_000_000), ChainID: 999999}}}
+	e.QuoteProviders = map[string]quote.Provider{"across": &fakeExecutorQuoteProvider{quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(90_000_000_000), OutputAmountBaseUnits: big.NewInt(910_000_000_000_000), InputAmountBaseUnits: big.NewInt(1_000_000_000_000_000)}}}
+	metrics := observability.NewMetrics()
+	e.Metrics = metrics
+
+	if err := e.ExecuteTestnetPayment(context.Background(), "pay-metrics-badchain"); err == nil {
+		t.Fatal("expected a hard error when the envelope's ChainID doesn't match e.OriginChainID")
+	}
+	if got := testutil.ToFloat64(metrics.ExecutionAttempts.WithLabelValues("across")); got != 0 {
+		t.Errorf("ExecutionAttempts{across} = %v, want 0 (nonce never allocated)", got)
+	}
+	if got := testutil.ToFloat64(metrics.ExecutionsFailed.WithLabelValues("across", "envelope_invalid")); got != 1 {
+		t.Errorf("ExecutionsFailed{across,envelope_invalid} = %v, want 1", got)
 	}
 }
 

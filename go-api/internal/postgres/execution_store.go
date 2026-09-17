@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -63,6 +64,9 @@ const executionExistsConstraint = "payment_executions_payment_id_key"
 // UPDATE and the row INSERT are one transaction, losing this race rolls
 // back the nonce allocation too: a lost race never burns a nonce.
 func (s *Store) TryCreateExecution(ctx context.Context, p CreateExecutionParams) (exec payment.Execution, created bool, err error) {
+	ctx, span := observability.Tracer("db").Start(ctx, "db.TryCreateExecution")
+	defer span.End()
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return payment.Execution{}, false, fmt.Errorf("begin tx: %w", err)
@@ -158,6 +162,9 @@ func (s *Store) GetExecutionByPaymentID(ctx context.Context, paymentID string) (
 // its deterministic hash BEFORE any broadcast attempt -- this ordering is
 // the core of Phase 7's crash-safety (design spec §8 step 2).
 func (s *Store) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string, providerReferenceID *string) error {
+	ctx, span := observability.Tracer("db").Start(ctx, "db.PersistSignedExecution")
+	defer span.End()
+
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE payment_executions SET raw_signed_tx = $2, signed_tx_hash = $3, provider_reference_id = $4, updated_at = now()
 		WHERE id = $1
@@ -214,20 +221,22 @@ func (s *Store) MarkSubmitted(ctx context.Context, paymentID string) (submitted 
 // CompleteSubmittedPayment atomically transitions a testnet-mode payment
 // from SUBMITTED to a terminal status, mirroring CompletePayment's
 // PROCESSING->terminal guard exactly, but for the SUBMITTED->terminal edge
-// that only testnet-mode payments ever traverse.
-func (s *Store) CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (completed bool, err error) {
-	result, err := s.db.ExecContext(ctx, `
+// that only testnet-mode payments ever traverse. It also returns the
+// payment's created_at timestamp, mirroring CompletePayment, for
+// end-to-end payment-duration metrics.
+func (s *Store) CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (completed bool, createdAt time.Time, err error) {
+	row := s.db.QueryRowContext(ctx, `
 		UPDATE payments SET status = $2, completed_at = now(), updated_at = now()
 		WHERE id = $1 AND status = $3
+		RETURNING created_at
 	`, paymentID, terminal, payment.StatusSubmitted)
-	if err != nil {
-		return false, fmt.Errorf("complete submitted payment: %w", err)
+	if err := row.Scan(&createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, time.Time{}, nil
+		}
+		return false, time.Time{}, fmt.Errorf("complete submitted payment: %w", err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("complete submitted payment rows affected: %w", err)
-	}
-	return rows == 1, nil
+	return true, createdAt, nil
 }
 
 // StaleTestnetProcessingWithoutExecutionIDs returns testnet-mode payments

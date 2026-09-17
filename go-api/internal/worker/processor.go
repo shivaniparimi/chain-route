@@ -3,10 +3,17 @@ package worker
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/execution"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -20,7 +27,7 @@ const defaultTestnetHandleTimeout = 30 * time.Second
 // PaymentStore is the subset of *postgres.Store the processor needs.
 type PaymentStore interface {
 	ClaimPayment(ctx context.Context, paymentID string) (bool, payment.ExecutionMode, error)
-	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
+	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error)
 }
 
 // TestnetExecutor is the subset of *Executor Processor needs -- kept as an
@@ -50,6 +57,31 @@ type Processor struct {
 	// defaultTestnetHandleTimeout. Simulated-mode handling is intentionally
 	// untouched by this field and keeps using the caller's own context.
 	TestnetTimeout time.Duration
+
+	Metrics *observability.Metrics
+	Logger  *slog.Logger
+}
+
+// metrics returns p.Metrics, or a shared safe-to-record-into default when
+// it is nil -- e.g. for an existing test's struct literal that predates
+// this phase and never sets the field. Every instrumentation call in this
+// file must go through this accessor, never through p.Metrics directly,
+// so that a nil Metrics field can never nil-pointer-panic.
+func (p *Processor) metrics() *observability.Metrics {
+	if p.Metrics != nil {
+		return p.Metrics
+	}
+	return observability.DefaultMetrics()
+}
+
+// logger mirrors metrics: it returns p.Logger, or a shared default when
+// nil. Every log call in this file must go through this accessor, never
+// through p.Logger directly.
+func (p *Processor) logger() *slog.Logger {
+	if p.Logger != nil {
+		return p.Logger
+	}
+	return observability.DefaultLogger()
 }
 
 // HandleRoutedPayment claims the payment and, only if the claim succeeds,
@@ -63,16 +95,28 @@ type Processor struct {
 // special-case: whichever of the two wins CompletePayment's guard is the
 // one that persists.
 func (p *Processor) HandleRoutedPayment(ctx context.Context, evt events.RoutedPayment) error {
+	carrier := propagation.MapCarrier(evt.TraceCarrier)
+	ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+	ctx, span := observability.Tracer("kafka").Start(ctx, "kafka.process")
+	defer span.End()
+	span.SetAttributes(attribute.String("payment.id", evt.PaymentID))
+
+	start := time.Now()
+	p.metrics().EventsConsumed.Inc()
+
 	claimed, mode, err := p.Store.ClaimPayment(ctx, evt.PaymentID)
 	if err != nil {
+		p.metrics().ProcessingFailures.WithLabelValues("unknown", "claim_conflict").Inc()
 		return fmt.Errorf("claim payment %s: %w", evt.PaymentID, err)
 	}
 	if !claimed {
 		return nil
 	}
+	span.SetAttributes(attribute.String("payment.execution_mode", string(mode)))
 
 	if mode == payment.ExecutionModeTestnet {
 		if p.Executor == nil {
+			p.metrics().ProcessingFailures.WithLabelValues(string(mode), "execution_error").Inc()
 			return fmt.Errorf("payment %s is execution_mode=testnet but this worker has no Executor configured (BLOCKCHAIN_ENV != testnet) -- this should be unreachable if the API layer's testnet gate is working", evt.PaymentID)
 		}
 		timeout := p.TestnetTimeout
@@ -84,20 +128,44 @@ func (p *Processor) HandleRoutedPayment(ctx context.Context, evt events.RoutedPa
 		// Phase 6 simulated path and may already have little budget left by
 		// the time ClaimPayment returns -- testnet execution needs its own
 		// larger, independent timeout (review Finding 4), not a truncation
-		// of whatever remains of the caller's.
-		testnetCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		// of whatever remains of the caller's. The trace SPAN CONTEXT is
+		// still carried forward via trace.ContextWithSpanContext so the
+		// child execution.run span nests under this kafka.process trace
+		// rather than starting a new, disconnected one -- this is
+		// orthogonal to the deadline, which stays independent.
+		testnetCtx := trace.ContextWithSpanContext(context.Background(), trace.SpanContextFromContext(ctx))
+		testnetCtx, cancel := context.WithTimeout(testnetCtx, timeout)
 		defer cancel()
-		return p.Executor.ExecuteTestnetPayment(testnetCtx, evt.PaymentID)
+		err := p.Executor.ExecuteTestnetPayment(testnetCtx, evt.PaymentID)
+		p.metrics().ProcessingDuration.WithLabelValues(string(mode)).Observe(time.Since(start).Seconds())
+		if err != nil {
+			p.metrics().ProcessingFailures.WithLabelValues(string(mode), "execution_error").Inc()
+		}
+		return err
 	}
 
 	result := execution.Execute(evt.PaymentID)
 	terminal := payment.StatusCompleted
+	outcome := "completed"
 	if !result.Success {
 		terminal = payment.StatusFailed
+		outcome = "failed"
 	}
 
-	if _, err := p.Store.CompletePayment(ctx, evt.PaymentID, terminal); err != nil {
+	completed, createdAt, err := p.Store.CompletePayment(ctx, evt.PaymentID, terminal)
+	p.metrics().ProcessingDuration.WithLabelValues(string(mode)).Observe(time.Since(start).Seconds())
+	if err != nil {
+		p.metrics().ProcessingFailures.WithLabelValues(string(mode), "execution_error").Inc()
 		return fmt.Errorf("complete payment %s: %w", evt.PaymentID, err)
+	}
+	if completed {
+		p.metrics().PaymentDuration.WithLabelValues(string(mode), outcome).Observe(time.Since(createdAt).Seconds())
+		p.metrics().PaymentsProcessing.WithLabelValues(string(mode)).Dec()
+		if terminal == payment.StatusCompleted {
+			p.metrics().PaymentsCompleted.WithLabelValues(string(mode)).Inc()
+		} else {
+			p.metrics().PaymentsFailed.WithLabelValues(string(mode), "execution").Inc()
+		}
 	}
 	return nil
 }

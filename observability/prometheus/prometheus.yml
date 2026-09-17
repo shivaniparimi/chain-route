@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: chainroute-go-api
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: go-api
+  - job_name: chainroute-worker
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          service: worker
+  - job_name: chainroute-router
+    static_configs:
+      - targets: ["host.docker.internal:9102"]
+        labels:
+          service: router

@@ -1,0 +1,88 @@
+{
+  "title": "ChainRoute Overview",
+  "uid": "chainroute-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "timezone": "browser",
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1, "title": "Payment Throughput", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [{"expr": "sum by (execution_mode) (rate(chainroute_payments_created_total[1m]))", "legendFormat": "{{execution_mode}}"}]
+    },
+    {
+      "id": 2, "title": "Payment Success vs Failure", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {"expr": "sum(rate(chainroute_payments_completed_total[5m]))", "legendFormat": "completed"},
+        {"expr": "sum(rate(chainroute_payments_failed_total[5m]))", "legendFormat": "failed"}
+      ]
+    },
+    {
+      "id": 3, "title": "End-to-End Payment Latency (p50/p95/p99)", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum(rate(chainroute_payment_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum(rate(chainroute_payment_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum(rate(chainroute_payment_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 4, "title": "Routing Latency (p50/p95/p99)", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum(rate(chainroute_routing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum(rate(chainroute_routing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum(rate(chainroute_routing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 5, "title": "Across vs Relay Selection", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [{"expr": "sum by (provider) (rate(chainroute_routing_selected_provider_total[5m]))", "legendFormat": "{{provider}}"}]
+    },
+    {
+      "id": 6, "title": "Provider Quote Latency (p95)", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [{"expr": "histogram_quantile(0.95, sum(rate(chainroute_quote_duration_seconds_bucket[5m])) by (le, provider))", "legendFormat": "{{provider}}"}]
+    },
+    {
+      "id": 7, "title": "Provider Quote Failures", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [{"expr": "sum by (provider, reason) (rate(chainroute_quote_failures_total[5m]))", "legendFormat": "{{provider}}/{{reason}}"}]
+    },
+    {
+      "id": 8, "title": "Kafka/Worker Processing", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {"expr": "sum(rate(chainroute_events_consumed_total[1m]))", "legendFormat": "events consumed/s"},
+        {"expr": "histogram_quantile(0.95, sum(rate(chainroute_processing_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95 processing latency"}
+      ]
+    },
+    {
+      "id": 9, "title": "Blockchain Execution Outcomes", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [
+        {"expr": "sum by (provider) (rate(chainroute_executions_completed_total[5m]))", "legendFormat": "{{provider}} completed"},
+        {"expr": "sum by (provider) (rate(chainroute_executions_failed_total[5m]))", "legendFormat": "{{provider}} failed"}
+      ]
+    },
+    {
+      "id": 10, "title": "Payments Currently Processing", "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "targets": [{"expr": "sum by (execution_mode) (chainroute_payments_processing)", "legendFormat": "{{execution_mode}}"}]
+    }
+  ]
+}

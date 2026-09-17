@@ -40,9 +40,15 @@ target_link_libraries(chainroute_proto PUBLIC protobuf::libprotobuf gRPC::grpc++
 
 add_library(chainroute_service_lib STATIC
     src/chain_asset_convert.cpp
+    src/metrics.cpp
     src/routing_service.cpp
 )
-target_include_directories(chainroute_service_lib PUBLIC include)
+# "src" is added here (alongside the public "include" dir) so that
+# metrics.hpp -- deliberately kept in src/ rather than include/ since it is
+# an implementation-internal helper, not part of the service's public
+# interface -- resolves via #include "metrics.hpp" from routing_service.hpp,
+# main.cpp, and the tests target that links against this library.
+target_include_directories(chainroute_service_lib PUBLIC include src)
 target_link_libraries(chainroute_service_lib PUBLIC chainroute chainroute_proto)
 if (NOT MSVC)
     target_compile_options(chainroute_service_lib PRIVATE -Wall -Wextra -Wpedantic)

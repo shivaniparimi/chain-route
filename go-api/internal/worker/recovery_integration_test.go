@@ -161,7 +161,7 @@ func TestRecovery_StalledWorkerVsSweepRace(t *testing.T) {
 		if !result.Success {
 			terminal = payment.StatusFailed
 		}
-		workerCompleted, workerErr = store.CompletePayment(context.Background(), created.ID, terminal)
+		workerCompleted, _, workerErr = store.CompletePayment(context.Background(), created.ID, terminal)
 	}()
 	wg.Wait()
 
