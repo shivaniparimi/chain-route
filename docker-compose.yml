@@ -1,0 +1,126 @@
+# Full containerized ChainRoute backend -- simulated mode by default (no
+# BLOCKCHAIN_ENV set anywhere below). Start with: docker compose up -d
+# For a testnet-enabled run, see docker-compose.testnet.yml.
+# This file is independent of docker-compose.observability.yml (which
+# remains for the native-binary + observability-only workflow); running
+# both together is not the intended usage -- each is self-contained.
+name: chainroute
+
+networks:
+  chainroute-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: chainroute
+      POSTGRES_USER: chainroute
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chainroute_local_dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [chainroute-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chainroute"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    image: postgres:16-bookworm
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./go-api/migrations:/migrations:ro
+      - ./scripts/apply_migrations.sh:/apply_migrations.sh:ro
+    entrypoint: ["/bin/bash", "/apply_migrations.sh"]
+    command: ["postgres://chainroute:${POSTGRES_PASSWORD:-chainroute_local_dev}@postgres:5432/chainroute?sslmode=disable"]
+    environment:
+      MIGRATIONS_DIR: /migrations
+    networks: [chainroute-net]
+    restart: "no"
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    networks: [chainroute-net]
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  cpp-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpp-router
+    networks: [chainroute-net]
+    restart: unless-stopped
+    # HEALTHCHECK is baked into the image (Task 3); no override needed here.
+
+  go-server:
+    build:
+      context: ./go-api
+      dockerfile: cmd/server/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      cpp-router:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://chainroute:${POSTGRES_PASSWORD:-chainroute_local_dev}@postgres:5432/chainroute?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+    command: ["--http-addr=:8080", "--grpc-addr=cpp-router:50051"]
+    ports:
+      - "8080:8080"
+    networks: [chainroute-net]
+    # No container-level HEALTHCHECK: distroless has no shell/HTTP client
+    # to run one from inside the container, and the app has no dedicated
+    # health endpoint yet. External checks (docker compose ps for exit
+    # status, or curl http://localhost:8080/metrics from the host) are
+    # the practical substitute -- see README's Docker section. The C++
+    # router's HEALTHCHECK (Task 3) works because that image is
+    # debian:bookworm-slim-based with a normal shell; this is a direct
+    # consequence of the two runtime bases differing, not an oversight.
+    restart: unless-stopped
+
+  go-worker:
+    build:
+      context: ./go-api
+      dockerfile: cmd/worker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://chainroute:${POSTGRES_PASSWORD:-chainroute_local_dev}@postgres:5432/chainroute?sslmode=disable
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      METRICS_ADDR: ":9091"
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+    ports:
+      - "9091:9091"
+    networks: [chainroute-net]
+    # Same reasoning as go-server above: distroless has no shell/HTTP
+    # client for a container-level HEALTHCHECK, and this service isn't
+    # depended on via `condition: service_healthy` by anything else.
+    restart: unless-stopped
