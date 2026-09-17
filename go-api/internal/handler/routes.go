@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -29,6 +28,28 @@ type Handler struct {
 	QuoteRegistry       *quote.Registry // nil when BlockchainEnv != "testnet"; never consulted otherwise
 	Metrics             *observability.Metrics
 	Logger              *slog.Logger
+}
+
+// metrics returns h.Metrics, or a shared safe-to-record-into default when
+// it is nil -- e.g. for an existing test's struct literal that predates
+// this phase and never sets the field. Every instrumentation call in this
+// package must go through this accessor, never through h.Metrics
+// directly, so that a nil Metrics field can never nil-pointer-panic.
+func (h *Handler) metrics() *observability.Metrics {
+	if h.Metrics != nil {
+		return h.Metrics
+	}
+	return observability.DefaultMetrics()
+}
+
+// logger mirrors metrics: it returns h.Logger, or a shared default when
+// nil. Every log call in this package must go through this accessor,
+// never through h.Logger directly.
+func (h *Handler) logger() *slog.Logger {
+	if h.Logger != nil {
+		return h.Logger
+	}
+	return observability.DefaultLogger()
 }
 
 type findRouteRequest struct {
@@ -150,14 +171,14 @@ func (h *Handler) PostRoutes(w http.ResponseWriter, r *http.Request) {
 		st, _ := status.FromError(err)
 		switch st.Code() {
 		case codes.InvalidArgument:
-			log.Printf("WARNING: routing service rejected a request that passed Go validation (possible validation drift): %v", st.Message())
+			h.logger().WarnContext(r.Context(), "routing service rejected a request that passed Go validation (possible validation drift)", "error", st.Message())
 			writeError(w, http.StatusBadRequest, st.Message())
 		case codes.Unavailable:
 			writeError(w, http.StatusServiceUnavailable, "routing service unavailable")
 		case codes.DeadlineExceeded:
 			writeError(w, http.StatusGatewayTimeout, "routing service timed out")
 		default:
-			log.Printf("ERROR: routing service call failed: %v", err)
+			h.logger().ErrorContext(r.Context(), "routing service call failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 		}
 		return

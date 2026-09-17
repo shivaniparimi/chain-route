@@ -8,11 +8,15 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -671,5 +675,126 @@ func TestPostPayments_DefaultExecutionModeIsSimulated(t *testing.T) {
 	}
 	if body["execution_mode"] != "simulated" {
 		t.Fatalf("expected execution_mode=simulated by default, got %v", body["execution_mode"])
+	}
+}
+
+// newTestHandlerWithMetrics builds a Handler wired to a fresh, isolated
+// *observability.Metrics (never the shared DefaultMetrics singleton, so
+// assertions in one test can't observe increments from another), backed
+// by a simple successful routing client/store -- enough for
+// simulated-mode payment creation.
+func newTestHandlerWithMetrics(t *testing.T) (*Handler, *observability.Metrics) {
+	t.Helper()
+	metrics := observability.NewMetrics()
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{
+		RouteFound: true, TotalFee: 1.0,
+		Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "Hop#1", Fee: 1.0}},
+	}}
+	store := &fakePaymentStore{
+		createOutcome: payment.Created,
+		createResult: payment.Payment{
+			ID: "metrics-test-id", Status: payment.StatusRouted, ExecutionMode: payment.ExecutionModeSimulated,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: fakeRoute, Store: store, Metrics: metrics}
+	return h, metrics
+}
+
+// newTestHandlerWithMetricsAndProviders builds a testnet-mode-capable
+// Handler wired to a fresh *observability.Metrics, registering each given
+// provider under testnetChainKey (the ethereum->base/WETH route every
+// testnet-mode test in this file already targets).
+func newTestHandlerWithMetricsAndProviders(t *testing.T, providers map[string]quote.Provider) (*Handler, *observability.Metrics) {
+	t.Helper()
+	metrics := observability.NewMetrics()
+	registry := quote.NewRegistry()
+	for _, p := range providers {
+		registry.Register(testnetChainKey, p)
+	}
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{
+		RouteFound: true, TotalFee: 0.0001,
+		Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "relay", Fee: 0.0001}},
+	}}
+	store := &fakePaymentStore{
+		createOutcome: payment.Created,
+		createResult: payment.Payment{
+			ID: "metrics-test-id-testnet", Status: payment.StatusRouted, ExecutionMode: payment.ExecutionModeTestnet,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{
+		Client: fakeRoute, Store: store, Metrics: metrics,
+		BlockchainEnv: "testnet", QuoteRegistry: registry,
+	}
+	return h, metrics
+}
+
+func TestPostPayments_SimulatedMode_IncrementsPaymentsCreatedAndProcessing(t *testing.T) {
+	h, metrics := newTestHandlerWithMetrics(t)
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"usdc","amount":"100"}`))
+	req.Header.Set("Idempotency-Key", t.Name())
+	w := httptest.NewRecorder()
+	h.PostPayments(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body: %s", w.Code, w.Body.String())
+	}
+	if got := testutil.ToFloat64(metrics.PaymentsCreated.WithLabelValues("simulated")); got != 1 {
+		t.Errorf("PaymentsCreated{simulated} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.PaymentsProcessing.WithLabelValues("simulated")); got != 1 {
+		t.Errorf("PaymentsProcessing{simulated} = %v, want 1", got)
+	}
+}
+
+func TestPostPayments_TestnetMode_RecordsQuoteMetricsWithBoundedProviderLabels(t *testing.T) {
+	h, metrics := newTestHandlerWithMetricsAndProviders(t,
+		map[string]quote.Provider{
+			"across": &fakeQuoteProvider{name: "across", quote: quote.Quote{ProviderName: "across", Available: true, FeeBaseUnits: big.NewInt(100), OutputAmountBaseUnits: big.NewInt(900), InputAmountBaseUnits: big.NewInt(1000)}},
+			"relay":  &fakeQuoteProvider{name: "relay", quote: quote.Quote{ProviderName: "relay", Available: true, FeeBaseUnits: big.NewInt(50), OutputAmountBaseUnits: big.NewInt(950), InputAmountBaseUnits: big.NewInt(1000)}},
+		})
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`))
+	req.Header.Set("Idempotency-Key", t.Name())
+	w := httptest.NewRecorder()
+	h.PostPayments(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body: %s", w.Code, w.Body.String())
+	}
+	for _, provider := range []string{"across", "relay"} {
+		if got := testutil.ToFloat64(metrics.QuoteRequests.WithLabelValues(provider)); got != 1 {
+			t.Errorf("QuoteRequests{%s} = %v, want 1", provider, got)
+		}
+	}
+	// relay's fee (50) beats across's (100), so relay must be the one
+	// credited with the win -- proves the metric reflects the ACTUAL
+	// C++-selected winner, not just "whichever provider happened first."
+	if got := testutil.ToFloat64(metrics.RoutingSelectedProvider.WithLabelValues("relay")); got != 1 {
+		t.Errorf("RoutingSelectedProvider{relay} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.RoutingSelectedProvider.WithLabelValues("across")); got != 0 {
+		t.Errorf("RoutingSelectedProvider{across} = %v, want 0 (across did not win)", got)
+	}
+}
+
+func TestPostPayments_QuoteProviderFailure_RecordsFailureMetricWithBoundedReason(t *testing.T) {
+	h, metrics := newTestHandlerWithMetricsAndProviders(t,
+		map[string]quote.Provider{
+			"across": &fakeQuoteProvider{name: "across", err: errors.New("connection refused")},
+		})
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`))
+	req.Header.Set("Idempotency-Key", t.Name())
+	w := httptest.NewRecorder()
+	h.PostPayments(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if got := testutil.ToFloat64(metrics.QuoteFailures.WithLabelValues("across", "http_error")); got != 1 {
+		t.Errorf("QuoteFailures{across,http_error} = %v, want 1", got)
 	}
 }
