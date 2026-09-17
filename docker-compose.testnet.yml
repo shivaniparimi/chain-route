@@ -1,0 +1,22 @@
+# Testnet override -- use with: docker compose -f docker-compose.yml -f docker-compose.testnet.yml up -d
+# Requires a .env file (git-ignored) providing TESTNET_WALLET_PRIVATE_KEY,
+# ETHEREUM_SEPOLIA_RPC_URL, BASE_SEPOLIA_RPC_URL, and optionally
+# ACROSS_API_KEY/ACROSS_INTEGRATOR_ID/RELAY_API_KEY -- never hardcode any
+# of these values in this file or any other committed file.
+services:
+  go-server:
+    environment:
+      BLOCKCHAIN_ENV: testnet
+      ACROSS_API_KEY: ${ACROSS_API_KEY:-}
+      ACROSS_INTEGRATOR_ID: ${ACROSS_INTEGRATOR_ID:-}
+      RELAY_API_KEY: ${RELAY_API_KEY:-}
+
+  go-worker:
+    environment:
+      BLOCKCHAIN_ENV: testnet
+      TESTNET_WALLET_PRIVATE_KEY: ${TESTNET_WALLET_PRIVATE_KEY:?TESTNET_WALLET_PRIVATE_KEY must be set in .env for testnet mode}
+      ETHEREUM_SEPOLIA_RPC_URL: ${ETHEREUM_SEPOLIA_RPC_URL:?ETHEREUM_SEPOLIA_RPC_URL must be set in .env for testnet mode}
+      BASE_SEPOLIA_RPC_URL: ${BASE_SEPOLIA_RPC_URL:?BASE_SEPOLIA_RPC_URL must be set in .env for testnet mode}
+      ACROSS_API_KEY: ${ACROSS_API_KEY:-}
+      ACROSS_INTEGRATOR_ID: ${ACROSS_INTEGRATOR_ID:-}
+      RELAY_API_KEY: ${RELAY_API_KEY:-}
