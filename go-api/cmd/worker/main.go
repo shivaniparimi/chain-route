@@ -4,8 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"chainroute/go-api/internal/bridge/across"
 	"chainroute/go-api/internal/bridge/quote"
@@ -23,32 +25,56 @@ import (
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/kafka"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/postgres"
 	"chainroute/go-api/internal/worker"
 )
 
 func main() {
+	logger := observability.NewLogger("worker")
+
+	shutdownTracing, err := observability.InitTracing(context.Background(), "worker")
+	if err != nil {
+		logger.Warn("tracing initialization failed, continuing without traces", "error", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			logger.Warn("tracing shutdown error", "error", err)
+		}
+	}()
+
+	metrics := observability.NewMetrics()
+
+	metricsAddr := envOrDefault("METRICS_ADDR", ":9091")
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
+	metricsServer := &http.Server{Addr: metricsAddr, Handler: metricsMux}
+
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
+		logger.Error("DATABASE_URL environment variable is required")
+		os.Exit(1)
 	}
 	bootstrapServers := os.Getenv("KAFKA_BOOTSTRAP_SERVERS")
 	if bootstrapServers == "" {
-		log.Fatal("KAFKA_BOOTSTRAP_SERVERS environment variable is required")
+		logger.Error("KAFKA_BOOTSTRAP_SERVERS environment variable is required")
+		os.Exit(1)
 	}
 	brokers := strings.Split(bootstrapServers, ",")
 
 	topic := envOrDefault("KAFKA_TOPIC", "chainroute.payments.routed")
 	consumerGroup := envOrDefault("KAFKA_CONSUMER_GROUP", "chainroute-payment-worker")
-	outboxPollInterval := envDuration("OUTBOX_POLL_INTERVAL_MS", 500*time.Millisecond, time.Millisecond)
-	recoverySweepInterval := envDuration("WORKER_RECOVERY_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second)
-	recoveryStaleness := envDuration("WORKER_RECOVERY_STALENESS_SECONDS", 120*time.Second, time.Second)
+	outboxPollInterval := envDuration("OUTBOX_POLL_INTERVAL_MS", 500*time.Millisecond, time.Millisecond, logger)
+	recoverySweepInterval := envDuration("WORKER_RECOVERY_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second, logger)
+	recoveryStaleness := envDuration("WORKER_RECOVERY_STALENESS_SECONDS", 120*time.Second, time.Second, logger)
 
 	blockchainEnv := os.Getenv("BLOCKCHAIN_ENV")
 
-	reconcileStaleness := envDuration("RECONCILE_STALENESS_SECONDS", 120*time.Second, time.Second)
-	reconcileSweepInterval := envDuration("RECONCILE_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second)
-	nonceDivergenceCheckInterval := envDuration("NONCE_DIVERGENCE_CHECK_INTERVAL_SECONDS", 60*time.Second, time.Second)
+	reconcileStaleness := envDuration("RECONCILE_STALENESS_SECONDS", 120*time.Second, time.Second, logger)
+	reconcileSweepInterval := envDuration("RECONCILE_SWEEP_INTERVAL_SECONDS", 30*time.Second, time.Second, logger)
+	nonceDivergenceCheckInterval := envDuration("NONCE_DIVERGENCE_CHECK_INTERVAL_SECONDS", 60*time.Second, time.Second, logger)
 
 	// Testnet-mode message handling gets its own, larger timeout than the
 	// simulated path's fixed 10-second handleCtx below: real testnet
@@ -57,13 +83,14 @@ func main() {
 	// timeout), so 10 seconds is not comfortably larger than that (review
 	// Finding 4). Simulated-mode handling is unaffected -- it keeps using
 	// handleCtx's fixed 10 seconds unchanged.
-	testnetHandleTimeout := envDuration("TESTNET_HANDLE_TIMEOUT_SECONDS", 30*time.Second, time.Second)
+	testnetHandleTimeout := envDuration("TESTNET_HANDLE_TIMEOUT_SECONDS", 30*time.Second, time.Second, logger)
 
 	// PostgreSQL is blocking-ping-or-die at startup, matching cmd/server:
 	// nothing in this binary can do anything useful without the database.
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		log.Fatalf("failed to open database: %v", err)
+		logger.Error("failed to open database", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(10)
@@ -71,7 +98,8 @@ func main() {
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := db.PingContext(pingCtx); err != nil {
 		pingCancel()
-		log.Fatalf("failed to connect to database: %v", err)
+		logger.Error("failed to connect to database", "error", err)
+		os.Exit(1)
 	}
 	pingCancel()
 
@@ -83,54 +111,61 @@ func main() {
 	if blockchainEnv == "testnet" {
 		testnetWalletKey := os.Getenv("TESTNET_WALLET_PRIVATE_KEY")
 		if testnetWalletKey == "" {
-			log.Fatal("TESTNET_WALLET_PRIVATE_KEY is required when BLOCKCHAIN_ENV=testnet")
+			logger.Error("TESTNET_WALLET_PRIVATE_KEY is required when BLOCKCHAIN_ENV=testnet")
+			os.Exit(1)
 		}
 		sepoliaRPC := os.Getenv("ETHEREUM_SEPOLIA_RPC_URL")
 		baseSepoliaRPC := os.Getenv("BASE_SEPOLIA_RPC_URL")
 		if sepoliaRPC == "" || baseSepoliaRPC == "" {
-			log.Fatal("ETHEREUM_SEPOLIA_RPC_URL and BASE_SEPOLIA_RPC_URL are required when BLOCKCHAIN_ENV=testnet")
+			logger.Error("ETHEREUM_SEPOLIA_RPC_URL and BASE_SEPOLIA_RPC_URL are required when BLOCKCHAIN_ENV=testnet")
+			os.Exit(1)
 		}
 		acrossBaseURL := envOrDefault("ACROSS_TESTNET_API_URL", "https://testnet.across.to/api")
-		maxTestnetAmountWei := envBigInt("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000)) // 0.01 WETH default ceiling
+		maxTestnetAmountWei := envBigInt("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000), logger) // 0.01 WETH default ceiling
 
 		wallet, err := evm.LoadWallet(testnetWalletKey)
 		if err != nil {
-			log.Fatalf("failed to load testnet wallet: %v", err)
+			logger.Error("failed to load testnet wallet", "error", err)
+			os.Exit(1)
 		}
-		log.Printf("testnet execution enabled: wallet address %s", wallet.Address.Hex())
+		logger.Info("testnet execution enabled", "wallet_address", wallet.Address.Hex())
 
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		sepoliaClient, err := evm.Dial(dialCtx, sepoliaRPC, 11155111)
 		dialCancel()
 		if err != nil {
-			log.Fatalf("failed to dial Sepolia RPC: %v", err)
+			logger.Error("failed to dial Sepolia RPC", "error", err)
+			os.Exit(1)
 		}
 		dialCtx2, dialCancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 		_, err = evm.Dial(dialCtx2, baseSepoliaRPC, 84532)
 		dialCancel2()
 		if err != nil {
-			log.Fatalf("failed to dial Base Sepolia RPC: %v", err)
+			logger.Error("failed to dial Base Sepolia RPC", "error", err)
+			os.Exit(1)
 		}
 
 		seedCtx, seedCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		pendingNonce, err := sepoliaClient.PendingNonceAt(seedCtx, wallet.Address)
 		seedCancel()
 		if err != nil {
-			log.Fatalf("failed to query starting nonce: %v", err)
+			logger.Error("failed to query starting nonce", "error", err)
+			os.Exit(1)
 		}
 		seedCtx2, seedCancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 		err = store.SeedWalletNonce(seedCtx2, wallet.Address.Hex(), int64(pendingNonce))
 		seedCancel2()
 		if err != nil {
-			log.Fatalf("failed to seed wallet nonce: %v", err)
+			logger.Error("failed to seed wallet nonce", "error", err)
+			os.Exit(1)
 		}
 
 		acrossClient := across.NewClient(acrossBaseURL)
 		acrossClient.APIKey = os.Getenv("ACROSS_API_KEY")
 		acrossClient.IntegratorID = os.Getenv("ACROSS_INTEGRATOR_ID")
 
-		maxFeeSlippageBps := envInt64("MAX_FEE_SLIPPAGE_BPS", 500) // 5% default
-		routingQuoteTTL := envDuration("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second)
+		maxFeeSlippageBps := envInt64("MAX_FEE_SLIPPAGE_BPS", 500, logger) // 5% default
+		routingQuoteTTL := envDuration("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second, logger)
 
 		spokePoolAddress := common.HexToAddress("0x5ef6C01E11889d86803e0B23e3cB3F9E9d97B662")
 		wethOrigin := common.HexToAddress("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14")
@@ -212,16 +247,32 @@ func main() {
 	wg.Add(goroutines)
 	go func() { defer wg.Done(); publisher.Run(ctx, outboxPollInterval) }()
 	go func() { defer wg.Done(); recovery.Run(ctx, recoverySweepInterval) }()
-	go func() { defer wg.Done(); runConsumeLoop(ctx, consumer, processor) }()
+	go func() { defer wg.Done(); runConsumeLoop(ctx, consumer, processor, logger) }()
 	if reconciler != nil {
 		go func() { defer wg.Done(); reconciler.Run(ctx, reconcileSweepInterval, nonceDivergenceCheckInterval) }()
 	}
 
-	log.Printf("worker started: topic=%s group=%s brokers=%v", topic, consumerGroup, brokers)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Info("metrics endpoint listening", "addr", metricsAddr)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics HTTP server error", "error", err)
+		}
+	}()
+
+	logger.Info("worker started", "topic", topic, "group", consumerGroup, "brokers", brokers)
 	<-ctx.Done()
-	log.Println("shutting down...")
+	logger.Info("shutting down...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("metrics server shutdown error", "error", err)
+	}
+
 	wg.Wait()
-	log.Println("worker shut down")
+	logger.Info("worker shut down")
 }
 
 // runConsumeLoop stops requesting new messages once ctx is done (FetchMessage
@@ -229,14 +280,14 @@ func main() {
 // handled with its own bounded context independent of the shutdown signal,
 // so a message already in progress gets a grace period to finish rather
 // than being aborted mid-cycle.
-func runConsumeLoop(ctx context.Context, consumer *kafka.Consumer, processor *worker.Processor) {
+func runConsumeLoop(ctx context.Context, consumer *kafka.Consumer, processor *worker.Processor, logger *slog.Logger) {
 	for {
 		msg, err := consumer.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("WARNING: fetch message failed, retrying: %v", err)
+			logger.Warn("fetch message failed, retrying", "error", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -247,12 +298,12 @@ func runConsumeLoop(ctx context.Context, consumer *kafka.Consumer, processor *wo
 
 		var evt events.RoutedPayment
 		if err := json.Unmarshal(msg.Value, &evt); err != nil {
-			log.Printf("ERROR: failed to decode event, committing offset to skip it: %v", err)
+			logger.Error("failed to decode event, committing offset to skip it", "error", err)
 			commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := consumer.CommitMessages(commitCtx, msg)
 			commitCancel()
 			if err != nil {
-				log.Printf("ERROR: failed to commit offset for undecodable message at key %q: %v", msg.Key, err)
+				logger.Error("failed to commit offset for undecodable message", "key", string(msg.Key), "error", err)
 			}
 			continue
 		}
@@ -270,7 +321,7 @@ func runConsumeLoop(ctx context.Context, consumer *kafka.Consumer, processor *wo
 		err = processor.HandleRoutedPayment(handleCtx, evt)
 		cancel()
 		if err != nil {
-			log.Printf("ERROR: failed to handle routed payment %s, NOT committing offset: %v", evt.PaymentID, err)
+			logger.Error("failed to handle routed payment, NOT committing offset", "payment_id", evt.PaymentID, "error", err)
 			continue
 		}
 
@@ -278,7 +329,7 @@ func runConsumeLoop(ctx context.Context, consumer *kafka.Consumer, processor *wo
 		err = consumer.CommitMessages(commitCtx, msg)
 		commitCancel()
 		if err != nil {
-			log.Printf("ERROR: failed to commit offset for payment %s: %v", evt.PaymentID, err)
+			logger.Error("failed to commit offset for payment", "payment_id", evt.PaymentID, "error", err)
 		}
 	}
 }
@@ -290,38 +341,41 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-func envDuration(key string, def time.Duration, unit time.Duration) time.Duration {
+func envDuration(key string, def time.Duration, unit time.Duration, logger *slog.Logger) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		log.Fatalf("invalid %s: %v", key, err)
+		logger.Error("invalid environment variable", "key", key, "error", err)
+		os.Exit(1)
 	}
 	return time.Duration(n) * unit
 }
 
-func envBigInt(key string, def *big.Int) *big.Int {
+func envBigInt(key string, def *big.Int, logger *slog.Logger) *big.Int {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
 	}
 	n, ok := new(big.Int).SetString(v, 10)
 	if !ok {
-		log.Fatalf("invalid %s: not a valid base-10 integer", key)
+		logger.Error("invalid environment variable: not a valid base-10 integer", "key", key)
+		os.Exit(1)
 	}
 	return n
 }
 
-func envInt64(key string, def int64) int64 {
+func envInt64(key string, def int64, logger *slog.Logger) int64 {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
-		log.Fatalf("invalid %s: %v", key, err)
+		logger.Error("invalid environment variable", "key", key, "error", err)
+		os.Exit(1)
 	}
 	return n
 }
