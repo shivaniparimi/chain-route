@@ -7,6 +7,8 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.20.5
 	github.com/segmentio/kafka-go v0.4.51
+	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.46.0
@@ -32,6 +34,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/ethereum/c-kzg-4844 v1.0.0 // indirect
 	github.com/ethereum/go-verkle v0.1.1-0.20240829091221-dffa7562dbe9 // indirect
+	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect

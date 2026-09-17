@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"flag"
-	"log"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -15,12 +15,15 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"chainroute/go-api/internal/bridge/across"
 	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/bridge/relay"
 	"chainroute/go-api/internal/grpcclient"
 	"chainroute/go-api/internal/handler"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/postgres"
 )
 
@@ -29,19 +32,36 @@ func main() {
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:50051", "gRPC routing service address")
 	flag.Parse()
 
+	logger := observability.NewLogger("go-api")
+
+	shutdownTracing, err := observability.InitTracing(context.Background(), "go-api")
+	if err != nil {
+		logger.Warn("tracing initialization failed, continuing without traces", "error", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			logger.Warn("tracing shutdown error", "error", err)
+		}
+	}()
+
+	metrics := observability.NewMetrics()
+
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
+		logger.Error("DATABASE_URL environment variable is required")
+		os.Exit(1)
 	}
 
 	blockchainEnv := os.Getenv("BLOCKCHAIN_ENV")
-	maxTestnetAmountWei := envBigIntServer("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000))
+	maxTestnetAmountWei := envBigIntServer("MAX_TESTNET_AMOUNT_WEI", big.NewInt(10_000_000_000_000_000), logger)
 
 	var registry *quote.Registry
 	if blockchainEnv == "testnet" {
 		acrossBaseURL := envOrDefaultServer("ACROSS_TESTNET_API_URL", "https://testnet.across.to/api")
 		relayBaseURL := envOrDefaultServer("RELAY_TESTNET_API_URL", "https://api.testnets.relay.link")
-		routingQuoteTTL := envDurationServer("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second)
+		routingQuoteTTL := envDurationServer("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second, logger)
 		acrossClient := across.NewClient(acrossBaseURL)
 		acrossClient.APIKey = os.Getenv("ACROSS_API_KEY")
 		acrossClient.IntegratorID = os.Getenv("ACROSS_INTEGRATOR_ID")
@@ -62,13 +82,15 @@ func main() {
 
 	client, err := grpcclient.Dial(*grpcAddr)
 	if err != nil {
-		log.Fatalf("failed to dial routing service at %s: %v", *grpcAddr, err)
+		logger.Error("failed to dial routing service", "grpc_addr", *grpcAddr, "error", err)
+		os.Exit(1)
 	}
 	defer client.Close()
 
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
-		log.Fatalf("failed to open database: %v", err)
+		logger.Error("failed to open database", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(10)
@@ -76,49 +98,58 @@ func main() {
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := db.PingContext(pingCtx); err != nil {
 		pingCancel()
-		log.Fatalf("failed to connect to database: %v", err)
+		logger.Error("failed to connect to database", "error", err)
+		os.Exit(1)
 	}
 	pingCancel()
 
 	store := postgres.New(db)
 
-	h := &handler.Handler{Client: client, Store: store, BlockchainEnv: blockchainEnv, MaxTestnetAmountWei: maxTestnetAmountWei, QuoteRegistry: registry}
+	h := &handler.Handler{
+		Client: client, Store: store, BlockchainEnv: blockchainEnv,
+		MaxTestnetAmountWei: maxTestnetAmountWei, QuoteRegistry: registry,
+		Metrics: metrics, Logger: logger,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /routes", h.PostRoutes)
 	mux.HandleFunc("POST /payments", h.PostPayments)
 	mux.HandleFunc("GET /payments/{id}", h.GetPayment)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
-	server := &http.Server{Addr: *httpAddr, Handler: mux}
+	instrumentedMux := otelhttp.NewHandler(mux, "http.server")
+	server := &http.Server{Addr: *httpAddr, Handler: instrumentedMux}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		log.Printf("go-api listening on %s, routing service at %s, database connected", *httpAddr, *grpcAddr)
+		logger.Info("go-api listening", "http_addr", *httpAddr, "grpc_addr", *grpcAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			logger.Error("HTTP server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("shutting down...")
+	logger.Info("shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown error: %v", err)
+		logger.Warn("graceful shutdown error", "error", err)
 	}
-	log.Println("go-api shut down")
+	logger.Info("go-api shut down")
 }
 
-func envBigIntServer(key string, def *big.Int) *big.Int {
+func envBigIntServer(key string, def *big.Int, logger *slog.Logger) *big.Int {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
 	}
 	n, ok := new(big.Int).SetString(v, 10)
 	if !ok {
-		log.Fatalf("invalid %s: not a valid base-10 integer", key)
+		logger.Error("invalid environment variable: not a valid base-10 integer", "key", key)
+		os.Exit(1)
 	}
 	return n
 }
@@ -130,14 +161,15 @@ func envOrDefaultServer(key, def string) string {
 	return def
 }
 
-func envDurationServer(key string, def time.Duration, unit time.Duration) time.Duration {
+func envDurationServer(key string, def time.Duration, unit time.Duration, logger *slog.Logger) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		log.Fatalf("invalid %s: %v", key, err)
+		logger.Error("invalid environment variable", "key", key, "error", err)
+		os.Exit(1)
 	}
 	return time.Duration(n) * unit
 }

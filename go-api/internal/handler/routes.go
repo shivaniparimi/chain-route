@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"chainroute/go-api/internal/bridge/quote"
 	routingv1 "chainroute/go-api/internal/gen/chainroute/v1"
+	"chainroute/go-api/internal/observability"
 )
 
 type RoutingClient interface {
@@ -25,6 +27,8 @@ type Handler struct {
 	BlockchainEnv       string          // "testnet" enables execution_mode="testnet" requests; anything else (including "") rejects them
 	MaxTestnetAmountWei *big.Int        // nil means no ceiling is enforced (only safe when BlockchainEnv != "testnet")
 	QuoteRegistry       *quote.Registry // nil when BlockchainEnv != "testnet"; never consulted otherwise
+	Metrics             *observability.Metrics
+	Logger              *slog.Logger
 }
 
 type findRouteRequest struct {

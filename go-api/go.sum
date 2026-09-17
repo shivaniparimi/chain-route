@@ -55,6 +55,8 @@ github.com/ethereum/go-ethereum v1.14.11 h1:8nFDCUUE67rPc6AKxFj7JKaOa2W/W1Rse3oS
 github.com/ethereum/go-ethereum v1.14.11/go.mod h1:+l/fr42Mma+xBnhefL/+z11/hcmJ2egl+ScIVPjhc7E=
 github.com/ethereum/go-verkle v0.1.1-0.20240829091221-dffa7562dbe9 h1:8NfxH2iXvJ60YRB8ChToFTUzl8awsc3cJ8CbLjGIl/A=
 github.com/ethereum/go-verkle v0.1.1-0.20240829091221-dffa7562dbe9/go.mod h1:M3b90YRnzqKyyzBEWJGqj8Qff4IDeXnzFw0P9bFw3uk=
+github.com/felixge/httpsnoop v1.1.0 h1:3YtUj32ZZkqZtt3sZZsClsymw/QDuVfpNhoA31zeORc=
+github.com/felixge/httpsnoop v1.1.0/go.mod h1:Zqxgdd+1Rkcz8euOqdr7lqgCRJztwr5hp9vDSi5UZCE=
 github.com/fsnotify/fsnotify v1.6.0 h1:n+5WquG0fcWoWp6xPWfHdbskMCQaFnG6PfBrh1Ky4HY=
 github.com/fsnotify/fsnotify v1.6.0/go.mod h1:sl3t1tCWJFWoRz9R8WJCbQihKKwmorjAbSClcnxKAGw=
 github.com/gballet/go-libpcsclite v0.0.0-20190607065134-2772fd86a8ff h1:tY80oXqGNY4FhTFhk+o9oFHGINQ/+vhlm8HFzi6znCI=
@@ -191,6 +193,10 @@ github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 h1:bAn7/zixMGCfxrRT
 github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673/go.mod h1:N3UwUGtsrSj3ccvlPHLoLsHnpR27oXr4ZE984MbSER8=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
 go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
+go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 h1:B2h3uqicet1CT2N5TOFhS+Gq++9i0/CLmaxvhmhtP5s=
+go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0/go.mod h1:dylvB+ZiiwMvsDij9O84Uy7SijLgHMX4mbkncds+4Sw=
+go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 h1:3g7B90UzBltIDKq1/5mrTGxTnOFDV0ICOhLoxiZ8jlg=
+go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0/go.mod h1:Ef8SuTh59BT7+ofpDxN9z+yOlc4t2GjLmKDgYNJL/NU=
 go.opentelemetry.io/otel v1.46.0 h1:FHt5/CDyVxi/8IM1CH7VE/rRgq3kLHa2mSTVMO8AWyc=
 go.opentelemetry.io/otel v1.46.0/go.mod h1:Gj3SEScelsNC45tp4nSxRYlS+f5iez7W8XPMCt905kE=
 go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0 h1:OFnwLJr+pF3iHrlGSzbxyuo6/6HyBlnlN1CWEJmBVcw=
