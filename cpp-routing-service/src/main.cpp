@@ -78,6 +78,16 @@ void RunMetricsListener(const chainroute::RouteMetrics& metrics, int port, std::
         if (clientFd < 0) {
             continue;  // transient accept error (e.g. connection reset before accept) -- loop and re-check shouldStop
         }
+        // Bound recv()/send() on this client socket: a connected-but-idle (or
+        // malicious) client that never sends anything would otherwise wedge
+        // this single-threaded loop in recv() forever, which also blocks
+        // metricsThread.join() at shutdown and makes SIGTERM ineffective
+        // (only SIGKILL would recover). This timeout is per-client-socket,
+        // not the listening socket, so it doesn't affect the poll()+accept()
+        // wait above.
+        struct timeval tv{2, 0};  // 2 second timeout
+        setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         char buf[512];
         recv(clientFd, buf, sizeof(buf), 0);  // discard the request line -- this endpoint serves exactly one fixed body
 
