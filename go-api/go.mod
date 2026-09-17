@@ -6,7 +6,8 @@ require (
 	github.com/ethereum/go-ethereum v1.14.11
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/segmentio/kafka-go v0.4.51
-	google.golang.org/grpc v1.83.2
+	go.opentelemetry.io/otel/sdk v1.32.0
+	google.golang.org/grpc v1.71.0-dev
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -23,7 +24,10 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/ethereum/c-kzg-4844 v1.0.0 // indirect
 	github.com/ethereum/go-verkle v0.1.1-0.20240829091221-dffa7562dbe9 // indirect
+	github.com/go-logr/logr v1.4.2 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/holiman/uint256 v1.3.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
@@ -36,6 +40,9 @@ require (
 	github.com/supranational/blst v0.3.13 // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
+	go.opentelemetry.io/otel v1.32.0 // indirect
+	go.opentelemetry.io/otel/metric v1.32.0 // indirect
+	go.opentelemetry.io/otel/trace v1.32.0 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
 	golang.org/x/net v0.58.0 // indirect
