@@ -10,8 +10,10 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"chainroute/go-api/internal/bridge/quote"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -420,6 +422,151 @@ func TestCheckAndUpdateOutcome_TransientStatusCheckerErrorIsNonTerminal(t *testi
 	}
 	if len(store.completeCalls) != 0 {
 		t.Fatalf("expected no payment completion, got %v", store.completeCalls)
+	}
+}
+
+// TestCheckAndUpdateOutcome_RelaySuccessCompletesPayment_RecordsMetricsAndDuration
+// is Task 10's metrics regression test (mirroring the sibling functional
+// test above, TestCheckAndUpdateOutcome_RelaySuccessCompletesPayment): a
+// Relay StateFilled outcome must record a Reconciliations{relay}
+// observation, an ExecutionsCompleted{relay} observation, a
+// ReconciliationDuration sample, and -- since markTerminal now threads the
+// real created_at CompleteSubmittedPayment returns (Task 7) through to
+// PaymentDuration -- a PaymentDuration sample too.
+func TestCheckAndUpdateOutcome_RelaySuccessCompletesPayment_RecordsMetricsAndDuration(t *testing.T) {
+	hash := "0x7070707070707070707070707070707070707070707070707070707070707070"
+	store := &fakeReconcilerStore{}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{
+		common.HexToHash(hash): {Status: 1},
+	}}
+	relayChecker := &fakeStatusChecker{name: "relay", checkResult: quote.StatusResult{State: quote.StateFilled, RawStatus: "success"}}
+	metrics := observability.NewMetrics()
+	r := &Reconciler{
+		Store: store, OriginClient: ethClient,
+		StatusCheckers: map[string]quote.StatusChecker{"relay": relayChecker},
+		OriginChainID:  11155111, Staleness: time.Hour,
+		Metrics: metrics,
+	}
+
+	exec := payment.Execution{ID: "exec-relay-metrics", PaymentID: "pay-relay-metrics", SignedTxHash: &hash, BridgeProvider: "relay"}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.Reconciliations.WithLabelValues("relay")); got != 1 {
+		t.Errorf("Reconciliations{relay} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ExecutionsCompleted.WithLabelValues("relay")); got != 1 {
+		t.Errorf("ExecutionsCompleted{relay} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.PaymentsCompleted.WithLabelValues(string(payment.ExecutionModeTestnet))); got != 1 {
+		t.Errorf("PaymentsCompleted{testnet} = %v, want 1", got)
+	}
+	if got := testutil.CollectAndCount(metrics.ReconciliationDuration); got == 0 {
+		t.Error("expected a ReconciliationDuration observation")
+	}
+	if got := testutil.CollectAndCount(metrics.PaymentDuration); got == 0 {
+		t.Error("expected a PaymentDuration observation (created_at now flows through markTerminal)")
+	}
+}
+
+// TestCheckAndUpdateOutcome_TransientPollFailure_DoesNotRecordReconciliations
+// asserts that a not-yet-mined/transient receipt lookup -- which never
+// reaches the StatusChecker at all -- must not count as a reconciliation
+// attempt (Reconciliations is meant to measure real, completed status
+// checks, not skipped ones).
+func TestCheckAndUpdateOutcome_TransientPollFailure_DoesNotRecordReconciliations(t *testing.T) {
+	hash := "0x8080808080808080808080808080808080808080808080808080808080808080"
+	store := &fakeReconcilerStore{}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{}} // not yet mined
+	metrics := observability.NewMetrics()
+	r := &Reconciler{Store: store, OriginClient: ethClient, OriginChainID: 11155111, Staleness: time.Hour, Metrics: metrics}
+
+	exec := payment.Execution{ID: "exec-transient-metrics", PaymentID: "pay-transient-metrics", SignedTxHash: &hash, BridgeProvider: "relay"}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.Reconciliations.WithLabelValues("relay")); got != 0 {
+		t.Errorf("Reconciliations{relay} = %v, want 0 for a transient/not-yet-mined poll", got)
+	}
+}
+
+// TestCheckAndUpdateOutcome_StillPendingRecordsReconciliationButNotCompletion
+// asserts the brief's deliberate distinction: a StatusChecker call that
+// succeeds but reports quote.StatePending IS counted as a reconciliation
+// (it got a real, definitive non-terminal answer), but must never record
+// ExecutionsCompleted/ExecutionsFailed/PaymentsCompleted/PaymentsFailed,
+// since the payment has not reached a terminal outcome.
+func TestCheckAndUpdateOutcome_StillPendingRecordsReconciliationButNotCompletion(t *testing.T) {
+	hash := "0x9090909090909090909090909090909090909090909090909090909090909090"
+	store := &fakeReconcilerStore{}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{
+		common.HexToHash(hash): {Status: 1},
+	}}
+	relayChecker := &fakeStatusChecker{name: "relay", checkResult: quote.StatusResult{State: quote.StatePending, RawStatus: "pending"}}
+	metrics := observability.NewMetrics()
+	r := &Reconciler{
+		Store: store, OriginClient: ethClient,
+		StatusCheckers: map[string]quote.StatusChecker{"relay": relayChecker},
+		OriginChainID:  11155111, Staleness: time.Hour,
+		Metrics: metrics,
+	}
+
+	exec := payment.Execution{ID: "exec-pending-metrics", PaymentID: "pay-pending-metrics", SignedTxHash: &hash, BridgeProvider: "relay"}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.Reconciliations.WithLabelValues("relay")); got != 1 {
+		t.Errorf("Reconciliations{relay} = %v, want 1 for a real but still-pending status check", got)
+	}
+	if got := testutil.ToFloat64(metrics.ExecutionsCompleted.WithLabelValues("relay")); got != 0 {
+		t.Errorf("ExecutionsCompleted{relay} = %v, want 0 for a non-terminal outcome", got)
+	}
+	if got := testutil.ToFloat64(metrics.PaymentsCompleted.WithLabelValues(string(payment.ExecutionModeTestnet))); got != 0 {
+		t.Errorf("PaymentsCompleted{testnet} = %v, want 0 for a non-terminal outcome", got)
+	}
+	if len(store.completeCalls) != 0 {
+		t.Fatalf("expected no payment completion for a still-pending outcome, got %v", store.completeCalls)
+	}
+}
+
+// TestMarkTerminal_CompleteSubmittedPaymentGuardFalse_DoesNotRecordCompletionMetrics
+// is this task's double-counting regression test, directly analogous to
+// Task 9's fix: when CompleteSubmittedPayment's own guard affects zero
+// rows (completed=false -- e.g. a race where the payment was already
+// completed by a previous sweep), markTerminal must NOT increment
+// ExecutionsCompleted/PaymentsCompleted/PaymentDuration/PaymentsProcessing,
+// since no real, new completion happened.
+func TestMarkTerminal_CompleteSubmittedPaymentGuardFalse_DoesNotRecordCompletionMetrics(t *testing.T) {
+	hash := "0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+	store := &fakeReconcilerStore{completeSubmittedFails: true}
+	ethClient := &fakeReconcilerEthClient{receipts: map[common.Hash]*types.Receipt{
+		common.HexToHash(hash): {Status: 1},
+	}}
+	relayChecker := &fakeStatusChecker{name: "relay", checkResult: quote.StatusResult{State: quote.StateFilled, RawStatus: "success"}}
+	metrics := observability.NewMetrics()
+	r := &Reconciler{
+		Store: store, OriginClient: ethClient,
+		StatusCheckers: map[string]quote.StatusChecker{"relay": relayChecker},
+		OriginChainID:  11155111, Staleness: time.Hour,
+		Metrics: metrics,
+	}
+
+	exec := payment.Execution{ID: "exec-guard-false", PaymentID: "pay-guard-false", SignedTxHash: &hash, BridgeProvider: "relay"}
+	if err := r.checkAndUpdateOutcome(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Reconciliations still fires -- a real status check happened.
+	if got := testutil.ToFloat64(metrics.Reconciliations.WithLabelValues("relay")); got != 1 {
+		t.Errorf("Reconciliations{relay} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ExecutionsCompleted.WithLabelValues("relay")); got != 0 {
+		t.Errorf("ExecutionsCompleted{relay} = %v, want 0 when CompleteSubmittedPayment's guard affected no rows", got)
+	}
+	if got := testutil.ToFloat64(metrics.PaymentsCompleted.WithLabelValues(string(payment.ExecutionModeTestnet))); got != 0 {
+		t.Errorf("PaymentsCompleted{testnet} = %v, want 0 when CompleteSubmittedPayment's guard affected no rows", got)
+	}
+	if got := testutil.CollectAndCount(metrics.PaymentDuration); got != 0 {
+		t.Errorf("PaymentDuration observations = %v, want 0 when CompleteSubmittedPayment's guard affected no rows", got)
 	}
 }
 

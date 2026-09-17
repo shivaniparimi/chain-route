@@ -4,13 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"go.opentelemetry.io/otel/attribute"
 
 	"chainroute/go-api/internal/bridge/quote"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -47,6 +49,30 @@ type Reconciler struct {
 	WalletAddress  common.Address
 	OriginChainID  int64
 	Staleness      time.Duration
+	Metrics        *observability.Metrics
+	Logger         *slog.Logger
+}
+
+// metrics returns r.Metrics, or a shared safe-to-record-into default when
+// it is nil -- e.g. for an existing test's struct literal that predates
+// this phase and never sets the field. Every instrumentation call in this
+// file must go through this accessor, never through r.Metrics directly,
+// so that a nil Metrics field can never nil-pointer-panic.
+func (r *Reconciler) metrics() *observability.Metrics {
+	if r.Metrics != nil {
+		return r.Metrics
+	}
+	return observability.DefaultMetrics()
+}
+
+// logger mirrors metrics: it returns r.Logger, or a shared default when
+// nil. Every log call in this file must go through this accessor, never
+// through r.Logger directly.
+func (r *Reconciler) logger() *slog.Logger {
+	if r.Logger != nil {
+		return r.Logger
+	}
+	return observability.DefaultLogger()
 }
 
 // SweepOnce runs one full reconciliation pass MINUS the divergence check,
@@ -70,13 +96,15 @@ func (r *Reconciler) SweepOnce(ctx context.Context) {
 func (r *Reconciler) recoverStaleProcessingWithoutExecution(ctx context.Context) {
 	ids, err := r.Store.StaleTestnetProcessingWithoutExecutionIDs(ctx, r.Staleness)
 	if err != nil {
-		log.Printf("ERROR: reconciler: query stale testnet processing without execution: %v", err)
+		r.logger().ErrorContext(ctx, "reconciler: query stale testnet processing without execution", "error", err)
 		return
 	}
 	for _, id := range ids {
 		if err := r.Executor.ExecuteTestnetPayment(ctx, id); err != nil {
-			log.Printf("ERROR: reconciler: recover stale processing payment %s: %v", id, err)
+			r.logger().ErrorContext(ctx, "reconciler: recover stale processing payment", "payment_id", id, "error", err)
+			continue
 		}
+		r.metrics().StaleRecoveries.WithLabelValues("reconciler").Inc()
 	}
 }
 
@@ -90,7 +118,7 @@ func (r *Reconciler) recoverStaleProcessingWithoutExecution(ctx context.Context)
 func (r *Reconciler) driveStaleNotYetBroadcast(ctx context.Context) {
 	candidates, err := r.Store.ReconciliationCandidates(ctx, r.Staleness)
 	if err != nil {
-		log.Printf("ERROR: reconciler: query reconciliation candidates: %v", err)
+		r.logger().ErrorContext(ctx, "reconciler: query reconciliation candidates", "error", err)
 		return
 	}
 	for _, c := range candidates {
@@ -99,14 +127,14 @@ func (r *Reconciler) driveStaleNotYetBroadcast(ctx context.Context) {
 		}
 		fresh, found, err := r.Store.GetExecutionByPaymentID(ctx, c.PaymentID)
 		if err != nil || !found {
-			log.Printf("ERROR: reconciler: re-check execution for payment %s before driving forward: %v", c.PaymentID, err)
+			r.logger().ErrorContext(ctx, "reconciler: re-check execution before driving forward", "payment_id", c.PaymentID, "error", err)
 			continue
 		}
 		if fresh.BroadcastAt != nil {
 			continue // the original executor finished in the meantime
 		}
 		if err := r.Executor.DriveExecutionForward(ctx, fresh); err != nil {
-			log.Printf("ERROR: reconciler: drive execution forward for payment %s: %v", c.PaymentID, err)
+			r.logger().ErrorContext(ctx, "reconciler: drive execution forward", "payment_id", c.PaymentID, "error", err)
 		}
 	}
 }
@@ -120,7 +148,7 @@ func (r *Reconciler) driveStaleNotYetBroadcast(ctx context.Context) {
 func (r *Reconciler) checkBroadcastOutcomes(ctx context.Context) {
 	candidates, err := r.Store.ReconciliationCandidates(ctx, r.Staleness)
 	if err != nil {
-		log.Printf("ERROR: reconciler: query reconciliation candidates: %v", err)
+		r.logger().ErrorContext(ctx, "reconciler: query reconciliation candidates", "error", err)
 		return
 	}
 
@@ -137,12 +165,18 @@ func (r *Reconciler) checkBroadcastOutcomes(ctx context.Context) {
 
 	for _, exec := range lowestByWallet {
 		if err := r.checkAndUpdateOutcome(ctx, exec); err != nil {
-			log.Printf("ERROR: reconciler: check outcome for execution %s (payment %s): %v", exec.ID, exec.PaymentID, err)
+			r.logger().ErrorContext(ctx, "reconciler: check outcome", "execution_id", exec.ID, "payment_id", exec.PaymentID, "error", err)
 		}
 	}
 }
 
 func (r *Reconciler) checkAndUpdateOutcome(ctx context.Context, exec payment.Execution) error {
+	ctx, span := observability.Tracer("reconcile").Start(ctx, "reconcile.check")
+	defer span.End()
+	providerLabel := observability.SanitizeProviderLabel(exec.BridgeProvider)
+	span.SetAttributes(attribute.String("payment.provider", providerLabel), attribute.String("payment.id", exec.PaymentID))
+	start := time.Now()
+
 	if exec.SignedTxHash == nil {
 		return fmt.Errorf("execution %s is marked broadcast but has no signed_tx_hash", exec.ID)
 	}
@@ -184,6 +218,15 @@ func (r *Reconciler) checkAndUpdateOutcome(ctx context.Context, exec payment.Exe
 	if err != nil {
 		return nil // transient API error -- not a failure signal (design spec §13), retry next sweep
 	}
+	// Counted here, not on the transient-error early return above: a
+	// reconciliation is "we got a real, definitive answer from the status
+	// checker" (chainroute_reconciliations_total's own Help text: "Total
+	// reconciliation status checks per provider"), whether that answer
+	// turns out to be terminal (StateFilled/Refunded/Reverted/FillFailed)
+	// or still StatePending -- distinct from ExecutionsCompleted/
+	// ExecutionsFailed below, which only fire on the terminal branches.
+	r.metrics().Reconciliations.WithLabelValues(providerLabel).Inc()
+	r.metrics().ReconciliationDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
 
 	switch result.State {
 	case quote.StateFilled:
@@ -228,12 +271,13 @@ func externalStateToStatus(s quote.ExternalState) payment.ExternalStatus {
 }
 
 func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, result quote.StatusResult, terminal payment.Status) error {
+	providerLabel := observability.SanitizeProviderLabel(exec.BridgeProvider)
 	external := externalStateToStatus(result.State)
 	confirmedAt := &sql.NullTime{Time: time.Now().UTC(), Valid: true}
 	if err := r.Store.UpdateExecutionExternalStatus(ctx, exec.ID, external, result.RawStatus, confirmedAt); err != nil {
 		return fmt.Errorf("record %s: %w", external, err)
 	}
-	completed, _, err := r.Store.CompleteSubmittedPayment(ctx, exec.PaymentID, terminal)
+	completed, createdAt, err := r.Store.CompleteSubmittedPayment(ctx, exec.PaymentID, terminal)
 	if err != nil {
 		return fmt.Errorf("complete payment as %s: %w", terminal, err)
 	}
@@ -248,7 +292,33 @@ func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, r
 		// rather than error: the terminal observation itself was already
 		// recorded above, and erroring here would just cause the sweep to
 		// retry an update that will never succeed.
-		log.Printf("ERROR: reconciler: CompleteSubmittedPayment(payment=%s, execution=%s, terminal=%s) affected no rows despite a definitive terminal observation (%s) -- the payment was not in SUBMITTED status; this indicates an unexpected state transition and needs investigation", exec.PaymentID, exec.ID, terminal, external)
+		//
+		// Deliberately return here BEFORE any of the completion metrics
+		// below: completed=false means no real, new payment transition
+		// happened (guard-suppressed no-op), so recording
+		// ExecutionsCompleted/ExecutionsFailed/PaymentDuration/
+		// PaymentsProcessing/PaymentsCompleted/PaymentsFailed here would
+		// double-count against whatever actor already completed this
+		// payment -- the same class of bug Task 9's review caught and
+		// fixed for Executor's Broadcasts metric (gate on the operation's
+		// real effect, not merely a nil error).
+		r.logger().ErrorContext(ctx, "reconciler: CompleteSubmittedPayment affected no rows despite a definitive terminal observation -- the payment was not in SUBMITTED status; this indicates an unexpected state transition and needs investigation",
+			"payment_id", exec.PaymentID, "execution_id", exec.ID, "terminal", string(terminal), "external_status", string(external))
+		return nil
+	}
+	outcome := "completed"
+	if terminal == payment.StatusFailed {
+		outcome = "failed"
+		r.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "reconciled_failed").Inc()
+	} else {
+		r.metrics().ExecutionsCompleted.WithLabelValues(providerLabel).Inc()
+	}
+	r.metrics().PaymentDuration.WithLabelValues(string(payment.ExecutionModeTestnet), outcome).Observe(time.Since(createdAt).Seconds())
+	r.metrics().PaymentsProcessing.WithLabelValues(string(payment.ExecutionModeTestnet)).Dec()
+	if terminal == payment.StatusCompleted {
+		r.metrics().PaymentsCompleted.WithLabelValues(string(payment.ExecutionModeTestnet)).Inc()
+	} else {
+		r.metrics().PaymentsFailed.WithLabelValues(string(payment.ExecutionModeTestnet), "reconciliation").Inc()
 	}
 	return nil
 }
@@ -261,19 +331,20 @@ func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, r
 func (r *Reconciler) checkNonceDivergence(ctx context.Context) {
 	chainPending, err := r.OriginClient.PendingNonceAt(ctx, r.WalletAddress)
 	if err != nil {
-		log.Printf("WARNING: reconciler: divergence check: query chain pending nonce: %v", err)
+		r.logger().WarnContext(ctx, "reconciler: divergence check: query chain pending nonce", "error", err)
 		return
 	}
 	lowest, found, err := r.Store.LowestUnconfirmedNonce(ctx, r.WalletAddress.Hex())
 	if err != nil {
-		log.Printf("WARNING: reconciler: divergence check: query lowest unconfirmed nonce: %v", err)
+		r.logger().WarnContext(ctx, "reconciler: divergence check: query lowest unconfirmed nonce", "error", err)
 		return
 	}
 	if !found {
 		return
 	}
 	if int64(chainPending) < lowest {
-		log.Printf("WARNING: reconciler: nonce divergence for wallet %s: chain pending nonce %d is behind ChainRoute's lowest unconfirmed nonce %d -- diagnostic only, wallet_nonces is never adjusted automatically", r.WalletAddress.Hex(), chainPending, lowest)
+		r.logger().WarnContext(ctx, "reconciler: nonce divergence -- diagnostic only, wallet_nonces is never adjusted automatically",
+			"wallet_address", r.WalletAddress.Hex(), "chain_pending_nonce", chainPending, "lowest_unconfirmed_nonce", lowest)
 	}
 }
 

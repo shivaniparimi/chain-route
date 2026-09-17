@@ -204,6 +204,7 @@ func main() {
 		reconciler = &worker.Reconciler{
 			Store: store, Executor: executor, OriginClient: sepoliaClient, StatusCheckers: statusCheckers,
 			WalletAddress: wallet.Address, OriginChainID: 11155111, Staleness: reconcileStaleness,
+			Metrics: metrics, Logger: logger,
 		}
 	}
 
