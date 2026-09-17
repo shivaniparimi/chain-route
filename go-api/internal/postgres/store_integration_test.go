@@ -540,12 +540,15 @@ func TestCompletePayment_TransitionsProcessingToTerminal(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	completed, err := s.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
+	completed, createdAt, err := s.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if !completed {
 		t.Fatal("expected completion to succeed on a PROCESSING payment")
+	}
+	if createdAt.IsZero() {
+		t.Fatal("expected CompletePayment to return a non-zero created_at")
 	}
 
 	fetched, found, err := s.GetPayment(context.Background(), created.ID)
@@ -579,12 +582,15 @@ func TestCompletePayment_NoOpIfNotProcessing(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	// Payment is ROUTED, not PROCESSING -- completion must be a no-op.
-	completed, err := s.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
+	completed, createdAt, err := s.CompletePayment(context.Background(), created.ID, payment.StatusCompleted)
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if completed {
 		t.Fatal("expected completion on a ROUTED (not PROCESSING) payment to be a no-op")
+	}
+	if !createdAt.IsZero() {
+		t.Fatalf("expected zero-value created_at on a no-op completion, got %v", createdAt)
 	}
 }
 
@@ -623,7 +629,7 @@ func TestCompletePayment_ConcurrentCompletionsSucceedExactlyOnce(t *testing.T) {
 			if i%2 == 0 {
 				terminal = payment.StatusFailed
 			}
-			completed, err := s.CompletePayment(context.Background(), created.ID, terminal)
+			completed, _, err := s.CompletePayment(context.Background(), created.ID, terminal)
 			if err != nil {
 				t.Errorf("goroutine %d: %v", i, err)
 				return

@@ -12,7 +12,7 @@ import (
 // RecoveryStore is the subset of *postgres.Store the recovery sweep needs.
 type RecoveryStore interface {
 	StalePaymentIDs(ctx context.Context, staleness time.Duration) ([]string, error)
-	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
+	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error)
 }
 
 // Recovery periodically re-completes payments stuck in PROCESSING past a
@@ -43,7 +43,7 @@ func (r *Recovery) SweepOnce(ctx context.Context) (int, error) {
 		if !result.Success {
 			terminal = payment.StatusFailed
 		}
-		didComplete, err := r.Store.CompletePayment(ctx, id, terminal)
+		didComplete, _, err := r.Store.CompletePayment(ctx, id, terminal)
 		if err != nil {
 			log.Printf("ERROR: recovery sweep failed to complete payment %s: %v", id, err)
 			continue

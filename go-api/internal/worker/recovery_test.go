@@ -21,13 +21,13 @@ func (f *fakeRecoveryStore) StalePaymentIDs(ctx context.Context, staleness time.
 	return f.staleIDs, f.staleErr
 }
 
-func (f *fakeRecoveryStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error) {
+func (f *fakeRecoveryStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error) {
 	if f.completeTerminals == nil {
 		f.completeTerminals = map[string]payment.Status{}
 	}
 	f.completeTerminals[paymentID] = terminal
 	f.completeCalls = append(f.completeCalls, paymentID)
-	return f.completeResult, f.completeErr
+	return f.completeResult, time.Now(), f.completeErr
 }
 
 func TestSweepOnce_CompletesStalePayments(t *testing.T) {

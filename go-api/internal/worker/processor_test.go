@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"chainroute/go-api/internal/events"
 	"chainroute/go-api/internal/execution"
@@ -30,10 +31,10 @@ func (f *fakeStore) ClaimPayment(ctx context.Context, paymentID string) (bool, p
 	return f.claimResult, mode, f.claimErr
 }
 
-func (f *fakeStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error) {
+func (f *fakeStore) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error) {
 	f.completeCalls++
 	f.lastTerminal = terminal
-	return f.completeResult, f.completeErr
+	return f.completeResult, time.Now(), f.completeErr
 }
 
 // findIDWithOutcome brute-forces a payment ID string for which the pure,

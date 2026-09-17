@@ -49,12 +49,12 @@ func (f *fakeReconcilerStore) UpdateExecutionExternalStatus(ctx context.Context,
 	f.updateRawStatusCalls = append(f.updateRawStatusCalls, rawStatus)
 	return nil
 }
-func (f *fakeReconcilerStore) CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error) {
+func (f *fakeReconcilerStore) CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error) {
 	f.completeCalls = append(f.completeCalls, terminal)
 	if f.completeSubmittedFails {
-		return false, nil
+		return false, time.Time{}, nil
 	}
-	return true, nil
+	return true, time.Now(), nil
 }
 func (f *fakeReconcilerStore) LowestUnconfirmedNonce(ctx context.Context, walletAddress string) (int64, bool, error) {
 	return f.lowestNonce, f.lowestNonceFound, nil

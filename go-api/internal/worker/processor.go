@@ -20,7 +20,7 @@ const defaultTestnetHandleTimeout = 30 * time.Second
 // PaymentStore is the subset of *postgres.Store the processor needs.
 type PaymentStore interface {
 	ClaimPayment(ctx context.Context, paymentID string) (bool, payment.ExecutionMode, error)
-	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
+	CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, time.Time, error)
 }
 
 // TestnetExecutor is the subset of *Executor Processor needs -- kept as an
@@ -96,7 +96,7 @@ func (p *Processor) HandleRoutedPayment(ctx context.Context, evt events.RoutedPa
 		terminal = payment.StatusFailed
 	}
 
-	if _, err := p.Store.CompletePayment(ctx, evt.PaymentID, terminal); err != nil {
+	if _, _, err := p.Store.CompletePayment(ctx, evt.PaymentID, terminal); err != nil {
 		return fmt.Errorf("complete payment %s: %w", evt.PaymentID, err)
 	}
 	return nil

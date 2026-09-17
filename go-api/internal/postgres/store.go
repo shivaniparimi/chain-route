@@ -10,8 +10,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"chainroute/go-api/internal/events"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -102,6 +105,9 @@ func (s *Store) hopsForPayment(ctx context.Context, paymentID string) ([]payment
 }
 
 func (s *Store) GetPayment(ctx context.Context, id string) (payment.Payment, bool, error) {
+	ctx, span := observability.Tracer("db").Start(ctx, "db.GetPayment")
+	defer span.End()
+
 	var p payment.Payment
 	var status, execMode string
 	var bridgeProvider sql.NullString
@@ -173,6 +179,9 @@ func (s *Store) LookupByIdempotencyKey(ctx context.Context, p payment.Payment) (
 }
 
 func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error) {
+	ctx, span := observability.Tracer("db").Start(ctx, "db.CreateOrGetPayment")
+	defer span.End()
+
 	p.ExecutionMode = normalizeExecutionMode(p.ExecutionMode)
 
 	// Optimization only, not correctness-critical: skip the routing RPC's
@@ -250,10 +259,14 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 		}
 	}
 
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
 	outboxPayload, err := json.Marshal(events.RoutedPayment{
-		PaymentID:  created.ID,
-		EventType:  events.RoutedPaymentEventType,
-		OccurredAt: time.Now().UTC(),
+		PaymentID:    created.ID,
+		EventType:    events.RoutedPaymentEventType,
+		OccurredAt:   time.Now().UTC(),
+		TraceCarrier: carrier,
 	})
 	if err != nil {
 		return payment.Payment{}, 0, fmt.Errorf("marshal outbox payload: %w", err)
@@ -306,24 +319,25 @@ func (s *Store) ClaimPayment(ctx context.Context, paymentID string) (claimed boo
 }
 
 // CompletePayment atomically transitions a payment from PROCESSING to the
-// given terminal status. completed=false means the payment was not
-// PROCESSING -- a safe no-op. This is the sole mechanism guaranteeing
-// exactly one terminal outcome is ever persisted per payment (Phase 6
-// design spec, §7 case 4), regardless of how many times the caller's
-// execution logic itself ran.
-func (s *Store) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (completed bool, err error) {
-	result, err := s.db.ExecContext(ctx, `
+// given terminal status, and returns the payment's created_at timestamp
+// (needed by callers to compute end-to-end payment-duration metrics).
+// completed=false means the payment was not PROCESSING -- a safe no-op. This
+// is the sole mechanism guaranteeing exactly one terminal outcome is ever
+// persisted per payment (Phase 6 design spec, §7 case 4), regardless of how
+// many times the caller's execution logic itself ran.
+func (s *Store) CompletePayment(ctx context.Context, paymentID string, terminal payment.Status) (completed bool, createdAt time.Time, err error) {
+	row := s.db.QueryRowContext(ctx, `
 		UPDATE payments SET status = $2, completed_at = now(), updated_at = now()
 		WHERE id = $1 AND status = $3
+		RETURNING created_at
 	`, paymentID, terminal, payment.StatusProcessing)
-	if err != nil {
-		return false, fmt.Errorf("complete payment: %w", err)
+	if err := row.Scan(&createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, time.Time{}, nil
+		}
+		return false, time.Time{}, fmt.Errorf("complete payment: %w", err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("complete payment rows affected: %w", err)
-	}
-	return rows == 1, nil
+	return true, createdAt, nil
 }
 
 // StalePaymentIDs returns the IDs of payments that have been PROCESSING for
