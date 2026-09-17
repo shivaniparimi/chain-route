@@ -49,3 +49,6 @@ desktop.ini
 
 # Claude Code local session/worktree state — not project source
 .claude/
+
+# Phase 10 observability stack local state
+observability/*.local.yml
