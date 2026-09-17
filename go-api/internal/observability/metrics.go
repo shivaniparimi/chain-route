@@ -32,18 +32,18 @@ type Metrics struct {
 	Registry *prometheus.Registry
 
 	// Payments
-	PaymentsCreated   *prometheus.CounterVec   // labels: execution_mode
-	PaymentsCompleted *prometheus.CounterVec   // labels: execution_mode
-	PaymentsFailed    *prometheus.CounterVec   // labels: execution_mode, failure_reason_class
-	PaymentsProcessing *prometheus.GaugeVec    // labels: execution_mode
-	PaymentDuration   *prometheus.HistogramVec // labels: execution_mode, outcome
+	PaymentsCreated    *prometheus.CounterVec   // labels: execution_mode
+	PaymentsCompleted  *prometheus.CounterVec   // labels: execution_mode
+	PaymentsFailed     *prometheus.CounterVec   // labels: execution_mode, failure_reason_class
+	PaymentsProcessing *prometheus.GaugeVec     // labels: execution_mode
+	PaymentDuration    *prometheus.HistogramVec // labels: execution_mode, outcome
 
 	// Routing
-	RoutingRequests        *prometheus.CounterVec   // labels: execution_mode
-	RoutingDuration        *prometheus.HistogramVec // labels: execution_mode
-	RoutingFailures        *prometheus.CounterVec   // labels: reason
-	RoutingSelectedProvider *prometheus.CounterVec  // labels: provider
-	RoutingSelectedFee     *prometheus.HistogramVec // labels: provider
+	RoutingRequests         *prometheus.CounterVec   // labels: execution_mode
+	RoutingDuration         *prometheus.HistogramVec // labels: execution_mode
+	RoutingFailures         *prometheus.CounterVec   // labels: reason
+	RoutingSelectedProvider *prometheus.CounterVec   // labels: provider
+	RoutingSelectedFee      *prometheus.HistogramVec // labels: provider
 
 	// Bridge providers (Across + Relay, differentiated only by the
 	// "provider" label -- never a per-provider metric family)
@@ -54,20 +54,20 @@ type Metrics struct {
 	QuoteSelected  *prometheus.CounterVec   // labels: provider
 
 	// Kafka / worker
-	EventsPublished     prometheus.Counter
-	EventsConsumed      prometheus.Counter
-	ProcessingDuration  *prometheus.HistogramVec // labels: execution_mode
-	ProcessingFailures  *prometheus.CounterVec   // labels: execution_mode, reason
-	StaleRecoveries     *prometheus.CounterVec   // labels: source
+	EventsPublished    prometheus.Counter
+	EventsConsumed     prometheus.Counter
+	ProcessingDuration *prometheus.HistogramVec // labels: execution_mode
+	ProcessingFailures *prometheus.CounterVec   // labels: execution_mode, reason
+	StaleRecoveries    *prometheus.CounterVec   // labels: source
 
 	// Blockchain execution
-	ExecutionAttempts       *prometheus.CounterVec   // labels: provider
-	Broadcasts               *prometheus.CounterVec   // labels: provider
-	Reconciliations          *prometheus.CounterVec   // labels: provider
-	ExecutionsCompleted      *prometheus.CounterVec   // labels: provider
-	ExecutionsFailed         *prometheus.CounterVec   // labels: provider, reason
-	ExecutionDuration        *prometheus.HistogramVec // labels: provider
-	ReconciliationDuration   *prometheus.HistogramVec // labels: provider
+	ExecutionAttempts      *prometheus.CounterVec   // labels: provider
+	Broadcasts             *prometheus.CounterVec   // labels: provider
+	Reconciliations        *prometheus.CounterVec   // labels: provider
+	ExecutionsCompleted    *prometheus.CounterVec   // labels: provider
+	ExecutionsFailed       *prometheus.CounterVec   // labels: provider, reason
+	ExecutionDuration      *prometheus.HistogramVec // labels: provider
+	ReconciliationDuration *prometheus.HistogramVec // labels: provider
 }
 
 // NewMetrics constructs and registers every ChainRoute metric against a
