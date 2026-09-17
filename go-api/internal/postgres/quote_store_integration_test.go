@@ -155,6 +155,125 @@ func TestCreateOrGetPayment_QuoteInsertFailureRollsBackWholeTransaction(t *testi
 	}
 }
 
+// TestCreateOrGetPayment_RelayWinnerProducesConsistentProviderAcrossTables
+// proves design doc §10/§24's cross-table consistency claim for a
+// Relay-selected route: payments.bridge_provider, the winning
+// payment_route_hops row, and payment_quotes.provider must all agree on
+// "relay" -- not just individually correct, but consistent with each other,
+// since Task 5-12 touch these three tables independently.
+func TestCreateOrGetPayment_RelayWinnerProducesConsistentProviderAcrossTables(t *testing.T) {
+	store := newTestStore(t)
+	key := "relay-consistency-" + t.Name()
+	cleanup := func() {
+		if _, err := store.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	p := payment.Payment{
+		IdempotencyKey: key, SourceChain: "ethereum", DestinationChain: "base",
+		Asset: "eth", Amount: "0.001", ExecutionMode: payment.ExecutionModeTestnet,
+		Hops:           []payment.Hop{{HopIndex: 0, FromChain: "ethereum", ToChain: "base", BridgeName: "relay", Fee: 0.0001, LatencyMs: 4000, Liquidity: 0.001, Reliability: 1.0}},
+		BridgeProvider: strPtr("relay"),
+		Quote: &payment.Quote{Provider: "relay", OriginChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+			InputAmount: "1000000000000000", OutputAmount: "999900000000000", FeeAmount: "100000000000",
+			EstimatedFillTimeSec: 4, QuotedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+			RawProviderPayload: json.RawMessage(`{"requestId":"0xabc"}`)},
+	}
+	created, _, err := store.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("CreateOrGetPayment: %v", err)
+	}
+
+	got, found, err := store.GetPayment(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("GetPayment: found=%v err=%v", found, err)
+	}
+	if got.BridgeProvider == nil || *got.BridgeProvider != "relay" {
+		t.Errorf("payments.bridge_provider = %v, want relay", got.BridgeProvider)
+	}
+	if len(got.Hops) == 0 || got.Hops[0].BridgeName != "relay" {
+		t.Errorf("payment_route_hops.bridge_name = %+v, want relay", got.Hops)
+	}
+	q, found, err := store.GetQuoteByPaymentID(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("GetQuoteByPaymentID: found=%v err=%v", found, err)
+	}
+	if q.Provider != "relay" {
+		t.Errorf("payment_quotes.provider = %q, want relay", q.Provider)
+	}
+}
+
+// TestCreateOrGetPayment_LosingAcrossQuoteIsNeverPersisted asserts, for the
+// same Relay-winning payment shape as the test above, that there is no
+// trace anywhere in the database of the losing "across" candidate: no
+// payment_route_hops row and no payment_quotes row naming "across" for
+// this payment_id. payment_quotes already has UNIQUE(payment_id), so this
+// is really confirming the ONE row that exists says "relay", not "across" --
+// phrased as its own test per design doc §10/§24 for clarity of intent,
+// distinct from the plain consistency check above.
+func TestCreateOrGetPayment_LosingAcrossQuoteIsNeverPersisted(t *testing.T) {
+	store := newTestStore(t)
+	key := "no-losing-across-" + t.Name()
+	cleanup := func() {
+		if _, err := store.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	p := payment.Payment{
+		IdempotencyKey: key, SourceChain: "ethereum", DestinationChain: "base",
+		Asset: "eth", Amount: "0.001", ExecutionMode: payment.ExecutionModeTestnet,
+		Hops:           []payment.Hop{{HopIndex: 0, FromChain: "ethereum", ToChain: "base", BridgeName: "relay", Fee: 0.0001, LatencyMs: 4000, Liquidity: 0.001, Reliability: 1.0}},
+		BridgeProvider: strPtr("relay"),
+		Quote: &payment.Quote{Provider: "relay", OriginChainID: 11155111, DestinationChainID: 84532, Asset: "WETH",
+			InputAmount: "1000000000000000", OutputAmount: "999900000000000", FeeAmount: "100000000000",
+			EstimatedFillTimeSec: 4, QuotedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute),
+			RawProviderPayload: json.RawMessage(`{"requestId":"0xabc"}`)},
+	}
+	created, _, err := store.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("CreateOrGetPayment: %v", err)
+	}
+
+	var hopCount int
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM payment_route_hops WHERE payment_id = $1 AND bridge_name = 'across'`, created.ID,
+	).Scan(&hopCount); err != nil {
+		t.Fatalf("hop count query: %v", err)
+	}
+	if hopCount != 0 {
+		t.Fatalf("expected no payment_route_hops row naming across for a relay-won payment, got %d", hopCount)
+	}
+
+	var quoteCount int
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT count(*) FROM payment_quotes WHERE payment_id = $1 AND provider = 'across'`, created.ID,
+	).Scan(&quoteCount); err != nil {
+		t.Fatalf("quote count query: %v", err)
+	}
+	if quoteCount != 0 {
+		t.Fatalf("expected no payment_quotes row naming across for a relay-won payment, got %d", quoteCount)
+	}
+
+	// payment_quotes.UNIQUE(payment_id) means confirming the single row
+	// present says "relay" is equivalent to confirming no "across" row
+	// exists, but assert it directly too for clarity of intent.
+	q, found, err := store.GetQuoteByPaymentID(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("GetQuoteByPaymentID: found=%v err=%v", found, err)
+	}
+	if q.Provider != "relay" {
+		t.Fatalf("payment_quotes.provider = %q, want relay (proves the single UNIQUE(payment_id) row is not across)", q.Provider)
+	}
+}
+
 func TestMarkProcessingFailed_TransitionsFromProcessingOnly(t *testing.T) {
 	store := newTestStore(t)
 	key := "mark-failed-" + t.Name()

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -247,35 +248,55 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		anyAvailable := false
-		for _, p := range providers {
-			q, err := p.GetQuote(r.Context(), quote.Request{
-				SourceChainID: originChainID, DestinationChainID: destChainID, Asset: bridgedAsset, AmountBaseUnits: amountWei,
-			})
-			if err != nil {
-				log.Printf("ERROR: quote provider %s failed: %v", p.Name(), err)
-				writeError(w, http.StatusServiceUnavailable, "bridge quote provider unavailable")
-				return
+		type quoteResult struct {
+			provider quote.Provider
+			q        quote.Quote
+			err      error
+		}
+
+		quoteCtx, quoteCancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer quoteCancel()
+		results := make([]quoteResult, len(providers))
+		var wg sync.WaitGroup
+		for i, p := range providers {
+			wg.Add(1)
+			go func(i int, p quote.Provider) {
+				defer wg.Done()
+				q, err := p.GetQuote(quoteCtx, quote.Request{
+					SourceChainID: originChainID, DestinationChainID: destChainID, Asset: bridgedAsset, AmountBaseUnits: amountWei,
+				})
+				results[i] = quoteResult{provider: p, q: q, err: err}
+			}(i, p)
+		}
+		wg.Wait()
+
+		anySucceeded, anyAvailable := false, false
+		for _, res := range results { // index order, never completion order -- keeps the C++ tie-break deterministic
+			if res.err != nil {
+				log.Printf("WARNING: quote provider %s failed: %v", res.provider.Name(), res.err)
+				continue
 			}
-			if !q.Available {
+			anySucceeded = true
+			if !res.q.Available {
 				continue
 			}
 			anyAvailable = true
-			feeDecimal := money.BaseUnitsToDecimal(q.FeeBaseUnits, 18)
+			feeDecimal := money.BaseUnitsToDecimal(res.q.FeeBaseUnits, 18)
 			feeFloat, _ := strconv.ParseFloat(feeDecimal, 64)
 			candidateEdges = append(candidateEdges, &routingv1.CandidateEdge{
-				BridgeName: p.Name(), Fee: feeFloat, LatencyMs: float64(q.EstimatedFillTimeSec) * 1000,
+				BridgeName: res.provider.Name(), Fee: feeFloat, LatencyMs: float64(res.q.EstimatedFillTimeSec) * 1000,
 				Liquidity: amountForRouting, Reliability: 1.0,
 			})
-			quotesByBridgeName[p.Name()] = q
+			quotesByBridgeName[res.provider.Name()] = res.q
+		}
+		if !anySucceeded {
+			writeError(w, http.StatusServiceUnavailable, "bridge quote providers unavailable")
+			return
 		}
 		if !anyAvailable {
 			writeError(w, http.StatusUnprocessableEntity, "no route available for the requested payment")
 			return
 		}
-
-		provider := "across" // overwritten below once the winning hop is known; placeholder to keep bridgeProvider non-nil until then
-		bridgeProvider = &provider
 	}
 
 	grpcReq := &routingv1.FindRouteRequest{

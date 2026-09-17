@@ -116,19 +116,19 @@ func (s *Store) TryCreateExecution(ctx context.Context, p CreateExecutionParams)
 // started for this payment yet, or it is a simulated-mode payment.
 func (s *Store) GetExecutionByPaymentID(ctx context.Context, paymentID string) (payment.Execution, bool, error) {
 	var e payment.Execution
-	var signedTxHash, acrossDepositID sql.NullString
+	var signedTxHash, providerReferenceID, rawExternalStatus sql.NullString
 	var broadcastAt, confirmedAt sql.NullTime
 	var externalStatus string
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, payment_id, bridge_provider, origin_chain_id, destination_chain_id,
 		       wallet_address, nonce, signed_tx_hash, raw_signed_tx, broadcast_at,
-		       across_deposit_id, external_status, confirmed_at, created_at, updated_at
+		       provider_reference_id, external_status, raw_external_status, confirmed_at, created_at, updated_at
 		FROM payment_executions
 		WHERE payment_id = $1
 	`, paymentID)
 	err := row.Scan(&e.ID, &e.PaymentID, &e.BridgeProvider, &e.OriginChainID, &e.DestinationChainID,
 		&e.WalletAddress, &e.Nonce, &signedTxHash, &e.RawSignedTx, &broadcastAt,
-		&acrossDepositID, &externalStatus, &confirmedAt, &e.CreatedAt, &e.UpdatedAt)
+		&providerReferenceID, &externalStatus, &rawExternalStatus, &confirmedAt, &e.CreatedAt, &e.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return payment.Execution{}, false, nil
 	}
@@ -138,11 +138,14 @@ func (s *Store) GetExecutionByPaymentID(ctx context.Context, paymentID string) (
 	if signedTxHash.Valid {
 		e.SignedTxHash = &signedTxHash.String
 	}
-	if acrossDepositID.Valid {
-		e.AcrossDepositID = &acrossDepositID.String
+	if providerReferenceID.Valid {
+		e.ProviderReferenceID = &providerReferenceID.String
 	}
 	if broadcastAt.Valid {
 		e.BroadcastAt = &broadcastAt.Time
+	}
+	if rawExternalStatus.Valid {
+		e.RawExternalStatus = &rawExternalStatus.String
 	}
 	if confirmedAt.Valid {
 		e.ConfirmedAt = &confirmedAt.Time
@@ -154,11 +157,11 @@ func (s *Store) GetExecutionByPaymentID(ctx context.Context, paymentID string) (
 // PersistSignedExecution durably persists the signed transaction bytes and
 // its deterministic hash BEFORE any broadcast attempt -- this ordering is
 // the core of Phase 7's crash-safety (design spec §8 step 2).
-func (s *Store) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string) error {
+func (s *Store) PersistSignedExecution(ctx context.Context, executionID string, rawTx []byte, txHash string, providerReferenceID *string) error {
 	if _, err := s.db.ExecContext(ctx, `
-		UPDATE payment_executions SET raw_signed_tx = $2, signed_tx_hash = $3, updated_at = now()
+		UPDATE payment_executions SET raw_signed_tx = $2, signed_tx_hash = $3, provider_reference_id = $4, updated_at = now()
 		WHERE id = $1
-	`, executionID, rawTx, txHash); err != nil {
+	`, executionID, rawTx, txHash, providerReferenceID); err != nil {
 		return fmt.Errorf("persist signed execution: %w", err)
 	}
 	return nil
@@ -179,11 +182,11 @@ func (s *Store) MarkExecutionBroadcast(ctx context.Context, executionID string) 
 
 // UpdateExecutionExternalStatus records the reconciler's observed terminal
 // (or still-pending) outcome for one execution.
-func (s *Store) UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, confirmedAt *sql.NullTime) error {
+func (s *Store) UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, rawStatus string, confirmedAt *sql.NullTime) error {
 	if _, err := s.db.ExecContext(ctx, `
-		UPDATE payment_executions SET external_status = $2, confirmed_at = $3, updated_at = now()
+		UPDATE payment_executions SET external_status = $2, raw_external_status = $3, confirmed_at = $4, updated_at = now()
 		WHERE id = $1
-	`, executionID, string(status), confirmedAt); err != nil {
+	`, executionID, string(status), rawStatus, confirmedAt); err != nil {
 		return fmt.Errorf("update execution external status: %w", err)
 	}
 	return nil
@@ -266,7 +269,7 @@ func (s *Store) ReconciliationCandidates(ctx context.Context, staleness time.Dur
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, payment_id, bridge_provider, origin_chain_id, destination_chain_id,
 		       wallet_address, nonce, signed_tx_hash, raw_signed_tx, broadcast_at,
-		       across_deposit_id, external_status, confirmed_at, created_at, updated_at
+		       provider_reference_id, external_status, raw_external_status, confirmed_at, created_at, updated_at
 		FROM payment_executions
 		WHERE (broadcast_at IS NOT NULL AND confirmed_at IS NULL)
 		   OR (broadcast_at IS NULL AND updated_at < now() - make_interval(secs => $1))
@@ -279,22 +282,25 @@ func (s *Store) ReconciliationCandidates(ctx context.Context, staleness time.Dur
 	var out []payment.Execution
 	for rows.Next() {
 		var e payment.Execution
-		var signedTxHash, acrossDepositID sql.NullString
+		var signedTxHash, providerReferenceID, rawExternalStatus sql.NullString
 		var broadcastAt, confirmedAt sql.NullTime
 		var externalStatus string
 		if err := rows.Scan(&e.ID, &e.PaymentID, &e.BridgeProvider, &e.OriginChainID, &e.DestinationChainID,
 			&e.WalletAddress, &e.Nonce, &signedTxHash, &e.RawSignedTx, &broadcastAt,
-			&acrossDepositID, &externalStatus, &confirmedAt, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			&providerReferenceID, &externalStatus, &rawExternalStatus, &confirmedAt, &e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan reconciliation candidate: %w", err)
 		}
 		if signedTxHash.Valid {
 			e.SignedTxHash = &signedTxHash.String
 		}
-		if acrossDepositID.Valid {
-			e.AcrossDepositID = &acrossDepositID.String
+		if providerReferenceID.Valid {
+			e.ProviderReferenceID = &providerReferenceID.String
 		}
 		if broadcastAt.Valid {
 			e.BroadcastAt = &broadcastAt.Time
+		}
+		if rawExternalStatus.Valid {
+			e.RawExternalStatus = &rawExternalStatus.String
 		}
 		if confirmedAt.Valid {
 			e.ConfirmedAt = &confirmedAt.Time

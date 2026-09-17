@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"chainroute/go-api/internal/bridge/quote"
 )
 
 // DepositStatusResponse is GET /deposit/status's response. Status is left
@@ -65,4 +67,31 @@ func (c *Client) DepositStatusByTxHash(ctx context.Context, originChainID int64,
 		return DepositStatusResponse{}, err
 	}
 	return out, nil
+}
+
+// acrossStatusToState maps Across's own status vocabulary onto the shared
+// ExternalState enum -- a direct extraction of the mapping
+// worker.Reconciler.checkAndUpdateOutcome already applied inline before
+// this task, not new logic.
+func acrossStatusToState(raw string) quote.ExternalState {
+	switch raw {
+	case "filled":
+		return quote.StateFilled
+	case "expired", "refunded":
+		return quote.StateRefunded
+	default:
+		return quote.StatePending
+	}
+}
+
+// CheckStatus implements quote.StatusChecker. p.OriginChainID must be set
+// by the caller (cmd/worker/main.go) to the chain the deposit originated
+// on -- DepositStatusByTxHash sends it as the live originChainId query
+// parameter Across's API requires to disambiguate req.OriginTxHash.
+func (p *Provider) CheckStatus(ctx context.Context, req quote.StatusRequest) (quote.StatusResult, error) {
+	resp, err := p.Client.DepositStatusByTxHash(ctx, p.OriginChainID, req.OriginTxHash)
+	if err != nil {
+		return quote.StatusResult{}, err
+	}
+	return quote.StatusResult{State: acrossStatusToState(resp.Status), RawStatus: resp.Status}, nil
 }

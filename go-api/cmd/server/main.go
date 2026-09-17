@@ -13,10 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"chainroute/go-api/internal/bridge/across"
 	"chainroute/go-api/internal/bridge/quote"
+	"chainroute/go-api/internal/bridge/relay"
 	"chainroute/go-api/internal/grpcclient"
 	"chainroute/go-api/internal/handler"
 	"chainroute/go-api/internal/postgres"
@@ -38,16 +40,24 @@ func main() {
 	var registry *quote.Registry
 	if blockchainEnv == "testnet" {
 		acrossBaseURL := envOrDefaultServer("ACROSS_TESTNET_API_URL", "https://testnet.across.to/api")
+		relayBaseURL := envOrDefaultServer("RELAY_TESTNET_API_URL", "https://api.testnets.relay.link")
 		routingQuoteTTL := envDurationServer("ROUTING_QUOTE_TTL_SECONDS", 2*time.Minute, time.Second)
 		acrossClient := across.NewClient(acrossBaseURL)
 		acrossClient.APIKey = os.Getenv("ACROSS_API_KEY")
 		acrossClient.IntegratorID = os.Getenv("ACROSS_INTEGRATOR_ID")
+		relayClient := relay.NewClient(relayBaseURL)
+		relayClient.APIKey = os.Getenv("RELAY_API_KEY")
 
+		// cmd/server never signs anything, so the quoting-only Provider
+		// instances here never need a real wallet address -- a zero
+		// address is safe (GetQuote uses it only as the quote request's
+		// "user" field, which does not need to resolve to funds for a
+		// price-discovery call).
+		var zeroWallet common.Address
 		registry = quote.NewRegistry()
-		registry.Register(
-			quote.RouteKey{SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH"},
-			across.NewProvider(acrossClient, routingQuoteTTL),
-		)
+		routeKey := quote.RouteKey{SourceChainID: 11155111, DestinationChainID: 84532, Asset: "WETH"}
+		registry.Register(routeKey, across.NewProvider(acrossClient, routingQuoteTTL))
+		registry.Register(routeKey, relay.NewProvider(relayClient, zeroWallet, routingQuoteTTL))
 	}
 
 	client, err := grpcclient.Dial(*grpcAddr)

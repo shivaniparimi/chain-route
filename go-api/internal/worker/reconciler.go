@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -11,7 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
-	"chainroute/go-api/internal/bridge/across"
+	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/payment"
 )
 
@@ -22,7 +21,7 @@ type ReconcilerStore interface {
 	GetExecutionByPaymentID(ctx context.Context, paymentID string) (payment.Execution, bool, error)
 	StaleTestnetProcessingWithoutExecutionIDs(ctx context.Context, staleness time.Duration) ([]string, error)
 	ReconciliationCandidates(ctx context.Context, staleness time.Duration) ([]payment.Execution, error)
-	UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, confirmedAt *sql.NullTime) error
+	UpdateExecutionExternalStatus(ctx context.Context, executionID string, status payment.ExternalStatus, rawStatus string, confirmedAt *sql.NullTime) error
 	CompleteSubmittedPayment(ctx context.Context, paymentID string, terminal payment.Status) (bool, error)
 	LowestUnconfirmedNonce(ctx context.Context, walletAddress string) (int64, bool, error)
 }
@@ -41,13 +40,13 @@ type ReconcilerEthClient interface {
 // actually happened externally," using chain RPC and the Across status
 // API, not just Postgres.
 type Reconciler struct {
-	Store         ReconcilerStore
-	Executor      *Executor
-	OriginClient  ReconcilerEthClient
-	Across        *across.Client
-	WalletAddress common.Address
-	OriginChainID int64
-	Staleness     time.Duration
+	Store          ReconcilerStore
+	Executor       *Executor
+	OriginClient   ReconcilerEthClient
+	StatusCheckers map[string]quote.StatusChecker // keyed by provider name, e.g. "across", "relay"
+	WalletAddress  common.Address
+	OriginChainID  int64
+	Staleness      time.Duration
 }
 
 // SweepOnce runs one full reconciliation pass MINUS the divergence check,
@@ -171,35 +170,67 @@ func (r *Reconciler) checkAndUpdateOutcome(ctx context.Context, exec payment.Exe
 		return nil
 	}
 	if receipt.Status == 0 {
-		return r.markTerminal(ctx, exec, payment.ExternalStatusReverted, payment.StatusFailed)
+		return r.markTerminal(ctx, exec, quote.StatusResult{State: quote.StateReverted, RawStatus: "origin_reverted"}, payment.StatusFailed)
 	}
 
-	status, err := r.Across.DepositStatusByTxHash(ctx, r.OriginChainID, *exec.SignedTxHash)
+	checker, ok := r.StatusCheckers[exec.BridgeProvider]
+	if !ok {
+		return fmt.Errorf("execution %s uses provider %q, which this reconciler has no configured status checker for", exec.ID, exec.BridgeProvider)
+	}
+	result, err := checker.CheckStatus(ctx, quote.StatusRequest{
+		ProviderReferenceID: derefOrEmpty(exec.ProviderReferenceID),
+		OriginTxHash:        *exec.SignedTxHash,
+	})
 	if err != nil {
-		if errors.Is(err, across.ErrDepositNotFound) {
-			return nil // Across's indexer hasn't observed it yet -- not a failure.
-		}
-		return nil // transient API error -- not a failure signal, retry next sweep.
+		return nil // transient API error -- not a failure signal (design spec §13), retry next sweep
 	}
 
-	switch status.Status {
-	case "filled":
-		return r.markTerminal(ctx, exec, payment.ExternalStatusFilled, payment.StatusCompleted)
-	case "expired":
-		return r.markTerminal(ctx, exec, payment.ExternalStatusExpired, payment.StatusFailed)
-	case "refunded":
-		return r.markTerminal(ctx, exec, payment.ExternalStatusRefunded, payment.StatusFailed)
-	case "pending":
-		return nil
-	default:
-		log.Printf("WARNING: reconciler: unrecognized across status %q for execution %s -- treating as still pending", status.Status, exec.ID)
+	switch result.State {
+	case quote.StateFilled:
+		return r.markTerminal(ctx, exec, result, payment.StatusCompleted)
+	case quote.StateRefunded, quote.StateReverted, quote.StateFillFailed:
+		return r.markTerminal(ctx, exec, result, payment.StatusFailed)
+	default: // quote.StatePending
 		return nil
 	}
 }
 
-func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, external payment.ExternalStatus, terminal payment.Status) error {
+// derefOrEmpty returns the empty string for a nil pointer rather than
+// panicking -- Across-provider executions never populate
+// exec.ProviderReferenceID (it's Relay-only, design doc §16), and this
+// dispatch path must work for either provider.
+func derefOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// externalStateToStatus maps the shared, provider-agnostic
+// quote.ExternalState back onto payment.ExternalStatus for persistence.
+// The two enums are intentionally distinct types (design doc §6's
+// rationale for two small interfaces applies to their result types too):
+// quote.ExternalState is Reconciler's own polling vocabulary, while
+// payment.ExternalStatus is payment_executions' durable column.
+func externalStateToStatus(s quote.ExternalState) payment.ExternalStatus {
+	switch s {
+	case quote.StateFilled:
+		return payment.ExternalStatusFilled
+	case quote.StateRefunded:
+		return payment.ExternalStatusRefunded
+	case quote.StateReverted:
+		return payment.ExternalStatusReverted
+	case quote.StateFillFailed:
+		return payment.ExternalStatusFillFailed
+	default:
+		return payment.ExternalStatusPending
+	}
+}
+
+func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, result quote.StatusResult, terminal payment.Status) error {
+	external := externalStateToStatus(result.State)
 	confirmedAt := &sql.NullTime{Time: time.Now().UTC(), Valid: true}
-	if err := r.Store.UpdateExecutionExternalStatus(ctx, exec.ID, external, confirmedAt); err != nil {
+	if err := r.Store.UpdateExecutionExternalStatus(ctx, exec.ID, external, result.RawStatus, confirmedAt); err != nil {
 		return fmt.Errorf("record %s: %w", external, err)
 	}
 	completed, err := r.Store.CompleteSubmittedPayment(ctx, exec.PaymentID, terminal)

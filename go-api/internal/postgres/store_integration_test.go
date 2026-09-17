@@ -17,6 +17,8 @@ import (
 	"chainroute/go-api/internal/payment"
 )
 
+func strPtr(s string) *string { return &s }
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	dsn := os.Getenv("DATABASE_URL")

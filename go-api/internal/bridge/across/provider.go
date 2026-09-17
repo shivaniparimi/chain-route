@@ -8,6 +8,8 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"chainroute/go-api/internal/bridge/quote"
 )
 
@@ -45,10 +47,21 @@ func DecodeQuotePayload(raw json.RawMessage) (QuotePayload, error) {
 
 // Provider implements quote.Provider by wrapping the existing,
 // live-verified Client.SuggestedFees -- it introduces no second Across
-// HTTP integration.
+// HTTP integration. It also implements quote.Signer (BuildTransaction, in
+// execute.go) and quote.StatusChecker (CheckStatus, in status.go).
+//
+// WalletAddress, SpokePoolAddress, WETHOrigin, WETHDestination, and
+// OriginChainID are all zero-valued and unused by cmd/server's
+// registry-only instance (which only ever calls GetQuote); they are set by
+// cmd/worker/main.go, the only caller that also signs and polls status.
 type Provider struct {
-	Client   *Client
-	QuoteTTL time.Duration
+	Client           *Client
+	QuoteTTL         time.Duration
+	WalletAddress    common.Address
+	SpokePoolAddress common.Address
+	WETHOrigin       common.Address
+	WETHDestination  common.Address
+	OriginChainID    int64
 }
 
 func NewProvider(client *Client, quoteTTL time.Duration) *Provider {
