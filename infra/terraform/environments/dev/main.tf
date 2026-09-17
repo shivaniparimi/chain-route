@@ -128,7 +128,7 @@ module "go_server_service" {
     DATABASE_URL                = "postgres://chainroute@${module.database.endpoint}/chainroute?sslmode=require"
     OTEL_EXPORTER_OTLP_ENDPOINT = "otel-collector.chainroute.local:4317"
   }
-  secrets            = { DATABASE_PASSWORD = module.database.secret_arn }
+  secrets            = { DATABASE_PASSWORD = "${module.database.secret_arn}:password::" }
   log_group_name     = aws_cloudwatch_log_group.chainroute.name
   execution_role_arn = aws_iam_role.ecs_execution.arn
   task_role_arn      = aws_iam_role.ecs_task.arn
@@ -150,7 +150,7 @@ module "go_worker_service" {
     KAFKA_BOOTSTRAP_SERVERS     = module.messaging.bootstrap_endpoint
     OTEL_EXPORTER_OTLP_ENDPOINT = "otel-collector.chainroute.local:4317"
   }
-  secrets            = { DATABASE_PASSWORD = module.database.secret_arn }
+  secrets            = { DATABASE_PASSWORD = "${module.database.secret_arn}:password::" }
   log_group_name     = aws_cloudwatch_log_group.chainroute.name
   execution_role_arn = aws_iam_role.ecs_execution.arn
   task_role_arn      = aws_iam_role.ecs_task.arn
