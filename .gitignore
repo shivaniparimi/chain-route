@@ -52,3 +52,16 @@ desktop.ini
 
 # Phase 10 observability stack local state
 observability/*.local.yml
+
+# Terraform local state and working directories — real state/plans/vars
+# must never be committed; *.tfvars.example files stay tracked.
+# (.terraform.lock.hcl is intentionally NOT ignored -- HashiCorp recommends
+# committing it for reproducible provider version selection.)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+crash.log
+crash.*.log
