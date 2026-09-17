@@ -277,13 +277,21 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 		// expiry/slippage for an already-signed row (design doc §8 concern
 		// 2's protocol-freshness argument only applies BEFORE signing; once
 		// signed, re-deriving anything risks a second distinct transaction).
-		err := e.broadcastWithRecovery(ctx, exec)
+		sent, err := e.broadcastWithRecovery(ctx, exec)
 		e.metrics().ExecutionDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
 		if err != nil {
 			e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "broadcast_error").Inc()
 			return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
 		}
-		e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
+		if sent {
+			// Only increment when THIS call actually issued a new
+			// SendTransaction -- not on the idempotent "already on
+			// chain" short-circuit, which would otherwise double-count
+			// a broadcast that a crashed-and-resumed signAndBroadcastFresh
+			// already counted before its own MarkExecutionBroadcast
+			// write failed.
+			e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
+		}
 		if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
 			return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)
 		}
@@ -435,12 +443,17 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 	exec.RawSignedTx = rawTx
 
 	broadcastCtx, broadcastSpan := observability.Tracer("execution").Start(ctx, "execution.broadcast")
-	err = e.broadcastWithRecovery(broadcastCtx, exec)
+	sent, err := e.broadcastWithRecovery(broadcastCtx, exec)
 	broadcastSpan.End()
 	if err != nil {
 		return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
 	}
-	e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
+	if sent {
+		// Only increment when THIS call actually issued a new
+		// SendTransaction -- see the same guard and rationale in
+		// DriveExecutionForward's already-signed branch above.
+		e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
+	}
 	if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
 		return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)
 	}
@@ -495,35 +508,45 @@ func extractProviderReferenceID(freshQuote quote.Quote) *string {
 // the chain for the precomputed signed_tx_hash. Only if that read
 // confirms the transaction does not exist does this rebroadcast, and even
 // then it rebroadcasts the exact persisted bytes, never a re-signed one.
-func (e *Executor) broadcastWithRecovery(ctx context.Context, exec payment.Execution) error {
+//
+// The returned sent bool reports whether THIS call actually issued a new
+// SendTransaction -- as opposed to short-circuiting because
+// TransactionByHash found the tx already on chain. Callers must gate their
+// Broadcasts metric increment on sent, not merely on a nil error: a nil
+// error also covers the idempotent "already on chain, no-op" path, and a
+// caller that increments unconditionally there double-counts a single
+// physical broadcast when a resumed execution (e.g. via the reconciler's
+// DriveExecutionForward call) finds its own earlier send already mined.
+func (e *Executor) broadcastWithRecovery(ctx context.Context, exec payment.Execution) (sent bool, err error) {
 	if exec.SignedTxHash == nil || exec.RawSignedTx == nil {
-		return fmt.Errorf("execution %s has no signed transaction to broadcast", exec.ID)
+		return false, fmt.Errorf("execution %s has no signed transaction to broadcast", exec.ID)
 	}
 	hash := common.HexToHash(*exec.SignedTxHash)
 
 	if _, _, err := e.OriginClient.TransactionByHash(ctx, hash); err == nil {
 		// Already known to the chain, pending or mined -- never
-		// rebroadcast or re-sign.
-		return nil
+		// rebroadcast or re-sign, and never counted as a new broadcast.
+		return false, nil
 	} else if !errors.Is(err, gethereum.NotFound) {
 		// A genuine lookup failure (RPC timeout, connection error, etc.)
 		// is NOT the same as a confirmed "the chain has never seen this
 		// tx" -- only ethereum.NotFound means that. Anything else must
 		// propagate as an error rather than being silently treated as
 		// license to rebroadcast against a possibly-flaky endpoint.
-		return fmt.Errorf("check transaction %s on chain: %w", hash.Hex(), err)
+		return false, fmt.Errorf("check transaction %s on chain: %w", hash.Hex(), err)
 	}
 
 	var tx types.Transaction
 	if err := tx.UnmarshalBinary(exec.RawSignedTx); err != nil {
-		return fmt.Errorf("unmarshal persisted signed tx: %w", err)
+		return false, fmt.Errorf("unmarshal persisted signed tx: %w", err)
 	}
 	if err := e.OriginClient.SendTransaction(ctx, &tx); err != nil {
 		// This error is itself ambiguous -- the node may have accepted
 		// the tx before the error surfaced. Do NOT treat this as
 		// terminal; leave broadcast_at unset so the next attempt
-		// re-runs this exact hash-check-then-broadcast sequence.
-		return fmt.Errorf("send transaction: %w", err)
+		// re-runs this exact hash-check-then-broadcast sequence. Report
+		// sent=false since we cannot confirm a new send actually landed.
+		return false, fmt.Errorf("send transaction: %w", err)
 	}
-	return nil
+	return true, nil
 }

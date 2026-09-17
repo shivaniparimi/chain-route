@@ -303,6 +303,50 @@ func TestDriveExecutionForward_AmbiguousBroadcastFoundOnChainNeverResends(t *tes
 	}
 }
 
+// TestDriveExecutionForward_ResumedAlreadyBroadcastTxDoesNotDoubleCountBroadcasts
+// guards the code-review finding that Broadcasts{provider} could be
+// double-incremented for a single physical broadcast: signAndBroadcastFresh
+// increments Broadcasts right after a genuine SendTransaction succeeds, but
+// if the subsequent MarkExecutionBroadcast DB write then fails (a transient
+// DB error, independent of the chain RPC succeeding), broadcast_at never
+// gets persisted even though the tx is already on chain. The reconciler
+// later resumes this row via DriveExecutionForward's already-signed branch,
+// whose broadcastWithRecovery call finds the tx already on chain (via
+// TransactionByHash) and correctly returns without resending -- but must NOT
+// count that as a second broadcast. This test simulates exactly that
+// resumed state directly (an already-signed exec whose tx TransactionByHash
+// reports as already on chain) and asserts Broadcasts{across} stays at 0
+// after DriveExecutionForward runs, even though the call succeeds and marks
+// the execution broadcast/submitted.
+func TestDriveExecutionForward_ResumedAlreadyBroadcastTxDoesNotDoubleCountBroadcasts(t *testing.T) {
+	hash := "0xabcd000000000000000000000000000000000000000000000000000000000000"[:66]
+	store := &fakeExecutorStore{}
+	ethClient := &fakeExecutorEthClient{txByHashFound: true} // simulates the resumed-crash-recovery scenario: already on chain
+	e := newTestExecutor(t, store, ethClient)
+	metrics := observability.NewMetrics()
+	e.Metrics = metrics
+
+	exec := payment.Execution{
+		ID: "exec-resumed-already-broadcast", PaymentID: "pay-resumed-already-broadcast", Nonce: 1,
+		BridgeProvider: "across", SignedTxHash: &hash, RawSignedTx: []byte{0xde, 0xad},
+	}
+	if err := e.DriveExecutionForward(context.Background(), exec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ethClient.sendCalled {
+		t.Fatal("must never rebroadcast when the hash is already found on-chain")
+	}
+	if !store.broadcastCalled {
+		t.Fatal("expected MarkExecutionBroadcast even on the found-on-chain path -- it is now confirmed broadcast, whoever sent it")
+	}
+	if !store.submittedCalled {
+		t.Fatal("expected MarkSubmitted to be called")
+	}
+	if got := testutil.ToFloat64(metrics.Broadcasts.WithLabelValues("across")); got != 0 {
+		t.Errorf("Broadcasts{across} = %v, want 0 -- the idempotent already-on-chain short-circuit must never increment Broadcasts, only a genuine new SendTransaction may", got)
+	}
+}
+
 // TestDriveExecutionForward_TransientLookupErrorPropagatesWithoutResend
 // guards the fix for the code-review finding that broadcastWithRecovery
 // was treating ANY TransactionByHash error as "not found." Only
