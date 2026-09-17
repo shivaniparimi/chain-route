@@ -216,7 +216,7 @@ func main() {
 	if executor != nil {
 		processorExecutor = executor
 	}
-	processor := &worker.Processor{Store: store, Executor: processorExecutor, TestnetTimeout: testnetHandleTimeout}
+	processor := &worker.Processor{Store: store, Executor: processorExecutor, TestnetTimeout: testnetHandleTimeout, Metrics: metrics, Logger: logger}
 
 	// Kafka is deliberately NOT blocking-or-die here: a transiently
 	// unreachable broker at startup is tolerated, since kafka-go's writer
@@ -233,8 +233,10 @@ func main() {
 		Publish: func(ctx context.Context, key string, value []byte) error {
 			return producer.Publish(ctx, key, value)
 		},
+		Metrics: metrics,
+		Logger:  logger,
 	}
-	recovery := &worker.Recovery{Store: store, Staleness: recoveryStaleness}
+	recovery := &worker.Recovery{Store: store, Staleness: recoveryStaleness, Metrics: metrics, Logger: logger}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

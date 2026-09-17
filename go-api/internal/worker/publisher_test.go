@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/postgres"
 )
 
@@ -75,5 +78,18 @@ func TestPollOnce_PublishErrorPropagates(t *testing.T) {
 	}
 	if _, err := p.PollOnce(context.Background()); err == nil {
 		t.Fatal("expected an error to propagate from a failing publish")
+	}
+}
+
+func TestPublisher_PollOnce_IncrementsEventsPublished(t *testing.T) {
+	metrics := observability.NewMetrics()
+	store := &fakeOutboxStore{publishResult: true}
+	p := &Publisher{Store: store, Publish: func(context.Context, string, []byte) error { return nil }, Metrics: metrics}
+
+	if _, err := p.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.EventsPublished); got != 1 {
+		t.Errorf("EventsPublished = %v, want 1", got)
 	}
 }
