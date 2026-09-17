@@ -61,10 +61,8 @@ std::string RouteMetrics::PrometheusText() const {
 
     out << "# HELP chainroute_router_duration_seconds FindRoute latency.\n";
     out << "# TYPE chainroute_router_duration_seconds histogram\n";
-    uint64_t cumulative = 0;
     for (int i = 0; i < kLatencyBucketCount; ++i) {
-        cumulative += latency_bucket_counts_[i].load();
-        out << "chainroute_router_duration_seconds_bucket{le=\"" << kLatencyBucketsSeconds[i] << "\"} " << cumulative << "\n";
+        out << "chainroute_router_duration_seconds_bucket{le=\"" << kLatencyBucketsSeconds[i] << "\"} " << latency_bucket_counts_[i].load() << "\n";
     }
     out << "chainroute_router_duration_seconds_bucket{le=\"+Inf\"} " << latency_count_.load() << "\n";
     out << "chainroute_router_duration_seconds_sum " << latency_sum_.load() << "\n";
@@ -72,10 +70,8 @@ std::string RouteMetrics::PrometheusText() const {
 
     out << "# HELP chainroute_router_candidate_edges Candidate edge count per request.\n";
     out << "# TYPE chainroute_router_candidate_edges histogram\n";
-    uint64_t edgeCumulative = 0;
     for (int i = 0; i < kEdgeBucketCount; ++i) {
-        edgeCumulative += edge_bucket_counts_[i].load();
-        out << "chainroute_router_candidate_edges_bucket{le=\"" << kEdgeBuckets[i] << "\"} " << edgeCumulative << "\n";
+        out << "chainroute_router_candidate_edges_bucket{le=\"" << kEdgeBuckets[i] << "\"} " << edge_bucket_counts_[i].load() << "\n";
     }
     out << "chainroute_router_candidate_edges_bucket{le=\"+Inf\"} " << edge_count_.load() << "\n";
     out << "chainroute_router_candidate_edges_sum " << edge_sum_.load() << "\n";
