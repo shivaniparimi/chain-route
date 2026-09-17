@@ -798,3 +798,76 @@ func TestPostPayments_QuoteProviderFailure_RecordsFailureMetricWithBoundedReason
 		t.Errorf("QuoteFailures{across,http_error} = %v, want 1", got)
 	}
 }
+
+// TestPostPayments_MetricsAndLoggerLeftNil_DoesNotPanic proves the
+// nil-safe accessor pattern (established before Task 6) actually holds: a
+// Handler literal that leaves Metrics/Logger unset -- exactly like every
+// pre-Phase-10 test in this file -- must not panic.
+//
+// Unlike the task brief's literal snippet (which used a bare &fakeClient{},
+// whose nil response makes the handler correctly return 422 "no route
+// found" -- not a bug, just a fixture mismatch), this uses the same
+// route-found fixture as TestPostPayments_SuccessfulCreation so the
+// request actually reaches the Metrics/Logger-touching code paths that
+// are the point of this test.
+func TestPostPayments_MetricsAndLoggerLeftNil_DoesNotPanic(t *testing.T) {
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{
+		RouteFound: true, TotalFee: 1.0,
+		Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "Hop#1", Fee: 1.0}},
+	}}
+	store := &fakePaymentStore{
+		createOutcome: payment.Created,
+		createResult: payment.Payment{
+			ID: "nil-metrics-logger-id", Status: payment.StatusRouted, ExecutionMode: payment.ExecutionModeSimulated,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+	}
+	h := &Handler{Client: fakeRoute, Store: store}
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"usdc","amount":"100"}`))
+	req.Header.Set("Idempotency-Key", t.Name())
+	w := httptest.NewRecorder()
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("PostPayments panicked with Metrics/Logger left nil: %v", r)
+		}
+	}()
+	h.PostPayments(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPostPayments_SimulatedMode_CompletesSuccessfullyWithUnreachableTracingBackend
+// proves tracing failure cannot block or fail payment creation --
+// engineering constraint: "instrumentation must not become a correctness
+// dependency."
+func TestPostPayments_SimulatedMode_CompletesSuccessfullyWithUnreachableTracingBackend(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "10.255.255.1:4317")
+	shutdown, err := observability.InitTracing(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("InitTracing: %v", err)
+	}
+	defer shutdown(context.Background())
+
+	h, _ := newTestHandlerWithMetrics(t)
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"usdc","amount":"100"}`))
+	req.Header.Set("Idempotency-Key", t.Name())
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.PostPayments(w, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PostPayments did not return within 5s -- tracing to an unreachable endpoint may be blocking the request")
+	}
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body: %s", w.Code, w.Body.String())
+	}
+}
