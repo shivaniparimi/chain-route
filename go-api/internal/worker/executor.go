@@ -5,18 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"time"
 
 	gethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"go.opentelemetry.io/otel/attribute"
 
 	"chainroute/go-api/internal/bridge/across"
 	"chainroute/go-api/internal/bridge/quote"
 	"chainroute/go-api/internal/evm"
 	"chainroute/go-api/internal/money"
+	"chainroute/go-api/internal/observability"
 	"chainroute/go-api/internal/payment"
 	"chainroute/go-api/internal/postgres"
 )
@@ -60,6 +62,30 @@ type Executor struct {
 	OriginChainID              int64
 	DestChainID                int64
 	MaxAmountWei               *big.Int
+	Metrics                    *observability.Metrics
+	Logger                     *slog.Logger
+}
+
+// metrics returns e.Metrics, or a shared safe-to-record-into default when
+// it is nil -- e.g. for an existing test's struct literal that predates
+// this phase and never sets the field. Every instrumentation call in this
+// file must go through this accessor, never through e.Metrics directly,
+// so that a nil Metrics field can never nil-pointer-panic.
+func (e *Executor) metrics() *observability.Metrics {
+	if e.Metrics != nil {
+		return e.Metrics
+	}
+	return observability.DefaultMetrics()
+}
+
+// logger mirrors metrics: it returns e.Logger, or a shared default when
+// nil. Every log call in this file must go through this accessor, never
+// through e.Logger directly.
+func (e *Executor) logger() *slog.Logger {
+	if e.Logger != nil {
+		return e.Logger
+	}
+	return observability.DefaultLogger()
 }
 
 // ExecuteTestnetPayment runs the expiry/provider-lookup/fresh-quote/
@@ -74,6 +100,11 @@ type Executor struct {
 // some other actor -- the reconciler, on a concurrent tick -- already owns
 // this payment's execution.
 func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) error {
+	ctx, span := observability.Tracer("execution").Start(ctx, "execution.run")
+	defer span.End()
+	span.SetAttributes(attribute.String("payment.id", paymentID))
+	start := time.Now()
+
 	quoteRow, found, err := e.Store.GetQuoteByPaymentID(ctx, paymentID)
 	if err != nil {
 		return fmt.Errorf("get quote for payment %s: %w", paymentID, err)
@@ -81,8 +112,11 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	if !found {
 		return fmt.Errorf("payment %s has no payment_quotes row -- cannot execute without a selected route", paymentID)
 	}
+	providerLabel := observability.SanitizeProviderLabel(quoteRow.Provider)
+	span.SetAttributes(attribute.String("payment.provider", providerLabel))
 
 	if time.Now().After(quoteRow.ExpiresAt) {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "quote_expired").Inc()
 		if _, err := e.Store.MarkProcessingFailed(ctx, paymentID, "routing_quote_expired"); err != nil {
 			return fmt.Errorf("mark payment %s failed (routing_quote_expired): %w", paymentID, err)
 		}
@@ -114,6 +148,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 		return fmt.Errorf("fetch fresh quote for payment %s: %w", paymentID, err)
 	}
 	if !freshQuote.Available {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "route_unavailable").Inc()
 		if _, err := e.Store.MarkProcessingFailed(ctx, paymentID, "route_unavailable"); err != nil {
 			return fmt.Errorf("mark payment %s failed (route no longer available): %w", paymentID, err)
 		}
@@ -121,6 +156,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	}
 
 	if exceedsSlippageTolerance(quoteRow.FeeAmount, freshQuote.FeeBaseUnits, e.MaxFeeSlippageBps) {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "slippage_exceeded").Inc()
 		if _, err := e.Store.MarkProcessingFailed(ctx, paymentID, "fee_slippage_exceeded"); err != nil {
 			return fmt.Errorf("mark payment %s failed (fee_slippage_exceeded): %w", paymentID, err)
 		}
@@ -128,6 +164,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	}
 
 	if e.MaxAmountWei != nil && inputAmount.Cmp(e.MaxAmountWei) > 0 {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "amount_exceeds_guardrail").Inc()
 		if _, err := e.Store.MarkProcessingFailed(ctx, paymentID, "amount_exceeds_guardrail"); err != nil {
 			return fmt.Errorf("mark payment %s failed (amount_exceeds_guardrail): %w", paymentID, err)
 		}
@@ -148,6 +185,7 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 	// is allocated.
 	envelope, err := e.buildValidatedEnvelope(ctx, paymentID, quoteRow, freshQuote)
 	if err != nil {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "envelope_invalid").Inc()
 		return err
 	}
 
@@ -159,9 +197,18 @@ func (e *Executor) ExecuteTestnetPayment(ctx context.Context, paymentID string) 
 		return fmt.Errorf("try create execution for payment %s: %w", paymentID, err)
 	}
 	if !created {
+		// Some other actor already won the race for this payment's
+		// execution row -- a nonce was never allocated by THIS call, so
+		// this never counts as an attempt (design spec §15).
 		return nil
 	}
-	return e.signAndBroadcastFresh(ctx, exec, envelope, freshQuote)
+	e.metrics().ExecutionAttempts.WithLabelValues(providerLabel).Inc()
+	err = e.signAndBroadcastFresh(ctx, exec, envelope, freshQuote, providerLabel)
+	e.metrics().ExecutionDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
+	if err != nil {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "broadcast_error").Inc()
+	}
+	return err
 }
 
 // exceedsSlippageTolerance reports whether freshFee exceeds baselineFee
@@ -217,19 +264,30 @@ func exceedsSlippageTolerance(baselineFeeDecimal string, freshFee *big.Int, tole
 // payment must still never be signed and broadcast against a stale or
 // now-unfavorable quote.
 func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execution) error {
+	ctx, span := observability.Tracer("execution").Start(ctx, "execution.run")
+	defer span.End()
+	span.SetAttributes(attribute.String("payment.id", exec.PaymentID))
+	providerLabel := observability.SanitizeProviderLabel(exec.BridgeProvider)
+	span.SetAttributes(attribute.String("payment.provider", providerLabel))
+	start := time.Now()
+
 	if exec.SignedTxHash != nil {
 		// Already signed (crash point C/D/E/F) -- go straight to broadcast
 		// recovery using the persisted bytes, never re-quote or re-check
 		// expiry/slippage for an already-signed row (design doc §8 concern
 		// 2's protocol-freshness argument only applies BEFORE signing; once
 		// signed, re-deriving anything risks a second distinct transaction).
-		if err := e.broadcastWithRecovery(ctx, exec); err != nil {
+		err := e.broadcastWithRecovery(ctx, exec)
+		e.metrics().ExecutionDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
+		if err != nil {
+			e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "broadcast_error").Inc()
 			return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
 		}
+		e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
 		if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
 			return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)
 		}
-		_, err := e.Store.MarkSubmitted(ctx, exec.PaymentID)
+		_, err = e.Store.MarkSubmitted(ctx, exec.PaymentID)
 		return err
 	}
 
@@ -241,6 +299,7 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 		return fmt.Errorf("payment %s has no payment_quotes row -- cannot resume execution without a selected route", exec.PaymentID)
 	}
 	if time.Now().After(quoteRow.ExpiresAt) {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "quote_expired").Inc()
 		if _, err := e.Store.MarkProcessingFailed(ctx, exec.PaymentID, "routing_quote_expired"); err != nil {
 			return fmt.Errorf("mark payment %s failed (routing_quote_expired): %w", exec.PaymentID, err)
 		}
@@ -279,11 +338,14 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 		// but doing so would misrepresent a stuck-nonce situation as a
 		// cleanly-failed one with no lingering state. Log loudly instead;
 		// resolving the underlying nonce is a manual operator action.
-		log.Printf("WARNING: execution %s (payment %s, nonce %d) resumed with an already-allocated nonce but the fresh quote is unavailable or exceeds slippage tolerance -- this nonce cannot proceed and will keep blocking higher nonces on wallet %s until an operator intervenes", exec.ID, exec.PaymentID, exec.Nonce, exec.WalletAddress)
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "slippage_exceeded").Inc()
+		e.logger().WarnContext(ctx, "execution resumed with an already-allocated nonce but the fresh quote is unavailable or exceeds slippage tolerance -- this nonce cannot proceed until an operator intervenes",
+			"execution_id", exec.ID, "payment_id", exec.PaymentID, "nonce", exec.Nonce, "wallet_address", exec.WalletAddress)
 		return nil
 	}
 
 	if e.MaxAmountWei != nil && inputAmount.Cmp(e.MaxAmountWei) > 0 {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "amount_exceeds_guardrail").Inc()
 		if _, err := e.Store.MarkProcessingFailed(ctx, exec.PaymentID, "amount_exceeds_guardrail"); err != nil {
 			return fmt.Errorf("mark payment %s failed (amount_exceeds_guardrail): %w", exec.PaymentID, err)
 		}
@@ -292,9 +354,15 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 
 	envelope, err := e.buildValidatedEnvelope(ctx, exec.ID, quoteRow, freshQuote)
 	if err != nil {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "envelope_invalid").Inc()
 		return err
 	}
-	return e.signAndBroadcastFresh(ctx, exec, envelope, freshQuote)
+	err = e.signAndBroadcastFresh(ctx, exec, envelope, freshQuote, providerLabel)
+	e.metrics().ExecutionDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
+	if err != nil {
+		e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "broadcast_error").Inc()
+	}
+	return err
 }
 
 // buildValidatedEnvelope looks up the Signer configured for
@@ -332,7 +400,11 @@ func (e *Executor) buildValidatedEnvelope(ctx context.Context, idForErrors strin
 // (e.OriginChainID, e.ExpectedContractByProvider,
 // freshQuote.InputAmountBaseUnits) -- has already run by the time this is
 // called, deliberately before nonce allocation for a fresh execution.
-func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, envelope quote.TxEnvelope, freshQuote quote.Quote) error {
+// providerLabel is the caller's already-sanitized provider label (design
+// doc §3's cardinality constraint) -- passed down rather than re-derived
+// from exec.BridgeProvider, since a caller's execution row may not have
+// BridgeProvider populated (e.g. a store fake in a test).
+func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execution, envelope quote.TxEnvelope, freshQuote quote.Quote, providerLabel string) error {
 	gasPrice, err := e.OriginClient.SuggestGasPrice(ctx)
 	if err != nil {
 		return fmt.Errorf("suggest gas price: %w", err)
@@ -343,7 +415,9 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 		gasLimit = fallbackGasLimit
 	}
 	unsignedTx := types.NewTx(&types.LegacyTx{Nonce: uint64(exec.Nonce), To: &envelope.To, Value: envelope.Value, Gas: gasLimit, GasPrice: gasPrice, Data: envelope.Data})
+	_, signSpan := observability.Tracer("execution").Start(ctx, "execution.sign")
 	signedTx, err := e.Wallet.SignTx(unsignedTx, big.NewInt(envelope.ChainID))
+	signSpan.End()
 	if err != nil {
 		return fmt.Errorf("sign tx for execution %s: %w", exec.ID, err)
 	}
@@ -360,9 +434,13 @@ func (e *Executor) signAndBroadcastFresh(ctx context.Context, exec payment.Execu
 	exec.SignedTxHash = &hash
 	exec.RawSignedTx = rawTx
 
-	if err := e.broadcastWithRecovery(ctx, exec); err != nil {
+	broadcastCtx, broadcastSpan := observability.Tracer("execution").Start(ctx, "execution.broadcast")
+	err = e.broadcastWithRecovery(broadcastCtx, exec)
+	broadcastSpan.End()
+	if err != nil {
 		return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
 	}
+	e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
 	if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
 		return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)
 	}

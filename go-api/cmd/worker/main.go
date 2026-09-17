@@ -199,6 +199,7 @@ func main() {
 			QuoteProviders: quoteProviders, Signers: signers, ExpectedContractByProvider: expectedContracts,
 			OriginChainID: 11155111, DestChainID: 84532,
 			MaxAmountWei: maxTestnetAmountWei, MaxFeeSlippageBps: maxFeeSlippageBps,
+			Metrics: metrics, Logger: logger,
 		}
 		reconciler = &worker.Reconciler{
 			Store: store, Executor: executor, OriginClient: sepoliaClient, StatusCheckers: statusCheckers,
