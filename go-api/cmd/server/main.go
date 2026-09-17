@@ -38,6 +38,14 @@ func main() {
 	if err != nil {
 		logger.Warn("tracing initialization failed, continuing without traces", "error", err)
 	}
+	if shutdownTracing == nil {
+		// Defensive only: InitTracing never actually returns a nil
+		// shutdown today (it fails open with a no-op shutdown func even
+		// on error), but nothing enforces that invariant across future
+		// edits, and the deferred call below would nil-panic if it ever
+		// did.
+		shutdownTracing = func(context.Context) error { return nil }
+	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -116,7 +124,13 @@ func main() {
 	mux.HandleFunc("GET /payments/{id}", h.GetPayment)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
-	instrumentedMux := otelhttp.NewHandler(mux, "http.server")
+	instrumentedMux := otelhttp.NewHandler(mux, "http.server", otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+		// Without this, every HTTP server span shares the literal name
+		// "http.server" regardless of route, making Jaeger's
+		// operation-name filter unable to distinguish POST /payments
+		// from GET /metrics or POST /routes.
+		return r.Method + " " + r.URL.Path
+	}))
 	server := &http.Server{Addr: *httpAddr, Handler: instrumentedMux}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

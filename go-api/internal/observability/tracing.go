@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -20,6 +21,21 @@ import (
 // "localhost:4317" (the OTel Collector's default OTLP/gRPC port).
 const otlpEndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
 
+// stripEndpointScheme strips a leading "http://" or "https://" from an
+// OTLP endpoint value. The OTel spec defines OTEL_EXPORTER_OTLP_ENDPOINT
+// as a full URL including scheme (e.g. "http://localhost:4317"), but
+// otlptracegrpc.WithEndpoint expects bare "host:port" -- passing a
+// scheme-prefixed value through unmodified causes silent, permanent
+// export failure (the gRPC dial target is malformed) for anyone who sets
+// the env var the spec-conformant way. Any other value (including one
+// with no scheme at all, the bare host:port form) passes through
+// unchanged.
+func stripEndpointScheme(endpoint string) string {
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	return endpoint
+}
+
 // InitTracing configures the global OTel TracerProvider to export via
 // OTLP/gRPC, with a short, non-blocking dial and export timeout so an
 // absent Collector degrades to "traces silently dropped," never to a
@@ -33,6 +49,7 @@ func InitTracing(ctx context.Context, serviceName string) (shutdown func(context
 	if endpoint == "" {
 		endpoint = "localhost:4317"
 	}
+	endpoint = stripEndpointScheme(endpoint)
 
 	client := otlptracegrpc.NewClient(
 		otlptracegrpc.WithEndpoint(endpoint),

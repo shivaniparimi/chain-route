@@ -25,6 +25,31 @@ func TestInitTracing_ReturnsWorkingShutdownEvenWithNoCollector(t *testing.T) {
 	}
 }
 
+// TestStripEndpointScheme guards M-1: OTEL_EXPORTER_OTLP_ENDPOINT is
+// spec'd as a full URL including scheme (e.g. "http://localhost:4317"),
+// but otlptracegrpc.WithEndpoint expects bare "host:port". Both the
+// spec-conformant form and the bare form must end up with the same
+// effective endpoint passed to the gRPC client.
+func TestStripEndpointScheme(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"bare host:port unchanged", "localhost:4317", "localhost:4317"},
+		{"http scheme stripped", "http://localhost:4317", "localhost:4317"},
+		{"https scheme stripped", "https://localhost:4317", "localhost:4317"},
+		{"http scheme with different host/port", "http://otel-collector:4317", "otel-collector:4317"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripEndpointScheme(tc.input); got != tc.want {
+				t.Errorf("stripEndpointScheme(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTracer_StartEndNeverPanics(t *testing.T) {
 	shutdown, err := InitTracing(context.Background(), "test-service")
 	if err != nil {

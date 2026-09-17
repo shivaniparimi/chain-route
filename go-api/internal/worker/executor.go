@@ -278,19 +278,22 @@ func (e *Executor) DriveExecutionForward(ctx context.Context, exec payment.Execu
 		// 2's protocol-freshness argument only applies BEFORE signing; once
 		// signed, re-deriving anything risks a second distinct transaction).
 		sent, err := e.broadcastWithRecovery(ctx, exec)
-		e.metrics().ExecutionDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
 		if err != nil {
 			e.metrics().ExecutionsFailed.WithLabelValues(providerLabel, "broadcast_error").Inc()
 			return fmt.Errorf("broadcast execution %s: %w", exec.ID, err)
 		}
 		if sent {
-			// Only increment when THIS call actually issued a new
+			// Only increment/observe when THIS call actually issued a new
 			// SendTransaction -- not on the idempotent "already on
 			// chain" short-circuit, which would otherwise double-count
 			// a broadcast that a crashed-and-resumed signAndBroadcastFresh
 			// already counted before its own MarkExecutionBroadcast
-			// write failed.
+			// write failed, AND would record a near-zero-duration sample
+			// for a resumed no-op that deflates the histogram's p50 with
+			// durations that reflect nothing but a stale-execution resume
+			// check, not an actual sign-through-broadcast.
 			e.metrics().Broadcasts.WithLabelValues(providerLabel).Inc()
+			e.metrics().ExecutionDuration.WithLabelValues(providerLabel).Observe(time.Since(start).Seconds())
 		}
 		if err := e.Store.MarkExecutionBroadcast(ctx, exec.ID); err != nil {
 			return fmt.Errorf("mark execution %s broadcast: %w", exec.ID, err)

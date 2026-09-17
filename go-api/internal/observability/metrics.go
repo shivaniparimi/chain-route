@@ -86,8 +86,21 @@ func NewMetrics() *Metrics {
 		PaymentsFailed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "chainroute_payments_failed_total", Help: "Total payments reaching FAILED.",
 		}, []string{"execution_mode", "failure_reason_class"}),
+		// NOTE: this gauge is Inc()'d in cmd/server (on payment.Created,
+		// i.e. when a payment is newly created/ROUTED -- BEFORE it is
+		// claimed into PROCESSING) and Dec()'d only in cmd/worker (once
+		// the payment reaches a terminal state). Those are two separate
+		// processes with two separate, isolated Prometheus registries, so
+		// neither process's own scraped series is individually
+		// meaningful: the server's series only ever climbs and the
+		// worker's series only ever falls. A query against this metric
+		// MUST sum across both scrape targets (e.g. `sum by
+		// (execution_mode) (chainroute_payments_processing)`) to recover
+		// the true in-flight count -- see README.md's metrics table and
+		// the "Payments Currently Processing" Grafana panel, which
+		// already does this.
 		PaymentsProcessing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "chainroute_payments_processing", Help: "Payments currently in PROCESSING.",
+			Name: "chainroute_payments_processing", Help: "Payments created but not yet in a terminal state (summed across server and worker processes).",
 		}, []string{"execution_mode"}),
 		PaymentDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "chainroute_payment_duration_seconds", Help: "Payment created-to-terminal wall time.",

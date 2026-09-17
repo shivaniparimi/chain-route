@@ -37,6 +37,14 @@ func main() {
 	if err != nil {
 		logger.Warn("tracing initialization failed, continuing without traces", "error", err)
 	}
+	if shutdownTracing == nil {
+		// Defensive only: InitTracing never actually returns a nil
+		// shutdown today (it fails open with a no-op shutdown func even
+		// on error), but nothing enforces that invariant across future
+		// edits, and the deferred call below would nil-panic if it ever
+		// did.
+		shutdownTracing = func(context.Context) error { return nil }
+	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()

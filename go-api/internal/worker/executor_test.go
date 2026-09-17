@@ -345,6 +345,9 @@ func TestDriveExecutionForward_ResumedAlreadyBroadcastTxDoesNotDoubleCountBroadc
 	if got := testutil.ToFloat64(metrics.Broadcasts.WithLabelValues("across")); got != 0 {
 		t.Errorf("Broadcasts{across} = %v, want 0 -- the idempotent already-on-chain short-circuit must never increment Broadcasts, only a genuine new SendTransaction may", got)
 	}
+	if got := testutil.CollectAndCount(metrics.ExecutionDuration); got != 0 {
+		t.Errorf("ExecutionDuration observations = %v, want 0 -- a resumed already-broadcast no-op must not record a near-zero-duration sample that deflates the histogram's p50, gated the same as Broadcasts above", got)
+	}
 }
 
 // TestDriveExecutionForward_TransientLookupErrorPropagatesWithoutResend
