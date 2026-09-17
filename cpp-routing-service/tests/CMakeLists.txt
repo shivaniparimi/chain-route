@@ -8,6 +8,7 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(chainroute_service_tests
     chain_asset_convert_test.cpp
+    metrics_test.cpp
     routing_service_test.cpp
 )
 target_link_libraries(chainroute_service_tests PRIVATE chainroute_service_lib GTest::gtest_main)

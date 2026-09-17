@@ -1,9 +1,17 @@
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <pthread.h>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -12,10 +20,80 @@
 
 #include "chainroute/sim/network_simulator.hpp"
 #include "chainroute_service/routing_service.hpp"
+#include "metrics.hpp"
 
 namespace {
 
 std::unique_ptr<grpc::Server> g_server;
+
+// RunMetricsListener serves a Prometheus /metrics endpoint over a raw TCP
+// socket -- deliberately not a general-purpose HTTP server. This endpoint
+// serves exactly one fixed body regardless of what's requested, so there is
+// no request parsing beyond discarding the incoming bytes (Phase 10 design
+// doc §4: avoid pulling in an HTTP library for a trivial fixed response).
+//
+// Shutdown: this loop polls the listening socket with a 1-second timeout
+// before calling accept(), so it wakes up periodically to check shouldStop
+// even when no client is connecting, letting the thread exit cleanly (and
+// be joined) instead of blocking forever.
+//
+// NOTE: an earlier version of this function relied on SO_RCVTIMEO to time
+// out accept() directly (as a naive reading of the BSD socket docs
+// suggests). That does NOT work: SO_RCVTIMEO governs recv()-family calls,
+// and POSIX does not guarantee it bounds accept()'s wait -- observed
+// directly here as accept() blocking forever on macOS with SO_RCVTIMEO set,
+// which left the listener thread unjoinable and hung the whole process at
+// shutdown. poll()+accept() is the portable way to get a timed wait on a
+// listening socket.
+void RunMetricsListener(const chainroute::RouteMetrics& metrics, int port, std::atomic<bool>& shouldStop) {
+    int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd < 0) {
+        return;
+    }
+    int opt = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(serverFd);
+        return;
+    }
+    listen(serverFd, 16);
+
+    while (!shouldStop.load()) {
+        pollfd pfd{};
+        pfd.fd = serverFd;
+        pfd.events = POLLIN;
+        const int pollResult = poll(&pfd, 1, /*timeout_ms=*/1000);
+        if (pollResult <= 0) {
+            continue;  // poll timeout or transient error -- loop and re-check shouldStop
+        }
+
+        sockaddr_in clientAddr{};
+        socklen_t clientLen = sizeof(clientAddr);
+        int clientFd = accept(serverFd, reinterpret_cast<sockaddr*>(&clientAddr), &clientLen);
+        if (clientFd < 0) {
+            continue;  // transient accept error (e.g. connection reset before accept) -- loop and re-check shouldStop
+        }
+        char buf[512];
+        recv(clientFd, buf, sizeof(buf), 0);  // discard the request line -- this endpoint serves exactly one fixed body
+
+        std::string body = metrics.PrometheusText();
+        std::ostringstream response;
+        response << "HTTP/1.1 200 OK\r\n"
+                  << "Content-Type: text/plain; version=0.0.4\r\n"
+                  << "Content-Length: " << body.size() << "\r\n"
+                  << "Connection: close\r\n\r\n"
+                  << body;
+        std::string responseStr = response.str();
+        send(clientFd, responseStr.data(), responseStr.size(), 0);
+        close(clientFd);
+    }
+    close(serverFd);
+}
 
 // NOTE: grpc::Server::Shutdown() must not be called from an async-signal
 // handler. It acquires internal (Abseil) mutexes, and if the interrupted
@@ -76,7 +154,15 @@ int main(int argc, char** argv) {
     }
 
     chainroute::sim::NetworkSimulator simulator(seed);
-    chainroute_service::RoutingServiceImpl service(simulator);
+    chainroute::RouteMetrics metrics;
+    chainroute_service::RoutingServiceImpl service(simulator, metrics);
+
+    int metricsPort = 9102;
+    if (const char* envPort = std::getenv("METRICS_PORT")) {
+        metricsPort = std::atoi(envPort);
+    }
+    std::atomic<bool> stopMetricsListener{false};
+    std::thread metricsThread(RunMetricsListener, std::cref(metrics), metricsPort, std::ref(stopMetricsListener));
 
     grpc::EnableDefaultHealthCheckService(true);
 
@@ -94,6 +180,8 @@ int main(int argc, char** argv) {
     g_server = builder.BuildAndStart();
     if (!g_server || selectedPort == 0) {
         std::cerr << "Failed to start server on " << listenAddress << "\n";
+        stopMetricsListener.store(true);
+        metricsThread.join();
         return 1;
     }
 
@@ -104,6 +192,10 @@ int main(int argc, char** argv) {
               << std::flush;
     g_server->Wait();
     signalThread.join();
+
+    stopMetricsListener.store(true);
+    metricsThread.join();
+
     std::cout << "chainroute_service_server shut down\n" << std::flush;
     return 0;
 }
