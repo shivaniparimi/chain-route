@@ -1,0 +1,48 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (must match a directory under infra/terraform/environments/)"
+        required: true
+        default: dev
+      confirm_apply:
+        description: "Type exactly 'yes' to actually apply -- any other value runs plan only"
+        required: true
+        default: "no"
+
+jobs:
+  plan-and-maybe-apply:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      # OIDC federation -- no long-lived AWS credentials stored as
+      # repository secrets. Requires an AWS IAM role trust policy for
+      # this repo's OIDC provider to be created out-of-band (not by this
+      # workflow) before this step can succeed against a real account.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: terraform init
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+        run: terraform init
+
+      - name: terraform plan
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply (gated)
+        if: inputs.confirm_apply == 'yes'
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+        run: terraform apply -auto-approve tfplan
