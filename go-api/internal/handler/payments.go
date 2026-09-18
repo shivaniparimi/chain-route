@@ -399,16 +399,19 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 		ExecutionMode: mode, BridgeProvider: bridgeProvider,
 	}
 	if mode == payment.ExecutionModeTestnet && len(hops) > 0 {
-		winningQuote := quotesByBridgeName[hops[0].BridgeName]
-		candidate.Quote = &payment.Quote{
-			Provider: winningQuote.ProviderName, OriginChainID: winningQuote.SourceChainID,
-			DestinationChainID: winningQuote.DestinationChainID, Asset: winningQuote.Asset,
-			InputAmount:          winningQuote.InputAmountBaseUnits.String(),
-			OutputAmount:         winningQuote.OutputAmountBaseUnits.String(),
-			FeeAmount:            winningQuote.FeeBaseUnits.String(),
-			EstimatedFillTimeSec: winningQuote.EstimatedFillTimeSec,
-			QuotedAt:             winningQuote.QuotedAt, ExpiresAt: winningQuote.ExpiresAt,
-			RawProviderPayload: winningQuote.RawProviderPayload,
+		winningBridgeName := hops[0].BridgeName
+		for bridgeName, q := range quotesByBridgeName {
+			candidate.Quotes = append(candidate.Quotes, payment.Quote{
+				Provider: q.ProviderName, OriginChainID: q.SourceChainID,
+				DestinationChainID: q.DestinationChainID, Asset: q.Asset,
+				InputAmount:          q.InputAmountBaseUnits.String(),
+				OutputAmount:         q.OutputAmountBaseUnits.String(),
+				FeeAmount:            q.FeeBaseUnits.String(),
+				EstimatedFillTimeSec: q.EstimatedFillTimeSec,
+				QuotedAt:             q.QuotedAt, ExpiresAt: q.ExpiresAt,
+				RawProviderPayload: q.RawProviderPayload,
+				Selected:           bridgeName == winningBridgeName,
+			})
 		}
 	}
 

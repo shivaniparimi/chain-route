@@ -66,6 +66,7 @@ type Quote struct {
 	QuotedAt             time.Time
 	ExpiresAt            time.Time
 	RawProviderPayload   json.RawMessage
+	Selected             bool // true for exactly one row per payment_id (migration 0007's partial unique index) -- the C++ router's winning hop
 	CreatedAt            time.Time
 }
 
@@ -82,10 +83,14 @@ type Payment struct {
 	ExecutionMode    ExecutionMode
 	BridgeProvider   *string
 	FailureReason    *string // populated only for the Phase 8 reasons: routing_quote_expired, fee_slippage_exceeded, route_unavailable, amount_exceeds_guardrail
-	Quote            *Quote  // set by the caller before CreateOrGetPayment for testnet-mode; nil for simulated
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	CompletedAt      *time.Time
+	// Quotes holds every quote fetched for a testnet-mode payment (winning
+	// and losing), exactly one of which has Selected=true -- the C++
+	// router's winning hop, persisted atomically with the payment. Empty
+	// for simulated-mode payments.
+	Quotes      []Quote
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	CompletedAt *time.Time
 }
 
 type Hop struct {

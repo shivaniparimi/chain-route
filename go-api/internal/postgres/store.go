@@ -253,8 +253,8 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 		}
 	}
 
-	if p.Quote != nil {
-		if err := insertPaymentQuote(ctx, tx, created.ID, p.Quote); err != nil {
+	if len(p.Quotes) > 0 {
+		if err := insertPaymentQuotes(ctx, tx, created.ID, p.Quotes); err != nil {
 			return payment.Payment{}, 0, err
 		}
 	}

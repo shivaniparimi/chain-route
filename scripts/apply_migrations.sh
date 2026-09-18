@@ -48,4 +48,8 @@ apply_if_missing \
 	"SELECT 1 FROM information_schema.columns WHERE table_name='payment_executions' AND column_name='provider_reference_id'" \
 	"$MIGRATIONS_DIR/0006_multi_provider_bridge_routing.sql"
 
+apply_if_missing \
+	"SELECT 1 FROM information_schema.columns WHERE table_name='payment_quotes' AND column_name='selected'" \
+	"$MIGRATIONS_DIR/0007_dashboard_payment_analytics.sql"
+
 echo "apply_migrations: all migrations up to date"

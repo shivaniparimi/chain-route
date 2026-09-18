@@ -534,11 +534,20 @@ func TestPostPayments_TestnetMode_CandidateEdgeBuiltFromLiveQuote(t *testing.T) 
 	if edge.GetLiquidity() != 0.001 {
 		t.Errorf("liquidity = %v, want 0.001 (the request amount, since Available=true)", edge.GetLiquidity())
 	}
-	if store.lastCreate.Quote == nil {
-		t.Fatal("expected the created payment to carry a Quote to persist")
+	if len(store.lastCreate.Quotes) == 0 {
+		t.Fatal("expected the created payment to carry Quotes to persist")
 	}
-	if store.lastCreate.Quote.Provider != "across" {
-		t.Errorf("persisted Quote.Provider = %q, want across", store.lastCreate.Quote.Provider)
+	var selected *payment.Quote
+	for i := range store.lastCreate.Quotes {
+		if store.lastCreate.Quotes[i].Selected {
+			selected = &store.lastCreate.Quotes[i]
+		}
+	}
+	if selected == nil {
+		t.Fatal("expected exactly one Quotes entry with Selected=true")
+	}
+	if selected.Provider != "across" {
+		t.Errorf("selected Quote.Provider = %q, want across", selected.Provider)
 	}
 }
 
@@ -777,6 +786,59 @@ func TestPostPayments_TestnetMode_RecordsQuoteMetricsWithBoundedProviderLabels(t
 	}
 	if got := testutil.ToFloat64(metrics.RoutingSelectedProvider.WithLabelValues("across")); got != 0 {
 		t.Errorf("RoutingSelectedProvider{across} = %v, want 0 (across did not win)", got)
+	}
+}
+
+// TestPostPayments_TestnetMode_PersistsBothWinningAndLosingQuotes proves
+// the handler now builds candidate.Quotes from every fetched provider
+// response (Task 1 of the payment-analytics-dashboard plan), not just the
+// C++-router-selected winner -- required so a later dashboard view can
+// honestly compare Across vs. Relay, including the quote that lost.
+func TestPostPayments_TestnetMode_PersistsBothWinningAndLosingQuotes(t *testing.T) {
+	registry := quote.NewRegistry()
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "across", quote: quote.Quote{
+		ProviderName: "across", Available: true,
+		FeeBaseUnits: big.NewInt(100), OutputAmountBaseUnits: big.NewInt(900), InputAmountBaseUnits: big.NewInt(1000),
+		RawProviderPayload: json.RawMessage(`{}`),
+	}})
+	registry.Register(testnetChainKey, &fakeQuoteProvider{name: "relay", quote: quote.Quote{
+		ProviderName: "relay", Available: true,
+		FeeBaseUnits: big.NewInt(50), OutputAmountBaseUnits: big.NewInt(950), InputAmountBaseUnits: big.NewInt(1000),
+		RawProviderPayload: json.RawMessage(`{}`),
+	}})
+
+	fakeRoute := &fakeClient{response: &routingv1.FindRouteResponse{
+		RouteFound: true, TotalFee: 0.0001,
+		Hops: []*routingv1.RouteHop{{FromChain: routingv1.Chain_CHAIN_ETHEREUM, ToChain: routingv1.Chain_CHAIN_BASE, BridgeName: "relay", Fee: 0.0001}},
+	}}
+	store := &fakePaymentStore{}
+	h := &Handler{Client: fakeRoute, Store: store, BlockchainEnv: "testnet", QuoteRegistry: registry}
+
+	rec := doPaymentRequest(h, "POST", "/payments", "both-quotes-persisted",
+		`{"source_chain":"ethereum","destination_chain":"base","asset":"eth","amount":"0.001","execution_mode":"testnet"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.lastCreate.Quotes) != 2 {
+		t.Fatalf("expected 2 persisted quotes (winning and losing), got %d: %+v", len(store.lastCreate.Quotes), store.lastCreate.Quotes)
+	}
+	var selectedCount int
+	var selectedProvider string
+	for _, q := range store.lastCreate.Quotes {
+		if q.Selected {
+			selectedCount++
+			selectedProvider = q.Provider
+		}
+	}
+	if selectedCount != 1 {
+		t.Fatalf("expected exactly 1 Quotes entry with Selected=true, got %d", selectedCount)
+	}
+	// Verify against the actual C++-router-selected winner (hops[0].BridgeName),
+	// not an assumption baked into the test (e.g. "the cheaper one" or "the first one").
+	wantWinner := fakeRoute.response.Hops[0].GetBridgeName()
+	if selectedProvider != wantWinner {
+		t.Errorf("selected provider = %q, want %q (hops[0].BridgeName)", selectedProvider, wantWinner)
 	}
 }
 

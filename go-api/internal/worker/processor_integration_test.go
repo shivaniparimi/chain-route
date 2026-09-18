@@ -91,6 +91,7 @@ func testnetQuoteFixture(provider string) (*payment.Quote, []payment.Hop) {
 		InputAmount: "1000000000000000", OutputAmount: "999900000000000", FeeAmount: "100000000000",
 		EstimatedFillTimeSec: 4, QuotedAt: now, ExpiresAt: now.Add(time.Minute),
 		RawProviderPayload: json.RawMessage(`{"requestId":"0xabc"}`),
+		Selected:           true,
 	}
 	return quote, hops
 }
@@ -149,7 +150,7 @@ func TestHandleRoutedPayment_ConcurrentDuplicateConsumers(t *testing.T) {
 			if tc.provider != "" {
 				p.BridgeProvider = &tc.provider
 				quote, hops := testnetQuoteFixture(tc.provider)
-				p.Quote = quote
+				p.Quotes = []payment.Quote{*quote}
 				p.Hops = hops
 				executor = &countingTestnetExecutor{}
 				proc.Executor = executor
