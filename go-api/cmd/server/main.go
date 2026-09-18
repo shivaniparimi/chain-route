@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -114,17 +115,24 @@ func main() {
 	store := postgres.New(db)
 
 	h := &handler.Handler{
-		Client: client, Store: store, BlockchainEnv: blockchainEnv,
+		Client: client, Store: store, DashboardStore: store, BlockchainEnv: blockchainEnv,
 		MaxTestnetAmountWei: maxTestnetAmountWei, QuoteRegistry: registry,
 		Metrics: metrics, Logger: logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /routes", h.PostRoutes)
 	mux.HandleFunc("POST /payments", h.PostPayments)
+	mux.HandleFunc("GET /payments", h.ListPayments)
 	mux.HandleFunc("GET /payments/{id}", h.GetPayment)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
-	instrumentedMux := otelhttp.NewHandler(mux, "http.server", otelhttp.WithSpanNameFormatter(spanNameFormatter))
+	// CORS wraps the whole mux (before otelhttp instrumentation) so its
+	// headers apply to every route, including /metrics. This API has no
+	// cookies/credentials, and the allowed-origin list is explicit and
+	// configured -- never "*".
+	corsOrigins := strings.Split(envOrDefaultServer("CHAINROUTE_CORS_ALLOWED_ORIGINS", "http://localhost:5173"), ",")
+	corsHandler := handler.CORS(corsOrigins, mux)
+	instrumentedMux := otelhttp.NewHandler(corsHandler, "http.server", otelhttp.WithSpanNameFormatter(spanNameFormatter))
 	server := &http.Server{Addr: *httpAddr, Handler: instrumentedMux}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

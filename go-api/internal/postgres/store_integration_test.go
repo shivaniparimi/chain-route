@@ -943,6 +943,208 @@ func TestClaimPayment_ReturnsExecutionMode(t *testing.T) {
 	}
 }
 
+// chainPaymentFor builds a payment.Payment on caller-supplied source/dest
+// chains (rather than the fixed ethereum/base of testPayment) so
+// ListPayments tests can scope their query to a SourceChain/DestinationChain
+// filter that no other test or pre-existing row in the shared database will
+// ever match, instead of relying on absolute timestamps to isolate rows.
+func chainPaymentFor(idempotencyKey, sourceChain, destChain string) payment.Payment {
+	p := testPayment(idempotencyKey)
+	p.SourceChain = sourceChain
+	p.DestinationChain = destChain
+	return p
+}
+
+func deleteByIdempotencyKeys(t *testing.T, s *Store, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup %s: %v", key, err)
+		}
+	}
+}
+
+func TestListPayments_PaginatesWithoutOverlapOrGap(t *testing.T) {
+	s := newTestStore(t)
+	const n = 5
+	src, dst := "zz-test-list-page-src", "zz-test-list-page-dst"
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = fmt.Sprintf("test-list-page-%d", i)
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	ids := make([]string, n)
+	base := time.Now().UTC()
+	for i := 0; i < n; i++ {
+		created, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(keys[i], src, dst))
+		if err != nil || outcome != payment.Created {
+			t.Fatalf("create %d: outcome=%v err=%v", i, outcome, err)
+		}
+		ids[i] = created.ID
+		// Backdate created_at to a distinct, deterministic value (ascending
+		// with i) so ORDER BY created_at DESC, id DESC gives a known order:
+		// ids[n-1] first, ids[0] last.
+		if _, err := s.db.ExecContext(context.Background(),
+			`UPDATE payments SET created_at = $2 WHERE id = $1`,
+			created.ID, base.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("backdate %d: %v", i, err)
+		}
+	}
+
+	wantOrder := []string{ids[4], ids[3], ids[2], ids[1], ids[0]}
+
+	var gotOrder []string
+	filter := payment.ListFilter{Limit: 2, SourceChain: &src, DestinationChain: &dst}
+	for page := 0; page < 10; page++ {
+		results, nextCursor, err := s.ListPayments(context.Background(), filter)
+		if err != nil {
+			t.Fatalf("page %d: ListPayments: %v", page, err)
+		}
+		for _, p := range results {
+			gotOrder = append(gotOrder, p.ID)
+		}
+		if nextCursor == "" {
+			break
+		}
+		filter.Cursor = nextCursor
+	}
+
+	if len(gotOrder) != n {
+		t.Fatalf("expected %d total rows across pages (no overlap/gap), got %d: %v", n, len(gotOrder), gotOrder)
+	}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("order mismatch at position %d: want %v, got %v", i, wantOrder, gotOrder)
+		}
+	}
+}
+
+func TestListPayments_FiltersByStatus(t *testing.T) {
+	s := newTestStore(t)
+	src, dst := "zz-test-list-status-src", "zz-test-list-status-dst"
+	routedKey, completedKey := "test-list-status-routed", "test-list-status-completed"
+	deleteByIdempotencyKeys(t, s, routedKey, completedKey)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, routedKey, completedKey) })
+
+	routed, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(routedKey, src, dst))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create routed: outcome=%v err=%v", outcome, err)
+	}
+	completed, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(completedKey, src, dst))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create completed: outcome=%v err=%v", outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), completed.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, _, err := s.CompletePayment(context.Background(), completed.ID, payment.StatusCompleted); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	status := string(payment.StatusCompleted)
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &src, DestinationChain: &dst, Status: &status,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != completed.ID {
+		t.Fatalf("expected exactly the completed payment %s, got %+v", completed.ID, results)
+	}
+	_ = routed
+}
+
+func TestListPayments_FiltersByProvider(t *testing.T) {
+	s := newTestStore(t)
+	src, dst := "zz-test-list-provider-src", "zz-test-list-provider-dst"
+	withProviderKey, withoutProviderKey := "test-list-provider-with", "test-list-provider-without"
+	deleteByIdempotencyKeys(t, s, withProviderKey, withoutProviderKey)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, withProviderKey, withoutProviderKey) })
+
+	withProvider := chainPaymentFor(withProviderKey, src, dst)
+	withProvider.ExecutionMode = payment.ExecutionModeTestnet
+	withProvider.BridgeProvider = strPtr("zz-test-provider")
+	created, outcome, err := s.CreateOrGetPayment(context.Background(), withProvider)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create with provider: outcome=%v err=%v", outcome, err)
+	}
+
+	without := chainPaymentFor(withoutProviderKey, src, dst)
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), without); err != nil || outcome != payment.Created {
+		t.Fatalf("create without provider: outcome=%v err=%v", outcome, err)
+	}
+
+	provider := "zz-test-provider"
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &src, DestinationChain: &dst, Provider: &provider,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != created.ID {
+		t.Fatalf("expected exactly the payment with provider %s, got %+v", created.ID, results)
+	}
+}
+
+func TestListPayments_FiltersBySourceAndDestinationChain(t *testing.T) {
+	s := newTestStore(t)
+	keyA, keyB := "test-list-chain-a", "test-list-chain-b"
+	srcA, dstA := "zz-test-list-chain-a-src", "zz-test-list-chain-a-dst"
+	srcB, dstB := "zz-test-list-chain-b-src", "zz-test-list-chain-b-dst"
+	deleteByIdempotencyKeys(t, s, keyA, keyB)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keyA, keyB) })
+
+	pA, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(keyA, srcA, dstA))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create A: outcome=%v err=%v", outcome, err)
+	}
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(keyB, srcB, dstB)); err != nil || outcome != payment.Created {
+		t.Fatalf("create B: outcome=%v err=%v", outcome, err)
+	}
+
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &srcA, DestinationChain: &dstA,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != pA.ID {
+		t.Fatalf("expected exactly payment A %s, got %+v", pA.ID, results)
+	}
+}
+
+func TestListPayments_FiltersByExecutionMode(t *testing.T) {
+	s := newTestStore(t)
+	src, dst := "zz-test-list-mode-src", "zz-test-list-mode-dst"
+	simulatedKey, testnetKey := "test-list-mode-simulated", "test-list-mode-testnet"
+	deleteByIdempotencyKeys(t, s, simulatedKey, testnetKey)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, simulatedKey, testnetKey) })
+
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(simulatedKey, src, dst)); err != nil || outcome != payment.Created {
+		t.Fatalf("create simulated: outcome=%v err=%v", outcome, err)
+	}
+	testnetPayment := chainPaymentFor(testnetKey, src, dst)
+	testnetPayment.ExecutionMode = payment.ExecutionModeTestnet
+	testnetCreated, outcome, err := s.CreateOrGetPayment(context.Background(), testnetPayment)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create testnet: outcome=%v err=%v", outcome, err)
+	}
+
+	mode := string(payment.ExecutionModeTestnet)
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &src, DestinationChain: &dst, ExecutionMode: &mode,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != testnetCreated.ID {
+		t.Fatalf("expected exactly the testnet payment %s, got %+v", testnetCreated.ID, results)
+	}
+}
+
 func TestStalePaymentIDs_ExcludesTestnetMode(t *testing.T) {
 	s := newTestStore(t)
 	key := "test-stale-excludes-testnet-key"

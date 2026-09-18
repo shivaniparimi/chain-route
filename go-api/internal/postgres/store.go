@@ -295,6 +295,105 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 	return created, payment.Created, nil
 }
 
+// ListPayments returns a page of payments (payment-level columns only, no
+// quotes/hops -- callers needing those use GetPayment for a single
+// payment), newest-first, matching every non-nil filter dimension, plus an
+// opaque cursor for the next page ("" when this is the last page). This is
+// a single query -- no per-row follow-up queries -- to avoid N+1 query
+// patterns on a list endpoint.
+//
+// The query text is built up dynamically to append zero or more optional
+// WHERE clauses, but every filter VALUE is passed as a $N placeholder
+// argument to QueryContext, never concatenated into the query text itself
+// -- nextArg only ever splices the placeholder's positional name ("$3")
+// into the SQL string, and the actual value goes into args, which
+// QueryContext binds out-of-band. This is standard parameterized-query
+// construction and is not vulnerable to SQL injection: there is no code
+// path here where a filter value (status, provider, chain name, cursor
+// component, ...) is formatted directly into query via fmt.Sprintf with a
+// %s that holds the value itself, only ones that hold "$N".
+func (s *Store) ListPayments(ctx context.Context, filter payment.ListFilter) ([]payment.Payment, string, error) {
+	ctx, span := observability.Tracer("db").Start(ctx, "db.ListPayments")
+	defer span.End()
+
+	query := `
+		SELECT id, source_chain, destination_chain, asset, amount::text, status,
+		       total_fee, execution_mode, bridge_provider, created_at
+		FROM payments
+		WHERE 1=1
+	`
+	args := []any{}
+	argN := 0
+	nextArg := func(v any) string {
+		argN++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", argN)
+	}
+
+	if filter.Cursor != "" {
+		createdAt, id, err := payment.DecodeCursor(filter.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		query += fmt.Sprintf(" AND (created_at, id) < (%s, %s)", nextArg(createdAt), nextArg(id))
+	}
+	if filter.Status != nil {
+		query += fmt.Sprintf(" AND status = %s", nextArg(*filter.Status))
+	}
+	if filter.Provider != nil {
+		query += fmt.Sprintf(" AND bridge_provider = %s", nextArg(*filter.Provider))
+	}
+	if filter.SourceChain != nil {
+		query += fmt.Sprintf(" AND source_chain = %s", nextArg(*filter.SourceChain))
+	}
+	if filter.DestinationChain != nil {
+		query += fmt.Sprintf(" AND destination_chain = %s", nextArg(*filter.DestinationChain))
+	}
+	if filter.ExecutionMode != nil {
+		query += fmt.Sprintf(" AND execution_mode = %s", nextArg(*filter.ExecutionMode))
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT %s", nextArg(limit+1))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("list payments: %w", err)
+	}
+	defer rows.Close()
+
+	var results []payment.Payment
+	for rows.Next() {
+		var p payment.Payment
+		var status, execMode string
+		var bridgeProvider sql.NullString
+		if err := rows.Scan(&p.ID, &p.SourceChain, &p.DestinationChain, &p.Asset, &p.Amount,
+			&status, &p.TotalFee, &execMode, &bridgeProvider, &p.CreatedAt); err != nil {
+			return nil, "", fmt.Errorf("scan payment row: %w", err)
+		}
+		p.Status = payment.Status(status)
+		p.ExecutionMode = payment.ExecutionMode(execMode)
+		if bridgeProvider.Valid {
+			p.BridgeProvider = &bridgeProvider.String
+		}
+		results = append(results, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	nextCursor := ""
+	if len(results) > limit {
+		last := results[limit-1]
+		nextCursor = payment.EncodeCursor(last.CreatedAt.UTC().Format(time.RFC3339Nano), last.ID)
+		results = results[:limit]
+	}
+	return results, nextCursor, nil
+}
+
 // ClaimPayment atomically transitions a payment from ROUTED to PROCESSING,
 // returning its execution_mode in the same round trip. claimed=false means
 // the payment was not ROUTED (already claimed by another delivery, or in

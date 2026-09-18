@@ -126,6 +126,19 @@ type Execution struct {
 	UpdatedAt           time.Time
 }
 
+// ListFilter narrows a ListPayments query. All fields are optional
+// (nil/zero means "no filter on this dimension"); Limit and Cursor
+// govern keyset pagination.
+type ListFilter struct {
+	Limit            int
+	Cursor           string
+	Status           *string
+	Provider         *string
+	SourceChain      *string
+	DestinationChain *string
+	ExecutionMode    *string
+}
+
 // CreateResult reports what Store.CreateOrGetPayment actually did.
 type CreateResult int
 

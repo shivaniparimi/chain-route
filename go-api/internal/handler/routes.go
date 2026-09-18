@@ -23,6 +23,7 @@ type RoutingClient interface {
 type Handler struct {
 	Client              RoutingClient
 	Store               PaymentStore
+	DashboardStore      DashboardStore  // wired by main.go; a nil value here is a wiring bug and must panic loudly, not fail silently
 	BlockchainEnv       string          // "testnet" enables execution_mode="testnet" requests; anything else (including "") rejects them
 	MaxTestnetAmountWei *big.Int        // nil means no ceiling is enforced (only safe when BlockchainEnv != "testnet")
 	QuoteRegistry       *quote.Registry // nil when BlockchainEnv != "testnet"; never consulted otherwise
