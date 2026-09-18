@@ -1289,4 +1289,20 @@ func TestGetDashboardStats_CountsAndProviderUsageAreExact(t *testing.T) {
 		t.Fatalf("expected provider %s usage to increase by 1, got %d (before=%d after=%d)",
 			providerB, got, before.ProviderUsage[providerB], after.ProviderUsage[providerB])
 	}
+
+	// AverageRoutingCost is a table-wide AVG(total_fee), so it can't be
+	// delta-checked directly -- but AVG * COUNT recovers the pre-existing
+	// fee sum, letting us predict the exact post-seed average in closed
+	// form: every testPayment() seeded above has a fixed TotalFee of 1.5,
+	// so the new sum is simply the recovered pre-existing sum plus 5*1.5.
+	// This verifies the actual COALESCE(AVG(total_fee), 0) SQL against
+	// real seeded rows, rather than only checking counts around it.
+	const seededFee = 1.5
+	const seededCount = 5
+	beforeSum := before.AverageRoutingCost * float64(before.TotalPayments)
+	wantAvg := (beforeSum + seededCount*seededFee) / float64(before.TotalPayments+seededCount)
+	if diff := after.AverageRoutingCost - wantAvg; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("expected average_routing_cost to be %v (recovered pre-existing sum %v + %d*%v over %d rows), got %v",
+			wantAvg, beforeSum, seededCount, seededFee, before.TotalPayments+seededCount, after.AverageRoutingCost)
+	}
 }
