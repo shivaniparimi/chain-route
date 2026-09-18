@@ -601,13 +601,18 @@ Application Load Balancer (public subnets, alb security group)
 go-server (private subnets, app security group)
   |
   |-- gRPC :50051 -->  cpp-router      (private subnets, internal security group)
-  |-- SQL   :5432 -->  RDS Postgres     (private subnets, data security group)
-  `-- Kafka :9092 -->  Redpanda         (private subnets, internal security group)
+  `-- SQL   :5432 -->  RDS Postgres     (private subnets, data security group)
                           ^
-                          | consumes routed-payment events
+                          | outbox poller reads the payment + outbox_events row
+                          | written above, in the same DB transaction
                         go-worker      (private subnets, internal security group)
                           |
-                          `-- SQL :5432 --> RDS Postgres (same instance as above)
+                          |-- SQL   :5432 -->  RDS Postgres (same instance as above; reconciliation writes)
+                          `-- Kafka :9092 <->  Redpanda      (private subnets, internal security group;
+                                                              go-worker's own outbox-poller goroutine
+                                                              publishes the routed-payment event here, and
+                                                              its own consume-loop goroutine -- same
+                                                              process -- consumes it back)
 
 go-server / go-worker / cpp-router
   |
@@ -682,12 +687,18 @@ particular, the CMake Protobuf CONFIG/MODULE-mode fallback added to
 Docker build and a real Ubuntu CI runner, whose `libprotobuf-dev` package
 ships no CMake CONFIG-mode files, can still configure successfully) was
 verified only against this macOS/Homebrew machine, the one platform
-reachable in this environment — a full clean rebuild passed `ctest` at
-78/78 (`cpp-routing-service`) and 49/49 (`router`), identical to the
-pre-change baseline, confirming no regression on that platform. Whether
-the Module-mode fallback actually succeeds against Debian/Ubuntu's real
-`libprotobuf-dev` package remains unverified until this workflow genuinely
-runs on a real Ubuntu GitHub Actions runner.
+reachable in this environment. Task 10's own full clean rebuild of
+`cpp-routing-service` passed `ctest` at 78/78, identical to its pre-change
+baseline, confirming no regression on that platform for the CONFIG-mode
+path; Task 10's verification of `router` itself was configure-time only
+(grepping the configure log for FetchContent/network activity, not an
+actual `ctest` run), so it produced no comparable pass count. Re-running
+`router`'s own test suite live while finalizing this documentation task
+(`cmake --build router/build -j && ctest --test-dir router/build`)
+confirmed 49/49 passing today, matching the project's established
+baseline. Whether the Module-mode fallback actually succeeds against
+Debian/Ubuntu's real `libprotobuf-dev` package remains unverified until
+this workflow genuinely runs on a real Ubuntu GitHub Actions runner.
 
 ## Environment variables
 
