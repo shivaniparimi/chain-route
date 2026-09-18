@@ -127,9 +127,9 @@ resource "aws_security_group" "app" {
 resource "aws_security_group" "internal" {
   name_prefix = "${var.environment}-chainroute-internal-"
   vpc_id      = aws_vpc.main.id
-  description = "Shared SG for cpp-router, redpanda, observability, and any service-to-service traffic -- ingress rules are added per-consumer by later modules via aws_security_group_rule, not baked in here, to avoid a monolithic SG with rules for every port up front."
+  description = "Shared SG for cpp-router, redpanda, and observability -- ingress: a self-referencing all-TCP rule for intra-SG traffic, plus per-consumer rules from the app-tier SG for cpp-router gRPC and OTLP export."
   ingress {
-    description = "Self-referencing: allows all TCP traffic between services that share this security group (e.g. go-worker -> Redpanda, future observability scraping) -- proportionate for a single shared internal-tier SG rather than enumerating every port pair"
+    description = "Self-referencing: allows all TCP traffic between services that share this security group (e.g. go-worker to Redpanda, observability scraping) -- proportionate for a single shared internal-tier SG rather than enumerating every port pair"
     from_port   = 0
     to_port     = 65535
     protocol    = "tcp"
@@ -139,6 +139,13 @@ resource "aws_security_group" "internal" {
     description     = "cpp-router gRPC (50051) from the app-tier SG (go-server)"
     from_port       = 50051
     to_port         = 50051
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+  ingress {
+    description     = "OTel Collector OTLP/gRPC (4317) from the app-tier SG (go-server) -- go-worker already reaches it via the self-referencing rule above, since both are in this SG"
+    from_port       = 4317
+    to_port         = 4317
     protocol        = "tcp"
     security_groups = [aws_security_group.app.id]
   }
