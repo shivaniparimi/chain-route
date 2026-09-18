@@ -78,3 +78,9 @@ variable "target_group_arn" {
   type        = string
   default     = null
 }
+
+variable "command" {
+  description = "Optional container command override (equivalent to Docker's CMD override). Null means use the image's own default ENTRYPOINT/CMD."
+  type        = list(string)
+  default     = null
+}

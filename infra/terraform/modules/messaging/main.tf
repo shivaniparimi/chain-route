@@ -23,4 +23,17 @@ module "redpanda_service" {
   execution_role_arn             = var.execution_role_arn
   task_role_arn                  = var.task_role_arn
   service_discovery_namespace_id = var.service_discovery_namespace_id
+  # Same tuning flags as the local Docker Compose redpanda service, except
+  # --advertise-kafka-addr uses Redpanda's own Cloud Map DNS name instead
+  # of Compose's service name, matching outputs.tf's bootstrap_endpoint.
+  command = [
+    "redpanda", "start",
+    "--smp=1",
+    "--memory=512M",
+    "--overprovisioned",
+    "--node-id=0",
+    "--check=false",
+    "--kafka-addr=PLAINTEXT://0.0.0.0:9092",
+    "--advertise-kafka-addr=PLAINTEXT://redpanda.chainroute.local:9092",
+  ]
 }

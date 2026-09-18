@@ -46,6 +46,23 @@ module "database" {
   instance_class         = var.db_instance_class
 }
 
+# The task definition's `secrets` block requires the execution role to be
+# able to read those specific secrets (separate from
+# AmazonECSTaskExecutionRolePolicy, which only covers ECR pull + logs) --
+# without this, ECS cannot launch any task that references a secret.
+resource "aws_iam_role_policy" "ecs_execution_secrets" {
+  name_prefix = "${var.environment}-chainroute-secrets-"
+  role        = aws_iam_role.ecs_execution.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = [module.database.secret_arn, module.database.connection_url_secret_arn]
+    }]
+  })
+}
+
 module "messaging" {
   source                         = "../../modules/messaging"
   environment                    = var.environment
@@ -125,10 +142,10 @@ module "go_server_service" {
   subnet_ids         = module.networking.private_subnet_ids
   security_group_ids = [module.networking.app_security_group_id]
   environment_variables = {
-    DATABASE_URL                = "postgres://chainroute@${module.database.endpoint}/chainroute?sslmode=require"
     OTEL_EXPORTER_OTLP_ENDPOINT = "otel-collector.chainroute.local:4317"
   }
-  secrets            = { DATABASE_PASSWORD = "${module.database.secret_arn}:password::" }
+  secrets            = { DATABASE_URL = module.database.connection_url_secret_arn }
+  command            = ["--http-addr=:8080", "--grpc-addr=cpp-router.chainroute.local:50051"]
   log_group_name     = aws_cloudwatch_log_group.chainroute.name
   execution_role_arn = aws_iam_role.ecs_execution.arn
   task_role_arn      = aws_iam_role.ecs_task.arn
@@ -146,11 +163,10 @@ module "go_worker_service" {
   subnet_ids         = module.networking.private_subnet_ids
   security_group_ids = [module.networking.internal_security_group_id]
   environment_variables = {
-    DATABASE_URL                = "postgres://chainroute@${module.database.endpoint}/chainroute?sslmode=require"
     KAFKA_BOOTSTRAP_SERVERS     = module.messaging.bootstrap_endpoint
     OTEL_EXPORTER_OTLP_ENDPOINT = "otel-collector.chainroute.local:4317"
   }
-  secrets            = { DATABASE_PASSWORD = "${module.database.secret_arn}:password::" }
+  secrets            = { DATABASE_URL = module.database.connection_url_secret_arn }
   log_group_name     = aws_cloudwatch_log_group.chainroute.name
   execution_role_arn = aws_iam_role.ecs_execution.arn
   task_role_arn      = aws_iam_role.ecs_task.arn

@@ -36,3 +36,16 @@ resource "aws_db_instance" "main" {
   skip_final_snapshot     = var.environment != "prod"
   tags                    = { Name = "${var.environment}-chainroute-postgres" }
 }
+
+# Full connection string (including the password), stored as its own
+# secret so the Go application -- which only reads a single DATABASE_URL
+# env var, not a separate password var -- can consume it directly via the
+# ECS task definition's `secrets` block.
+resource "aws_secretsmanager_secret" "connection_url" {
+  name_prefix = "${var.environment}-chainroute-db-url-"
+}
+
+resource "aws_secretsmanager_secret_version" "connection_url" {
+  secret_id     = aws_secretsmanager_secret.connection_url.id
+  secret_string = "postgres://chainroute:${random_password.db.result}@${aws_db_instance.main.endpoint}/chainroute?sslmode=require"
+}

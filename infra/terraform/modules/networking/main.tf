@@ -128,6 +128,20 @@ resource "aws_security_group" "internal" {
   name_prefix = "${var.environment}-chainroute-internal-"
   vpc_id      = aws_vpc.main.id
   description = "Shared SG for cpp-router, redpanda, observability, and any service-to-service traffic -- ingress rules are added per-consumer by later modules via aws_security_group_rule, not baked in here, to avoid a monolithic SG with rules for every port up front."
+  ingress {
+    description = "Self-referencing: allows all TCP traffic between services that share this security group (e.g. go-worker -> Redpanda, future observability scraping) -- proportionate for a single shared internal-tier SG rather than enumerating every port pair"
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    self        = true
+  }
+  ingress {
+    description     = "cpp-router gRPC (50051) from the app-tier SG (go-server)"
+    from_port       = 50051
+    to_port         = 50051
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
   egress {
     from_port   = 0
     to_port     = 0

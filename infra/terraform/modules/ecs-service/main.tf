@@ -7,25 +7,28 @@ resource "aws_ecs_task_definition" "this" {
   execution_role_arn       = var.execution_role_arn
   task_role_arn            = var.task_role_arn
 
-  container_definitions = jsonencode([{
-    name      = var.service_name
-    image     = var.image
-    essential = true
-    portMappings = [{
-      containerPort = var.container_port
-      protocol      = "tcp"
-    }]
-    environment = [for k, v in var.environment_variables : { name = k, value = v }]
-    secrets     = [for k, arn in var.secrets : { name = k, valueFrom = arn }]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = var.log_group_name
-        "awslogs-region"        = data.aws_region.current.name
-        "awslogs-stream-prefix" = var.service_name
+  container_definitions = jsonencode([merge(
+    {
+      name      = var.service_name
+      image     = var.image
+      essential = true
+      portMappings = [{
+        containerPort = var.container_port
+        protocol      = "tcp"
+      }]
+      environment = [for k, v in var.environment_variables : { name = k, value = v }]
+      secrets     = [for k, arn in var.secrets : { name = k, valueFrom = arn }]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = var.log_group_name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = var.service_name
+        }
       }
-    }
-  }])
+    },
+    var.command == null ? {} : { command = var.command }
+  )])
 }
 
 data "aws_region" "current" {}
