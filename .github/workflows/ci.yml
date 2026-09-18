@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: go-api/go.sum
+      - name: gofmt check
+        working-directory: go-api
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        working-directory: go-api
+        run: go vet ./...
+      - name: go build
+        working-directory: go-api
+        run: go build ./...
+      - name: go test
+        working-directory: go-api
+        run: go test ./...
+
+  go-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_DB: chainroute
+          POSTGRES_USER: chainroute
+          POSTGRES_PASSWORD: chainroute_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U chainroute"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: go-api/go.sum
+      - name: apply migrations
+        run: PSQL_BIN=psql scripts/apply_migrations.sh "postgres://chainroute:chainroute_ci@localhost:5432/chainroute?sslmode=disable"
+      - name: go test -tags=integration
+        working-directory: go-api
+        env:
+          DATABASE_URL: postgres://chainroute:chainroute_ci@localhost:5432/chainroute?sslmode=disable
+        run: go test -tags=integration ./...
+
+  kafka-integration:
+    runs-on: ubuntu-latest
+    services:
+      redpanda:
+        image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+        ports: ["9092:9092"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache-dependency-path: go-api/go.sum
+      - name: go test -tags=kafka_integration
+        working-directory: go-api
+        env:
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+        run: go test -tags=kafka_integration ./internal/kafka/...
+
+  cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake protobuf-compiler-grpc libprotobuf-dev libgrpc++-dev libssl-dev pkg-config
+      - name: build and test router
+        run: |
+          cmake -S router -B router/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build router/build -j
+          ctest --test-dir router/build --output-on-failure
+      - name: build and test cpp-routing-service
+        run: |
+          cmake -S cpp-routing-service -B cpp-routing-service/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp-routing-service/build -j
+          ctest --test-dir cpp-routing-service/build --output-on-failure
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build go-server image
+        uses: docker/build-push-action@v6
+        with:
+          context: go-api
+          file: go-api/cmd/server/Dockerfile
+          push: false
+      - name: build go-worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: go-api
+          file: go-api/cmd/worker/Dockerfile
+          push: false
+      - name: build cpp-router image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cpp-router
+          push: false
+      - name: hadolint (cpp-router)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.cpp-router
+      - name: hadolint (go-server)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: go-api/cmd/server/Dockerfile
+      - name: hadolint (go-worker)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: go-api/cmd/worker/Dockerfile
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: terraform fmt check
+        working-directory: infra/terraform
+        run: terraform fmt -recursive -check -diff
+      - name: terraform init (no backend)
+        working-directory: infra/terraform/environments/dev
+        run: terraform init -backend=false
+      - name: terraform validate
+        working-directory: infra/terraform/environments/dev
+        run: terraform validate
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
