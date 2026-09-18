@@ -19,7 +19,7 @@ RUN cmake -S cpp-routing-service -B /build -DCMAKE_BUILD_TYPE=Release -DCHAINROU
 # health service main.cpp registers via grpc::EnableDefaultHealthCheckService.
 ARG GRPC_HEALTH_PROBE_VERSION=v0.4.28
 RUN curl -fsSL -o /usr/local/bin/grpc-health-probe \
-        "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc-health-probe-linux-$(dpkg --print-architecture)" \
+        "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/${GRPC_HEALTH_PROBE_VERSION}/grpc_health_probe-linux-$(dpkg --print-architecture)" \
     && chmod +x /usr/local/bin/grpc-health-probe
 
 FROM debian:bookworm-slim AS runtime
