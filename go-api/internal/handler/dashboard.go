@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -84,6 +85,10 @@ func (h *Handler) ListPayments(w http.ResponseWriter, r *http.Request) {
 
 	payments, nextCursor, err := h.DashboardStore.ListPayments(r.Context(), filter)
 	if err != nil {
+		if errors.Is(err, payment.ErrInvalidCursor) {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
 		h.logger().ErrorContext(r.Context(), "failed to list payments", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return

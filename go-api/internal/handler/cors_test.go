@@ -47,6 +47,9 @@ func TestCORS_DisallowedOriginGetsNoHeaders(t *testing.T) {
 	if !called {
 		t.Fatal("expected the request to still reach the inner handler (CORS only gates headers, not access)")
 	}
+	if got := rec.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("expected Vary: Origin even for a disallowed origin (the response still varies by Origin, and a shared cache needs this to avoid serving one origin's response to another), got %q", got)
+	}
 }
 
 func TestCORS_NeverReflectsWildcard(t *testing.T) {
@@ -104,5 +107,8 @@ func TestCORS_NoOriginHeaderPassesThroughWithoutCORSHeaders(t *testing.T) {
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Fatalf("expected no CORS headers when no Origin header is present, got %q", got)
+	}
+	if got := rec.Header().Get("Vary"); got != "Origin" {
+		t.Fatalf("expected Vary: Origin unconditionally, even with no Origin header present, got %q", got)
 	}
 }

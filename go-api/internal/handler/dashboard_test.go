@@ -3,8 +3,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -194,5 +196,34 @@ func TestListPayments_StoreErrorReturns500(t *testing.T) {
 	rec := doListPaymentsRequest(h, "/payments")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+}
+
+func TestListPayments_MalformedCursorReturns400(t *testing.T) {
+	// A cursor-decode failure is a client input error, not a server fault:
+	// it must surface as 400 (like the endpoint's other invalid-input
+	// cases: limit, status, execution_mode), never as the 500 a genuine
+	// store/database error gets.
+	store := &fakeDashboardStore{listErr: fmt.Errorf("wrapped: %w", payment.ErrInvalidCursor)}
+	h := &Handler{DashboardStore: store}
+
+	rec := doListPaymentsRequest(h, "/payments?cursor=not-valid-base64!!!")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed cursor, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(rec.Body.String()), "cursor") {
+		t.Fatalf("expected error message to mention 'cursor', got %s", rec.Body.String())
+	}
+}
+
+func TestListPayments_NonCursorStoreErrorStillReturns500(t *testing.T) {
+	// Guard against over-broadly treating every store error as a 400:
+	// only ErrInvalidCursor should map to 400; everything else stays 500.
+	store := &fakeDashboardStore{listErr: context.DeadlineExceeded}
+	h := &Handler{DashboardStore: store}
+
+	rec := doListPaymentsRequest(h, "/payments?cursor=some-cursor-value")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for a non-cursor store error, got %d", rec.Code)
 	}
 }

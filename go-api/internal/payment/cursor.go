@@ -2,9 +2,17 @@ package payment
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrInvalidCursor is a sentinel wrapped into every error DecodeCursor
+// returns, so callers (e.g. the ListPayments handler) can distinguish a
+// malformed/tampered client-supplied cursor -- a 400-worthy input error --
+// from an unrelated store/database failure using errors.Is, without the
+// postgres package needing to know anything about cursor internals.
+var ErrInvalidCursor = errors.New("invalid cursor")
 
 // EncodeCursor and DecodeCursor implement opaque keyset-pagination cursors
 // (base64 of "createdAtRFC3339Nano,id") for ListPayments. They live in this
@@ -26,11 +34,11 @@ func EncodeCursor(createdAt, id string) string {
 func DecodeCursor(cursor string) (createdAt, id string, err error) {
 	raw, err := base64.URLEncoding.DecodeString(cursor)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid cursor: %w", err)
+		return "", "", fmt.Errorf("%w: %v", ErrInvalidCursor, err)
 	}
 	parts := strings.SplitN(string(raw), ",", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid cursor format")
+		return "", "", fmt.Errorf("%w: malformed cursor format", ErrInvalidCursor)
 	}
 	return parts[0], parts[1], nil
 }
