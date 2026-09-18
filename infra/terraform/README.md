@@ -2,8 +2,10 @@
 
 Infrastructure-as-code for deploying ChainRoute (Go API server, Go worker,
 C++ router, Postgres, message broker, ALB, and an optional observability
-stack) onto AWS ECS Fargate. See the design doc and implementation plan in
-`.superpowers/sdd/2026-09-17-containerization-deployment-implementation/`
+stack) onto AWS ECS Fargate. See the design doc
+(`docs/superpowers/specs/2026-09-17-containerization-deployment-design.md`)
+and implementation plan
+(`docs/superpowers/plans/2026-09-17-containerization-deployment-implementation.md`)
 for the full rationale behind every tradeoff summarized below.
 
 ## Module tree

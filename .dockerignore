@@ -5,3 +5,9 @@ go-api
 router/build
 cpp-routing-service/build
 *.md
+infra
+.env
+.env.*
+*.tfstate
+*.tfstate.*
+.terraform
