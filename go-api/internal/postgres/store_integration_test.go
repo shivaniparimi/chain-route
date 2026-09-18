@@ -1179,3 +1179,114 @@ func TestStalePaymentIDs_ExcludesTestnetMode(t *testing.T) {
 		}
 	}
 }
+
+// TestGetDashboardStats_CountsAndProviderUsageAreExact seeds a mix of
+// payments spanning every status bucket and two distinct bridge providers,
+// then asserts GetDashboardStats's counts and provider-usage map move by
+// exactly the seeded amounts. It compares before/after deltas rather than
+// absolute values because GetDashboardStats aggregates over the entire
+// payments table with no scoping filter (unlike ListPayments, which every
+// other integration test in this file can scope by a unique
+// source_chain/destination_chain pair) -- this is the only way to make the
+// assertion exact against a shared, persistent database that may already
+// hold rows from other runs, while still catching a subtly wrong
+// FILTER/GROUP BY clause (which would move the deltas, not just the
+// absolute totals).
+func TestGetDashboardStats_CountsAndProviderUsageAreExact(t *testing.T) {
+	s := newTestStore(t)
+	providerA := "zz-test-stats-provider-a"
+	providerB := "zz-test-stats-provider-b"
+	keys := []string{
+		"test-stats-routed-no-provider",
+		"test-stats-routed-provider-a",
+		"test-stats-completed-provider-a",
+		"test-stats-failed-provider-b",
+		"test-stats-processing-no-provider",
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	before, err := s.GetDashboardStats(context.Background())
+	if err != nil {
+		t.Fatalf("baseline GetDashboardStats: %v", err)
+	}
+
+	// 1: simulated, left ROUTED, no provider -- counts toward "processing".
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), testPayment(keys[0])); err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[0], outcome, err)
+	}
+
+	// 2: testnet, left ROUTED, provider A -- counts toward "processing" and provider A.
+	p2 := testPayment(keys[1])
+	p2.ExecutionMode = payment.ExecutionModeTestnet
+	p2.BridgeProvider = strPtr(providerA)
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), p2); err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[1], outcome, err)
+	}
+
+	// 3: testnet, driven to COMPLETED, provider A -- counts toward "completed" and provider A.
+	p3 := testPayment(keys[2])
+	p3.ExecutionMode = payment.ExecutionModeTestnet
+	p3.BridgeProvider = strPtr(providerA)
+	created3, outcome, err := s.CreateOrGetPayment(context.Background(), p3)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[2], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created3.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[2], err)
+	}
+	if _, _, err := s.CompletePayment(context.Background(), created3.ID, payment.StatusCompleted); err != nil {
+		t.Fatalf("complete %s: %v", keys[2], err)
+	}
+
+	// 4: testnet, driven to FAILED, provider B -- counts toward "failed" and provider B.
+	p4 := testPayment(keys[3])
+	p4.ExecutionMode = payment.ExecutionModeTestnet
+	p4.BridgeProvider = strPtr(providerB)
+	created4, outcome, err := s.CreateOrGetPayment(context.Background(), p4)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[3], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created4.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[3], err)
+	}
+	if ok, err := s.MarkProcessingFailed(context.Background(), created4.ID, "test-failure"); err != nil || !ok {
+		t.Fatalf("mark failed %s: ok=%v err=%v", keys[3], ok, err)
+	}
+
+	// 5: simulated, driven to PROCESSING, no provider -- counts toward "processing".
+	created5, outcome, err := s.CreateOrGetPayment(context.Background(), testPayment(keys[4]))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[4], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created5.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[4], err)
+	}
+
+	after, err := s.GetDashboardStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetDashboardStats: %v", err)
+	}
+
+	if got := after.TotalPayments - before.TotalPayments; got != 5 {
+		t.Fatalf("expected total_payments to increase by 5, got %d", got)
+	}
+	if got := after.CompletedPayments - before.CompletedPayments; got != 1 {
+		t.Fatalf("expected completed_payments to increase by 1, got %d", got)
+	}
+	if got := after.ProcessingPayments - before.ProcessingPayments; got != 3 {
+		t.Fatalf("expected processing_payments (ROUTED/PROCESSING/SUBMITTED) to increase by 3, got %d", got)
+	}
+	if got := after.FailedPayments - before.FailedPayments; got != 1 {
+		t.Fatalf("expected failed_payments to increase by 1, got %d", got)
+	}
+
+	if got := after.ProviderUsage[providerA] - before.ProviderUsage[providerA]; got != 2 {
+		t.Fatalf("expected provider %s usage to increase by 2, got %d (before=%d after=%d)",
+			providerA, got, before.ProviderUsage[providerA], after.ProviderUsage[providerA])
+	}
+	if got := after.ProviderUsage[providerB] - before.ProviderUsage[providerB]; got != 1 {
+		t.Fatalf("expected provider %s usage to increase by 1, got %d (before=%d after=%d)",
+			providerB, got, before.ProviderUsage[providerB], after.ProviderUsage[providerB])
+	}
+}

@@ -139,6 +139,22 @@ type ListFilter struct {
 	ExecutionMode    *string
 }
 
+// DashboardStats aggregates payment counts by status and bridge-provider
+// usage across all payments, for the read-only dashboard overview endpoint
+// (GET /dashboard/stats). Like Payment and Quote, this is a plain domain
+// type with no json tags -- handler holds its own thin json-tagged
+// response-shape struct and converts, per this codebase's existing
+// domain/response separation (see handler.paymentResponse/toPaymentResponse
+// and handler.paymentListItem).
+type DashboardStats struct {
+	TotalPayments      int64
+	CompletedPayments  int64
+	ProcessingPayments int64
+	FailedPayments     int64
+	ProviderUsage      map[string]int64
+	AverageRoutingCost float64
+}
+
 // CreateResult reports what Store.CreateOrGetPayment actually did.
 type CreateResult int
 

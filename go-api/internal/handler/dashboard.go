@@ -16,6 +16,8 @@ import (
 // paths) per this package's existing per-handler-interface convention.
 type DashboardStore interface {
 	ListPayments(ctx context.Context, filter payment.ListFilter) ([]payment.Payment, string, error)
+	GetQuotesByPaymentID(ctx context.Context, paymentID string) ([]payment.Quote, error)
+	GetDashboardStats(ctx context.Context) (payment.DashboardStats, error)
 }
 
 type paymentListItem struct {
@@ -116,4 +118,93 @@ func isValidStatus(s string) bool {
 		return true
 	}
 	return false
+}
+
+type quoteItem struct {
+	Provider             string `json:"provider"`
+	InputAmount          string `json:"input_amount"`
+	OutputAmount         string `json:"output_amount"`
+	FeeAmount            string `json:"fee_amount"`
+	EstimatedFillTimeSec int64  `json:"estimated_fill_time_sec"`
+	Selected             bool   `json:"selected"`
+	QuotedAt             string `json:"quoted_at"`
+}
+
+type paymentQuotesResponse struct {
+	Quotes []quoteItem `json:"quotes"`
+}
+
+// GetPaymentQuotes returns every quote fetched for a payment (winning and
+// losing), selected-first -- read-only, backed by Task 1's
+// GetQuotesByPaymentID. 404s if the payment itself doesn't exist; an
+// existing payment with no quotes (simulated-mode, or predating migration
+// 0007) renders as "quotes": [] rather than null.
+func (h *Handler) GetPaymentQuotes(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	_, found, err := h.Store.GetPayment(r.Context(), id)
+	if err != nil {
+		h.logger().ErrorContext(r.Context(), "failed to read payment for quotes lookup", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "payment not found")
+		return
+	}
+	quotes, err := h.DashboardStore.GetQuotesByPaymentID(r.Context(), id)
+	if err != nil {
+		h.logger().ErrorContext(r.Context(), "failed to read payment quotes", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	items := make([]quoteItem, 0, len(quotes))
+	for _, q := range quotes {
+		items = append(items, quoteItem{
+			Provider: q.Provider, InputAmount: q.InputAmount, OutputAmount: q.OutputAmount,
+			FeeAmount: q.FeeAmount, EstimatedFillTimeSec: q.EstimatedFillTimeSec,
+			Selected: q.Selected, QuotedAt: q.QuotedAt.UTC().Format(time.RFC3339Nano),
+		})
+	}
+	writeJSON(w, http.StatusOK, paymentQuotesResponse{Quotes: items})
+}
+
+// dashboardStats is the JSON response shape for GET /dashboard/stats --
+// kept as its own thin, json-tagged struct (converted from
+// payment.DashboardStats by toDashboardStatsResponse) rather than adding
+// json tags to the domain type itself, matching this package's existing
+// convention for Payment/paymentResponse and Payment/paymentListItem.
+type dashboardStats struct {
+	TotalPayments      int64            `json:"total_payments"`
+	CompletedPayments  int64            `json:"completed_payments"`
+	ProcessingPayments int64            `json:"processing_payments"`
+	FailedPayments     int64            `json:"failed_payments"`
+	ProviderUsage      map[string]int64 `json:"provider_usage"`
+	AverageRoutingCost float64          `json:"average_routing_cost"`
+}
+
+func toDashboardStatsResponse(s payment.DashboardStats) dashboardStats {
+	providerUsage := s.ProviderUsage
+	if providerUsage == nil {
+		providerUsage = map[string]int64{}
+	}
+	return dashboardStats{
+		TotalPayments: s.TotalPayments, CompletedPayments: s.CompletedPayments,
+		ProcessingPayments: s.ProcessingPayments, FailedPayments: s.FailedPayments,
+		ProviderUsage: providerUsage, AverageRoutingCost: s.AverageRoutingCost,
+	}
+}
+
+// GetDashboardStats returns the read-only aggregate counters backing the
+// dashboard overview: payment counts by status, per-provider usage, and
+// average routing cost -- computed entirely in SQL by
+// postgres.Store.GetDashboardStats (a small fixed number of aggregation
+// queries, never fetch-all-then-aggregate-in-Go).
+func (h *Handler) GetDashboardStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := h.DashboardStore.GetDashboardStats(r.Context())
+	if err != nil {
+		h.logger().ErrorContext(r.Context(), "failed to read dashboard stats", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, toDashboardStatsResponse(stats))
 }

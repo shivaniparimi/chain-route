@@ -394,6 +394,51 @@ func (s *Store) ListPayments(ctx context.Context, filter payment.ListFilter) ([]
 	return results, nextCursor, nil
 }
 
+// GetDashboardStats computes the read-only dashboard overview counters in
+// exactly two aggregation queries -- both aggregating in SQL, never
+// fetch-all-then-aggregate-in-Go, to keep this endpoint free of N+1 query
+// patterns regardless of table size. The first query aggregates payment
+// counts by status plus the average total_fee in one pass; the second
+// groups by bridge_provider for the provider-usage breakdown (a variable
+// number of rows, so it can't be folded into the fixed-shape first query).
+func (s *Store) GetDashboardStats(ctx context.Context) (payment.DashboardStats, error) {
+	var stats payment.DashboardStats
+	stats.ProviderUsage = map[string]int64{}
+
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) AS total,
+			COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+			COUNT(*) FILTER (WHERE status IN ('ROUTED', 'PROCESSING', 'SUBMITTED')) AS processing,
+			COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
+			COALESCE(AVG(total_fee), 0) AS avg_fee
+		FROM payments
+	`)
+	if err := row.Scan(&stats.TotalPayments, &stats.CompletedPayments, &stats.ProcessingPayments, &stats.FailedPayments, &stats.AverageRoutingCost); err != nil {
+		return payment.DashboardStats{}, fmt.Errorf("get dashboard stats: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT bridge_provider, COUNT(*)
+		FROM payments
+		WHERE bridge_provider IS NOT NULL
+		GROUP BY bridge_provider
+	`)
+	if err != nil {
+		return payment.DashboardStats{}, fmt.Errorf("get provider usage: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var provider string
+		var count int64
+		if err := rows.Scan(&provider, &count); err != nil {
+			return payment.DashboardStats{}, fmt.Errorf("scan provider usage row: %w", err)
+		}
+		stats.ProviderUsage[provider] = count
+	}
+	return stats, rows.Err()
+}
+
 // ClaimPayment atomically transitions a payment from ROUTED to PROCESSING,
 // returning its execution_mode in the same round trip. claimed=false means
 // the payment was not ROUTED (already claimed by another delivery, or in

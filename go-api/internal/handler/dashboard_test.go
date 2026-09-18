@@ -19,11 +19,27 @@ type fakeDashboardStore struct {
 	listErr    error
 
 	lastFilter payment.ListFilter
+
+	quotesResult []payment.Quote
+	quotesErr    error
+	lastQuotesID string
+
+	statsResult payment.DashboardStats
+	statsErr    error
 }
 
 func (f *fakeDashboardStore) ListPayments(_ context.Context, filter payment.ListFilter) ([]payment.Payment, string, error) {
 	f.lastFilter = filter
 	return f.listResult, f.listCursor, f.listErr
+}
+
+func (f *fakeDashboardStore) GetQuotesByPaymentID(_ context.Context, paymentID string) ([]payment.Quote, error) {
+	f.lastQuotesID = paymentID
+	return f.quotesResult, f.quotesErr
+}
+
+func (f *fakeDashboardStore) GetDashboardStats(_ context.Context) (payment.DashboardStats, error) {
+	return f.statsResult, f.statsErr
 }
 
 func doListPaymentsRequest(h *Handler, target string) *httptest.ResponseRecorder {
@@ -225,5 +241,149 @@ func TestListPayments_NonCursorStoreErrorStillReturns500(t *testing.T) {
 	rec := doListPaymentsRequest(h, "/payments?cursor=some-cursor-value")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 for a non-cursor store error, got %d", rec.Code)
+	}
+}
+
+func doPaymentQuotesRequest(h *Handler, target string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", target, nil)
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /payments/{id}/quotes", h.GetPaymentQuotes)
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func doDashboardStatsRequest(h *Handler, target string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", target, nil)
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /dashboard/stats", h.GetDashboardStats)
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestGetPaymentQuotes_NonexistentPaymentReturns404(t *testing.T) {
+	h := &Handler{
+		Store:          &fakePaymentStore{getFound: false},
+		DashboardStore: &fakeDashboardStore{},
+	}
+
+	rec := doPaymentQuotesRequest(h, "/payments/does-not-exist/quotes")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetPaymentQuotes_NoQuotesReturnsEmptyArrayNotNull(t *testing.T) {
+	h := &Handler{
+		Store:          &fakePaymentStore{getFound: true, getResult: payment.Payment{ID: "pay-1"}},
+		DashboardStore: &fakeDashboardStore{quotesResult: nil},
+	}
+
+	rec := doPaymentQuotesRequest(h, "/payments/pay-1/quotes")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"quotes":[]`) {
+		t.Fatalf("expected quotes to render as an empty array, not null: %s", rec.Body.String())
+	}
+}
+
+func TestGetPaymentQuotes_ReturnsExpectedShapeWithSelectedFlag(t *testing.T) {
+	quotedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	quotes := []payment.Quote{
+		{
+			Provider: "across", InputAmount: "1000000000000000000", OutputAmount: "999000000000000000",
+			FeeAmount: "1000000000000000", EstimatedFillTimeSec: 30, Selected: true, QuotedAt: quotedAt,
+		},
+		{
+			Provider: "relay", InputAmount: "1000000000000000000", OutputAmount: "998000000000000000",
+			FeeAmount: "2000000000000000", EstimatedFillTimeSec: 60, Selected: false, QuotedAt: quotedAt,
+		},
+	}
+	h := &Handler{
+		Store:          &fakePaymentStore{getFound: true, getResult: payment.Payment{ID: "pay-1"}},
+		DashboardStore: &fakeDashboardStore{quotesResult: quotes},
+	}
+
+	rec := doPaymentQuotesRequest(h, "/payments/pay-1/quotes")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp paymentQuotesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(resp.Quotes) != 2 {
+		t.Fatalf("expected 2 quotes, got %d", len(resp.Quotes))
+	}
+	if resp.Quotes[0].Provider != "across" || !resp.Quotes[0].Selected ||
+		resp.Quotes[0].InputAmount != "1000000000000000000" || resp.Quotes[0].OutputAmount != "999000000000000000" ||
+		resp.Quotes[0].FeeAmount != "1000000000000000" || resp.Quotes[0].EstimatedFillTimeSec != 30 ||
+		resp.Quotes[0].QuotedAt != "2026-01-02T03:04:05Z" {
+		t.Fatalf("unexpected first quote shape: %+v", resp.Quotes[0])
+	}
+	if resp.Quotes[1].Provider != "relay" || resp.Quotes[1].Selected {
+		t.Fatalf("expected second quote to be unselected relay quote: %+v", resp.Quotes[1])
+	}
+}
+
+func TestGetPaymentQuotes_PaymentLookupErrorReturns500(t *testing.T) {
+	h := &Handler{
+		Store:          &fakePaymentStore{getErr: context.DeadlineExceeded},
+		DashboardStore: &fakeDashboardStore{},
+	}
+
+	rec := doPaymentQuotesRequest(h, "/payments/pay-1/quotes")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+}
+
+func TestGetPaymentQuotes_StoreErrorReturns500(t *testing.T) {
+	h := &Handler{
+		Store:          &fakePaymentStore{getFound: true, getResult: payment.Payment{ID: "pay-1"}},
+		DashboardStore: &fakeDashboardStore{quotesErr: context.DeadlineExceeded},
+	}
+
+	rec := doPaymentQuotesRequest(h, "/payments/pay-1/quotes")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+}
+
+func TestGetDashboardStats_ReturnsExpectedShape(t *testing.T) {
+	stats := payment.DashboardStats{
+		TotalPayments: 10, CompletedPayments: 6, ProcessingPayments: 3, FailedPayments: 1,
+		ProviderUsage:      map[string]int64{"across": 4, "relay": 2},
+		AverageRoutingCost: 1.25,
+	}
+	h := &Handler{DashboardStore: &fakeDashboardStore{statsResult: stats}}
+
+	rec := doDashboardStatsRequest(h, "/dashboard/stats")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp dashboardStats
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.TotalPayments != 10 || resp.CompletedPayments != 6 || resp.ProcessingPayments != 3 ||
+		resp.FailedPayments != 1 || resp.AverageRoutingCost != 1.25 {
+		t.Fatalf("unexpected stats shape: %+v", resp)
+	}
+	if resp.ProviderUsage["across"] != 4 || resp.ProviderUsage["relay"] != 2 || len(resp.ProviderUsage) != 2 {
+		t.Fatalf("unexpected provider usage: %+v", resp.ProviderUsage)
+	}
+}
+
+func TestGetDashboardStats_StoreErrorReturns500(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{statsErr: context.DeadlineExceeded}}
+
+	rec := doDashboardStatsRequest(h, "/dashboard/stats")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
 	}
 }
