@@ -10,7 +10,7 @@ COPY router/ router/
 COPY cpp-routing-service/ cpp-routing-service/
 COPY proto/ proto/
 
-RUN cmake -S cpp-routing-service -B /build -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S cpp-routing-service -B /build -DCMAKE_BUILD_TYPE=Release -DCHAINROUTE_BUILD_TESTS=OFF \
     && cmake --build /build -j"$(nproc)" --target chainroute_service_server
 
 # grpc-health-probe: a small static Go binary, pinned version, used by the

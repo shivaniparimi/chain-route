@@ -5,7 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Protobuf CONFIG REQUIRED)
+option(CHAINROUTE_BUILD_TESTS "Build the cpp-routing-service test suite" ON)
+
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+    find_package(Protobuf REQUIRED)
+endif()
 find_package(gRPC CONFIG REQUIRED)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../router ${CMAKE_CURRENT_BINARY_DIR}/router-build)
@@ -21,10 +26,11 @@ set(GRPC_SRCS ${PROTO_GEN_DIR}/chainroute/v1/routing.grpc.pb.cc)
 set(GRPC_HDRS ${PROTO_GEN_DIR}/chainroute/v1/routing.grpc.pb.h)
 
 find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
+find_program(PROTOC_EXECUTABLE protoc REQUIRED)
 
 add_custom_command(
     OUTPUT ${PROTO_SRCS} ${PROTO_HDRS} ${GRPC_SRCS} ${GRPC_HDRS}
-    COMMAND protobuf::protoc
+    COMMAND ${PROTOC_EXECUTABLE}
     ARGS --cpp_out=${PROTO_GEN_DIR}
          --grpc_out=${PROTO_GEN_DIR}
          --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
@@ -64,5 +70,7 @@ if (NOT MSVC)
     # should apply the same -Wall -Wextra -Wpedantic flags.
 endif()
 
-enable_testing()
-add_subdirectory(tests)
+if(CHAINROUTE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
