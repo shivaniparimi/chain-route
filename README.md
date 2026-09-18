@@ -44,6 +44,15 @@ and, in testnet mode, a reconciler that re-checks payments stuck in
 `PROCESSING` and a nonce-divergence check against the wallet's on-chain
 nonce.
 
+Phase 11 adds a deployment layer on top of this pipeline without changing
+any of it: each of the three runtime components (`go-server`, `go-worker`,
+`cpp-router`) is packaged as its own Docker image and composed together
+locally via Docker Compose, and the same three services plus Postgres and
+Redpanda can be provisioned in AWS (ECS Fargate, behind a public
+Application Load Balancer) via the Terraform under `infra/terraform/`. See
+the **Docker**, **Terraform**, and **Networking and deployment data flow**
+sections below.
+
 ## Running locally
 
 You need a local PostgreSQL instance (with the schema migrations in
@@ -347,12 +356,356 @@ concurrency setting — never a claimed universal throughput or latency
 figure for ChainRoute in general. Re-run it on the hardware you actually
 care about before drawing conclusions from it.
 
+### Phase 11: benchmarking against the full Docker stack
+
+Phase 11 packages the full pipeline as a Docker Compose stack (see
+**Docker** below) instead of the natively-run processes the sections
+above assume. The intent, per this phase's implementation plan, was to
+run `docker compose up -d`, wait for every service to report healthy,
+and then run `go run ./go-api/cmd/benchmark` against the containerized
+stack's published `:8080` port, to get throughput/latency numbers that
+reflect the container and bridge-network overhead (distroless runtimes,
+Docker's own network stack, the outbox poller and worker each running in
+their own container) rather than same-host native processes talking over
+`localhost`.
+
+That run was never possible in this environment: no Docker daemon has
+been reachable at any point during this phase, consistent with every
+earlier phase of this project. Confirmed again immediately before writing
+this section — `docker info` reports the Docker CLI is installed (v28.3.2,
+via Docker Desktop's `desktop-linux` context) but `Cannot connect to the
+Docker daemon at unix:///Users/shivaniparimi/.docker/run/docker.sock`.
+What actually happened instead, and what it does and does not prove: every
+Dockerfile was reviewed line-by-line against its build's real
+requirements (see the Docker section's honesty note below), and
+`docker compose config` — which validates a compose file's YAML,
+variable interpolation, and service references without needing a daemon
+— was run against all three compose files (`docker-compose.yml`, the
+`docker-compose.yml` + `docker-compose.testnet.yml` override with its
+required testnet variables supplied, and `docker-compose.observability.yml`)
+and passed cleanly every time. That confirms the stack's configuration is
+internally consistent; it does not confirm that any image actually
+builds, that any container actually starts, or any throughput/latency
+number for the containerized stack. No such number exists anywhere in
+this repository, and none should be assumed or quoted until a real Docker
+daemon is available and the run described above is actually performed.
+
+## Docker
+
+Phase 11 packages all three ChainRoute runtime components as containers.
+Each has its own Dockerfile, and `docker-compose.yml` wires all three
+together with Postgres and Redpanda into a single local stack.
+
+**Images:**
+
+| Service | Dockerfile | Build context | Base image (build → runtime) | Listens on |
+|---|---|---|---|---|
+| `go-server` | `go-api/cmd/server/Dockerfile` | `go-api/` | `golang:1.27-bookworm` → `gcr.io/distroless/static-debian12:nonroot` | `:8080` (HTTP) |
+| `go-worker` | `go-api/cmd/worker/Dockerfile` | `go-api/` | `golang:1.27-bookworm` → `gcr.io/distroless/static-debian12:nonroot` | `:9091` (`/metrics`) |
+| `cpp-router` | `Dockerfile.cpp-router` | `.` (repo root) | `debian:bookworm-slim` → `debian:bookworm-slim` | `:50051` (gRPC), `:9102` (`/metrics`) |
+
+The C++ router's build context is the repo root (not `cpp-routing-service/`
+alone) because its CMake build also needs `router/` (the Dijkstra graph
+library it links against) and `proto/` (the shared gRPC schema) — the
+Dockerfile `COPY`s all three directories in explicitly rather than relying
+on a wider context.
+
+**Building each image individually:**
+
+```bash
+# Go server (multi-stage: CGO_ENABLED=0 static build, then a distroless nonroot runtime)
+docker build -t chainroute/go-server -f go-api/cmd/server/Dockerfile go-api
+
+# Go worker (same base images as the server)
+docker build -t chainroute/go-worker -f go-api/cmd/worker/Dockerfile go-api
+
+# C++ router (builds router/ + cpp-routing-service/ + proto/ via CMake Release,
+# with test targets skipped via -DCHAINROUTE_BUILD_TESTS=OFF)
+docker build -t chainroute/cpp-router -f Dockerfile.cpp-router .
+```
+
+**Running the full local stack:**
+
+```bash
+docker compose up -d
+```
+
+This starts, on a single `chainroute-net` bridge network: `postgres`
+(`postgres:16-bookworm`, with a healthcheck via `pg_isready`), a one-shot
+`migrate` service (also `postgres:16-bookworm`, running
+`scripts/apply_migrations.sh` against the compose-internal Postgres —
+the same portable, idempotent migration script used natively and in CI),
+`redpanda` (`docker.redpanda.com/redpandadata/redpanda:v24.2.7`, single
+broker), `cpp-router`, `go-server`, `go-worker`, and the bundled
+observability stack (`prometheus`, `otel-collector`, `jaeger`, `grafana`
+— using a Docker-native Prometheus scrape config,
+`observability/prometheus/prometheus.docker.yml`, that targets the
+compose service names directly rather than `host.docker.internal`).
+`go-server` and `go-worker` don't start until `postgres` is healthy and
+`migrate` has completed successfully; `go-server` also waits on
+`cpp-router` being healthy, and `go-worker` waits on `redpanda` being
+healthy. Everything runs in simulated mode by default — no
+`BLOCKCHAIN_ENV` is set anywhere in `docker-compose.yml`. Published host
+ports: `8080` (go-server HTTP), `9091` (go-worker metrics), `9090`
+(Prometheus), `16686` (Jaeger UI), `3000` (Grafana); `redpanda` and
+`cpp-router` are reachable only from other containers on `chainroute-net`.
+The Postgres password defaults to `chainroute_local_dev`
+(`POSTGRES_PASSWORD:-chainroute_local_dev` in the compose file) and can be
+overridden by exporting `POSTGRES_PASSWORD` or setting it in a `.env`
+file — see `go-api/.env.example`.
+
+`docker-compose.observability.yml` (Phase 10) is a separate, independent
+file for the native-binary development workflow described in the
+**Observability** section above (it reaches natively-running binaries via
+`host.docker.internal`). It is not meant to be run together with the full
+stack above — each is self-contained and provides its own
+Prometheus/OTel-Collector/Jaeger/Grafana containers.
+
+**Testnet mode:**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.testnet.yml up -d
+```
+
+`docker-compose.testnet.yml` overrides `go-server` and `go-worker` to set
+`BLOCKCHAIN_ENV=testnet` and injects the real Across/Relay/Sepolia
+credentials from a `.env` file (git-ignored — never hardcode these values
+in a committed file). `TESTNET_WALLET_PRIVATE_KEY`,
+`ETHEREUM_SEPOLIA_RPC_URL`, and `BASE_SEPOLIA_RPC_URL` are required (the
+override file uses Compose's `${VAR:?message}` syntax, so `docker compose`
+itself refuses to start with a clear error if any is missing);
+`ACROSS_API_KEY`, `ACROSS_INTEGRATOR_ID`, and `RELAY_API_KEY` are optional
+and default to empty.
+
+**The `go-server`/`go-worker` health-check gap:** neither image defines a
+container-level `HEALTHCHECK`, and `docker-compose.yml` doesn't add one
+via `healthcheck:` either. This isn't an oversight — both run on
+`gcr.io/distroless/static-debian12:nonroot`, which ships no shell and no
+HTTP client, so there is nothing an in-container `HEALTHCHECK CMD` could
+actually execute, and neither service has a dedicated `/healthz` endpoint
+yet to check even from outside. The practical substitutes are external:
+`docker compose ps` (shows exit/restart status if a container has
+crashed) and `curl http://localhost:8080/metrics` from the host (a `200`
+response is a reasonable proxy for "the HTTP server is up"; there is no
+equivalent for `go-worker` since it has no HTTP surface to accept
+requests, only to be scraped on `:9091/metrics`). This is a direct
+contrast with the **`cpp-router`** image, which *does* ship a working
+`HEALTHCHECK` (`grpc-health-probe -addr=localhost:50051`, every 10s) —
+possible only because that image is built on `debian:bookworm-slim`, a
+normal shell-capable base, specifically so `grpc-health-probe` (a small
+static binary fetched in the builder stage) has an environment to run in.
+`go-server` depending on `cpp-router: condition: service_healthy` in
+`docker-compose.yml` relies on exactly this working healthcheck.
+
+**What's been verified and what hasn't:** every Dockerfile was written and
+statically reviewed against its build's actual requirements — package
+names and versions cross-checked against the real Debian Bookworm package
+index (see `Dockerfile.cpp-router`'s inline comment and Task 3's report
+for that trail), multi-stage build/runtime splits checked for correctness
+by inspection. A real `docker build` or `docker run` has never been
+possible in this development environment: no Docker daemon has been
+reachable at any point across this entire phase (the Docker CLI itself is
+installed — `docker info` reports client v28.3.2 — but its `Server:`
+block reports `Cannot connect to the Docker daemon`). `docker compose
+config` (which parses and validates a compose file's YAML and variable
+interpolation without needing a daemon) was run repeatedly against all
+three compose files and passed, including the testnet override once its
+required variables were supplied. The full stack has never actually been
+started.
+
+## Terraform
+
+`infra/terraform/` provisions ChainRoute onto AWS ECS Fargate: the Go
+server, Go worker, and C++ router as Fargate services, Postgres as RDS,
+a single-node Redpanda broker as its own Fargate service, an optional
+observability stack (also Fargate), and a public Application Load
+Balancer in front of `go-server`. **`infra/terraform/README.md` is the
+canonical module reference** — module-by-module inputs/outputs, the full
+design rationale, and the remote-state and Redpanda-vs-MSK tradeoffs in
+more depth than here. This section is a summary and a pointer, not a
+duplicate.
+
+Module tree (see `infra/terraform/README.md` for the full version):
+
+```
+infra/terraform/
+├── versions.tf          shared provider pins (aws ~> 5.0, random ~> 3.6)
+├── modules/
+│   ├── networking/       VPC, public/private subnets, NAT, security groups, Cloud Map namespace
+│   ├── database/         RDS Postgres + Secrets Manager credentials
+│   ├── messaging/        single-node Redpanda, run via ecs-service
+│   ├── observability/    OTel Collector, Jaeger, Prometheus, Grafana, each run via ecs-service
+│   ├── ecs-service/       reusable Fargate task/service module -- used by every app and infra service
+│   └── alb/               public ALB (the only 0.0.0.0/0 ingress point in the whole design) + go-server target group
+└── environments/
+    └── dev/               root module: provider, ECS cluster, IAM roles, ECR repos, wires the modules above together
+```
+
+`environments/dev` is the only environment defined today; a future
+`environments/prod` would reuse the same modules with its own tfvars and
+state.
+
+**Validating locally:**
+
+```bash
+cd infra/terraform
+terraform fmt -recursive -check -diff   # drop -check -diff to fix formatting in place
+
+cd environments/dev
+terraform init -backend=false           # downloads providers; no AWS credentials needed
+terraform validate                      # checks HCL syntax/references; no AWS credentials needed
+```
+
+These three commands were genuinely, successfully run in this development
+environment — `terraform fmt -recursive -check -diff`,
+`terraform init -backend=false`, and `terraform validate` all passed
+cleanly (once a disk-space issue was resolved and Terraform itself was
+installed). This is real, verified signal, not a limitation to caveat.
+
+`terraform plan` additionally requires real AWS credentials (it makes
+read-only API calls to reconcile against live state), and
+`terraform apply` will create real, billable AWS resources. **Neither was
+ever run in this project.** Never run `terraform apply` — or `plan` for
+real — without a real AWS account, real credentials configured for it,
+and explicit authorization from whoever owns that account and its bill.
+No AWS credentials are configured anywhere in this repository or in the
+environment this was built in, by design.
+
+**Redpanda, not MSK:** `modules/messaging` runs a single-node Redpanda
+broker as one Fargate task rather than Amazon MSK or MSK Serverless. This
+mirrors `docker-compose.yml`'s local setup exactly and costs a single
+small Fargate task, at the cost of no replication or high availability —
+a task restart loses any in-flight, uncommitted data, exactly the way a
+local dev restart would. This is a disclosed, deliberate portfolio-scale
+tradeoff, not an oversight; the production upgrade path is MSK Serverless
+or a multi-broker Redpanda cluster spread across availability zones. See
+`infra/terraform/README.md` and the phase's design doc §4.1 for the full
+reasoning.
+
+**Remote state:** Terraform uses local state by default, so `init` and
+`validate` don't require any pre-existing AWS resources.
+`environments/dev/backend.tf` documents (commented out) how to point this
+environment at an S3-plus-DynamoDB remote backend once that bucket and
+lock table exist — `infra/terraform/README.md` has the exact steps.
+
+## Networking and deployment data flow
+
+```
+Internet
+  |
+  v  (public ingress, ports 80/443 only -- the ONLY 0.0.0.0/0 entry point
+  |   in the whole Terraform design)
+Application Load Balancer (public subnets, alb security group)
+  |  HTTP :8080, target group health-checked via GET /metrics
+  v
+go-server (private subnets, app security group)
+  |
+  |-- gRPC :50051 -->  cpp-router      (private subnets, internal security group)
+  `-- SQL   :5432 -->  RDS Postgres     (private subnets, data security group)
+                          ^
+                          | outbox poller reads the payment + outbox_events row
+                          | written above, in the same DB transaction
+                        go-worker      (private subnets, internal security group)
+                          |
+                          |-- SQL   :5432 -->  RDS Postgres (same instance as above; reconciliation writes)
+                          `-- Kafka :9092 <->  Redpanda      (private subnets, internal security group;
+                                                              go-worker's own outbox-poller goroutine
+                                                              publishes the routed-payment event here, and
+                                                              its own consume-loop goroutine -- same
+                                                              process -- consumes it back)
+
+go-server / go-worker / cpp-router
+  |
+  `-- OTLP/gRPC :4317 / scraped /metrics -->  observability stack
+                                                (private subnets, internal security group;
+                                                 OTel Collector -> Jaeger, Prometheus <- scrapes
+                                                 the three services above, Grafana <- Prometheus)
+```
+
+This is the same request/data flow as the local **Architecture** diagram
+above, redrawn with the AWS trust boundaries Terraform actually
+provisions: everything except the ALB sits in private subnets behind
+security groups with no path from the public internet, and the
+observability stack is both private and non-blocking — exactly as in the
+local Docker Compose stack, OTLP export failures are logged and swallowed
+rather than affecting payment processing, and the whole stack can be
+disabled via the `enable_observability_stack` Terraform variable
+(`environments/dev/variables.tf`) without touching any app service.
+
+## CI/CD
+
+**`.github/workflows/ci.yml`** runs on every pull request and every push
+to `main`. It has seven jobs, all independent:
+
+| Job | What it validates |
+|---|---|
+| `go` | `gofmt -l` (clean), `go vet ./...`, `go build ./...`, `go test ./...` in `go-api` (Go 1.27.1) |
+| `go-integration` | Spins up a `postgres:16-bookworm` service container, applies migrations with `scripts/apply_migrations.sh`, runs `go test -tags=integration ./...` |
+| `kafka-integration` | Spins up a `docker.redpanda.com/redpandadata/redpanda:v24.2.7` service container, runs `go test -tags=kafka_integration ./internal/kafka/...` |
+| `cpp` | Builds and `ctest`s both `router/` and `cpp-routing-service/` via CMake (Release) |
+| `docker-build` | Builds all three images (`go-server`, `go-worker`, `cpp-router`) with `docker/build-push-action` (`push: false`), then lints all three Dockerfiles with `hadolint` |
+| `terraform` | `terraform fmt -recursive -check -diff`, `terraform init -backend=false`, `terraform validate` against `environments/dev` |
+| `security-scan` | `gitleaks` secret scan across the full git history |
+
+**`.github/workflows/deploy.yml`** is manual-only
+(`workflow_dispatch`) and requires, to actually deploy anything:
+
+- A human triggering it explicitly, choosing an `environment` input
+  (a directory name under `infra/terraform/environments/`, default `dev`)
+  and typing `confirm_apply: yes` exactly — any other value runs
+  `terraform plan` only and stops there.
+- The `production` GitHub Environment's approval gate, which the workflow
+  requests (`environment: production`) but which has no approvers or
+  branch protections configured in this repository yet — that
+  configuration is a one-time, out-of-band GitHub repository setting, not
+  something this workflow file can create for itself.
+- A real AWS IAM role for OIDC federation (`aws-actions/configure-aws-credentials`
+  assumes `secrets.AWS_DEPLOY_ROLE_ARN` — no long-lived AWS credentials
+  are ever stored as a repository secret). Neither that IAM role, its
+  trust policy for this repository's OIDC provider, nor the
+  `AWS_DEPLOY_ROLE_ARN` secret itself exist yet; they must be created
+  out-of-band against a real AWS account before this workflow can
+  succeed.
+
+**CI never auto-deploys.** `ci.yml` contains no deploy step of any kind,
+and `deploy.yml` only ever runs on a human explicitly dispatching it —
+never on a push or a pull request. Even when dispatched, it only reaches
+`terraform apply` if the `confirm_apply` input is the literal string
+`yes`; every other input value, including the default, stops after
+`terraform plan`.
+
+**What's been verified and what hasn't:** the workflow YAML for both
+files is `actionlint`-clean (zero errors or warnings). Every command
+`ci.yml` runs was independently exercised manually on this development
+machine and passed: `go build`/`go vet`/`go test` in `go-api`, `cmake`
+configure/build/`ctest` for both `router/` and `cpp-routing-service/`,
+and `terraform fmt`/`init -backend=false`/`validate`. Neither workflow
+has ever actually executed as a real GitHub Actions run — that requires
+pushing this branch, which has not happened as part of this phase. In
+particular, the CMake Protobuf CONFIG/MODULE-mode fallback added to
+`cpp-routing-service/CMakeLists.txt` and `router/CMakeLists.txt` (so the
+Docker build and a real Ubuntu CI runner, whose `libprotobuf-dev` package
+ships no CMake CONFIG-mode files, can still configure successfully) was
+verified only against this macOS/Homebrew machine, the one platform
+reachable in this environment. Task 10's own full clean rebuild of
+`cpp-routing-service` passed `ctest` at 78/78, identical to its pre-change
+baseline, confirming no regression on that platform for the CONFIG-mode
+path; Task 10's verification of `router` itself was configure-time only
+(grepping the configure log for FetchContent/network activity, not an
+actual `ctest` run), so it produced no comparable pass count. Re-running
+`router`'s own test suite live while finalizing this documentation task
+(`cmake --build router/build -j && ctest --test-dir router/build`)
+confirmed 49/49 passing today, matching the project's established
+baseline. Whether the Module-mode fallback actually succeeds against
+Debian/Ubuntu's real `libprotobuf-dev` package remains unverified until
+this workflow genuinely runs on a real Ubuntu GitHub Actions runner.
+
 ## Environment variables
 
 All variables are read via `os.Getenv`; those with a documented default
 below fall back to it when unset or empty. `go-api/.env.example` has a
-starter file for local development (extend it with any variables you
-need beyond `DATABASE_URL`).
+starter file for local development covering every variable in the tables
+below.
 
 **Core (server and worker)**
 
@@ -406,12 +759,9 @@ need beyond `DATABASE_URL`).
 | `--listen-address` (flag) | `0.0.0.0:50051` | gRPC listen address. |
 | `METRICS_PORT` | `9102` | Port for the raw-socket `/metrics` listener. |
 
-`go-api/.env.example` currently documents `DATABASE_URL` and the Phase
-7 testnet-execution variables (`BLOCKCHAIN_ENV`,
-`TESTNET_WALLET_PRIVATE_KEY`, `ETHEREUM_SEPOLIA_RPC_URL`,
-`BASE_SEPOLIA_RPC_URL`, `ACROSS_TESTNET_API_URL`, `ACROSS_API_KEY`,
-`ACROSS_INTEGRATOR_ID`, `MAX_TESTNET_AMOUNT_WEI`,
-`RECONCILE_STALENESS_SECONDS`, `RECONCILE_SWEEP_INTERVAL_SECONDS`,
-`NONCE_DIVERGENCE_CHECK_INTERVAL_SECONDS`); the tables above are the
-complete, current set including the Kafka/outbox/recovery, Relay, and
-Phase 10 observability variables that file doesn't yet list.
+`go-api/.env.example` lists every variable from the tables above (Core /
+Server / Worker / Testnet-only), plus the Phase 11 Docker-Compose-only
+`POSTGRES_PASSWORD` (read by `docker-compose.yml` to build the
+`postgres`/`migrate`/`go-server`/`go-worker` services' `DATABASE_URL`,
+not by either Go binary directly) — copy it to `.env` and fill in the
+values you need for the mode you're running in.

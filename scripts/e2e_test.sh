@@ -112,24 +112,7 @@ fi
 kill -0 "$CPP_PID" 2>/dev/null || { echo "C++ service exited before becoming ready" >&2; exit 1; }
 
 echo "Ensuring database schema is up to date..."
-/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-    "SELECT 1 FROM information_schema.tables WHERE table_name='payments'" | grep -q 1 || \
-    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0001_create_payments.sql"
-/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-    "SELECT 1 FROM information_schema.tables WHERE table_name='outbox_events'" | grep -q 1 || \
-    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0002_payment_processing.sql"
-/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-    "SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_payment_id_fkey' AND confdeltype = 'c'" | grep -q 1 || \
-    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0003_outbox_events_cascade_delete.sql"
-/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-    "SELECT 1 FROM information_schema.tables WHERE table_name='payment_executions'" | grep -q 1 || \
-    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0004_across_testnet_execution.sql"
-/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-    "SELECT 1 FROM information_schema.tables WHERE table_name='payment_quotes'" | grep -q 1 || \
-    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0005_realtime_bridge_routing.sql"
-/opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -tAc \
-    "SELECT 1 FROM information_schema.columns WHERE table_name='payment_executions' AND column_name='provider_reference_id'" | grep -q 1 || \
-    /opt/homebrew/opt/postgresql@16/bin/psql "$DATABASE_URL" -f "$ROOT_DIR/go-api/migrations/0006_multi_provider_bridge_routing.sql"
+PSQL_BIN="/opt/homebrew/opt/postgresql@16/bin/psql" "$ROOT_DIR/scripts/apply_migrations.sh" "$DATABASE_URL"
 
 # Resolve a way to talk to Redpanda's rpk. The upstream project ships rpk
 # directly on PATH when Redpanda is installed natively (e.g. via Homebrew),
