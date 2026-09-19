@@ -251,15 +251,55 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// consumerConcurrency/publisherConcurrency each launch this many
+	// identical, independent goroutines against the SAME shared
+	// *kafka.Consumer/*worker.Processor or *worker.Publisher, rather than
+	// one. Both default to 1 (today's exact prior behavior, unchanged for
+	// any deployment that doesn't set these). A benchmark
+	// (docs/superpowers/benchmarks/2026-09-19-full-system-benchmark.md
+	// §10) found the single-goroutine OUTBOX PUBLISHER -- not the Kafka
+	// consumer -- to be the pipeline's real throughput ceiling: worker CPU
+	// sat under 1% at saturation and Kafka consumer lag stayed at 0 even
+	// with 3 consumer goroutines running, because Publisher.PollOnce
+	// claims and publishes exactly one outbox row per call, one full
+	// DB-claim + synchronous Kafka-produce round trip at a time, with no
+	// batching. Both are safe to parallelize: (1) kafka-go's
+	// Reader.FetchMessage/CommitMessages are documented-safe for
+	// concurrent calls from multiple goroutines (the standard consumer-
+	// pool pattern); (2) PublishNextOutboxEvent already claims its row via
+	// `FOR UPDATE SKIP LOCKED LIMIT 1`, PostgreSQL's standard idiom for
+	// exactly this multiple-concurrent-claimants case -- two publisher
+	// goroutines can never claim the same outbox row; (3) Processor's and
+	// Publisher's only shared state is Store (a *sql.DB-backed connection
+	// pool, safe for concurrent use) and Metrics/Logger (both
+	// concurrency-safe by design); (4) every message's state transition is
+	// already idempotent and DB-guarded (CompletePayment's `WHERE status =
+	// 'PROCESSING'`), the same guarantee that already makes the recovery
+	// sweep safe to race against a live in-progress execution. No
+	// transaction boundary, commit-after-success ordering, or delivery
+	// guarantee changes -- only how many of each cycle run at once.
+	consumerConcurrency := int(envInt64("WORKER_CONSUMER_CONCURRENCY", 1, logger))
+	if consumerConcurrency < 1 {
+		consumerConcurrency = 1
+	}
+	publisherConcurrency := int(envInt64("WORKER_PUBLISHER_CONCURRENCY", 1, logger))
+	if publisherConcurrency < 1 {
+		publisherConcurrency = 1
+	}
+
 	var wg sync.WaitGroup
-	goroutines := 3
+	goroutines := 1 + publisherConcurrency + consumerConcurrency
 	if reconciler != nil {
-		goroutines = 4
+		goroutines++
 	}
 	wg.Add(goroutines)
-	go func() { defer wg.Done(); publisher.Run(ctx, outboxPollInterval) }()
+	for i := 0; i < publisherConcurrency; i++ {
+		go func() { defer wg.Done(); publisher.Run(ctx, outboxPollInterval) }()
+	}
 	go func() { defer wg.Done(); recovery.Run(ctx, recoverySweepInterval) }()
-	go func() { defer wg.Done(); runConsumeLoop(ctx, consumer, processor, logger) }()
+	for i := 0; i < consumerConcurrency; i++ {
+		go func() { defer wg.Done(); runConsumeLoop(ctx, consumer, processor, logger) }()
+	}
 	if reconciler != nil {
 		go func() { defer wg.Done(); reconciler.Run(ctx, reconcileSweepInterval, nonceDivergenceCheckInterval) }()
 	}
@@ -273,7 +313,7 @@ func main() {
 		}
 	}()
 
-	logger.Info("worker started", "topic", topic, "group", consumerGroup, "brokers", brokers)
+	logger.Info("worker started", "topic", topic, "group", consumerGroup, "brokers", brokers, "consumer_concurrency", consumerConcurrency, "publisher_concurrency", publisherConcurrency)
 	<-ctx.Done()
 	logger.Info("shutting down...")
 
