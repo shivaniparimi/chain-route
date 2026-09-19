@@ -165,3 +165,17 @@ services:
       - "3000:3000"
     depends_on: [prometheus]
     restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      API_BASE_URL: http://localhost:8080
+    ports:
+      - "5173:80"
+    networks: [chainroute-net]
+    # No depends_on go-server: the frontend's own loading/error states
+    # handle a not-yet-ready API, matching the "nothing gates on a soft
+    # dependency" pattern this project already uses for observability.
+    restart: unless-stopped
