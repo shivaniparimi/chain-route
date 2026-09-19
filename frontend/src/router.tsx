@@ -9,8 +9,9 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     isActive ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
   }`;
 
-// Three placeholder routes -- later tasks fill in each stub page's real
-// content. This task's scope is only that the shell compiles and renders.
+// Three routes, each backed by its real page as of Task 12 (the Overview
+// Dashboard, the last of the three to get real content) -- no stub pages
+// remain.
 export function AppRoutes() {
   return (
     <div className="min-h-screen bg-slate-50">

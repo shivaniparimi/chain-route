@@ -174,13 +174,24 @@ func (h *Handler) GetPaymentQuotes(w http.ResponseWriter, r *http.Request) {
 // payment.DashboardStats by toDashboardStatsResponse) rather than adding
 // json tags to the domain type itself, matching this package's existing
 // convention for Payment/paymentResponse and Payment/paymentListItem.
+// networkUsageEntry is the JSON response shape for one element of
+// dashboardStats.NetworkUsage -- kept as its own thin, json-tagged struct
+// converted from payment.NetworkUsageEntry, matching this package's
+// existing domain/response separation.
+type networkUsageEntry struct {
+	SourceChain      string `json:"source_chain"`
+	DestinationChain string `json:"destination_chain"`
+	Count            int64  `json:"count"`
+}
+
 type dashboardStats struct {
-	TotalPayments      int64            `json:"total_payments"`
-	CompletedPayments  int64            `json:"completed_payments"`
-	ProcessingPayments int64            `json:"processing_payments"`
-	FailedPayments     int64            `json:"failed_payments"`
-	ProviderUsage      map[string]int64 `json:"provider_usage"`
-	AverageRoutingCost float64          `json:"average_routing_cost"`
+	TotalPayments      int64               `json:"total_payments"`
+	CompletedPayments  int64               `json:"completed_payments"`
+	ProcessingPayments int64               `json:"processing_payments"`
+	FailedPayments     int64               `json:"failed_payments"`
+	ProviderUsage      map[string]int64    `json:"provider_usage"`
+	AverageRoutingCost float64             `json:"average_routing_cost"`
+	NetworkUsage       []networkUsageEntry `json:"network_usage"`
 }
 
 func toDashboardStatsResponse(s payment.DashboardStats) dashboardStats {
@@ -188,16 +199,24 @@ func toDashboardStatsResponse(s payment.DashboardStats) dashboardStats {
 	if providerUsage == nil {
 		providerUsage = map[string]int64{}
 	}
+	networkUsage := make([]networkUsageEntry, 0, len(s.NetworkUsage))
+	for _, entry := range s.NetworkUsage {
+		networkUsage = append(networkUsage, networkUsageEntry{
+			SourceChain: entry.SourceChain, DestinationChain: entry.DestinationChain, Count: entry.Count,
+		})
+	}
 	return dashboardStats{
 		TotalPayments: s.TotalPayments, CompletedPayments: s.CompletedPayments,
 		ProcessingPayments: s.ProcessingPayments, FailedPayments: s.FailedPayments,
 		ProviderUsage: providerUsage, AverageRoutingCost: s.AverageRoutingCost,
+		NetworkUsage: networkUsage,
 	}
 }
 
 // GetDashboardStats returns the read-only aggregate counters backing the
-// dashboard overview: payment counts by status, per-provider usage, and
-// average routing cost -- computed entirely in SQL by
+// dashboard overview: payment counts by status, per-provider usage,
+// per-corridor (source_chain/destination_chain) network usage, and average
+// routing cost -- computed entirely in SQL by
 // postgres.Store.GetDashboardStats (a small fixed number of aggregation
 // queries, never fetch-all-then-aggregate-in-Go).
 func (h *Handler) GetDashboardStats(w http.ResponseWriter, r *http.Request) {

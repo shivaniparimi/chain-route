@@ -153,6 +153,22 @@ type DashboardStats struct {
 	FailedPayments     int64
 	ProviderUsage      map[string]int64
 	AverageRoutingCost float64
+	// NetworkUsage is the source_chain/destination_chain-pair frequency
+	// breakdown (Task 12, phase 12), added for the Overview Dashboard's
+	// network-usage chart -- computed by postgres.Store.GetDashboardStats
+	// as one additional GROUP BY source_chain, destination_chain query,
+	// following the exact same convention as ProviderUsage above (a
+	// variable number of rows, so it can't be folded into the fixed-shape
+	// counts query either).
+	NetworkUsage []NetworkUsageEntry
+}
+
+// NetworkUsageEntry is one source-chain/destination-chain pair's payment
+// count, one element of DashboardStats.NetworkUsage.
+type NetworkUsageEntry struct {
+	SourceChain      string
+	DestinationChain string
+	Count            int64
 }
 
 // TimeseriesPoint is one bucketed data point for the read-only

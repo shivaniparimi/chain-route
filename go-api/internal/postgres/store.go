@@ -395,12 +395,14 @@ func (s *Store) ListPayments(ctx context.Context, filter payment.ListFilter) ([]
 }
 
 // GetDashboardStats computes the read-only dashboard overview counters in
-// exactly two aggregation queries -- both aggregating in SQL, never
+// exactly three aggregation queries -- all aggregating in SQL, never
 // fetch-all-then-aggregate-in-Go, to keep this endpoint free of N+1 query
 // patterns regardless of table size. The first query aggregates payment
 // counts by status plus the average total_fee in one pass; the second
-// groups by bridge_provider for the provider-usage breakdown (a variable
-// number of rows, so it can't be folded into the fixed-shape first query).
+// groups by bridge_provider for the provider-usage breakdown, and the third
+// groups by (source_chain, destination_chain) for the network-usage
+// breakdown -- both variable-row-count breakdowns, so neither can be folded
+// into the fixed-shape first query.
 func (s *Store) GetDashboardStats(ctx context.Context) (payment.DashboardStats, error) {
 	var stats payment.DashboardStats
 	stats.ProviderUsage = map[string]int64{}
@@ -436,7 +438,27 @@ func (s *Store) GetDashboardStats(ctx context.Context) (payment.DashboardStats, 
 		}
 		stats.ProviderUsage[provider] = count
 	}
-	return stats, rows.Err()
+	if err := rows.Err(); err != nil {
+		return payment.DashboardStats{}, err
+	}
+
+	networkRows, err := s.db.QueryContext(ctx, `
+		SELECT source_chain, destination_chain, COUNT(*)
+		FROM payments
+		GROUP BY source_chain, destination_chain
+	`)
+	if err != nil {
+		return payment.DashboardStats{}, fmt.Errorf("get network usage: %w", err)
+	}
+	defer networkRows.Close()
+	for networkRows.Next() {
+		var entry payment.NetworkUsageEntry
+		if err := networkRows.Scan(&entry.SourceChain, &entry.DestinationChain, &entry.Count); err != nil {
+			return payment.DashboardStats{}, fmt.Errorf("scan network usage row: %w", err)
+		}
+		stats.NetworkUsage = append(stats.NetworkUsage, entry)
+	}
+	return stats, networkRows.Err()
 }
 
 // GetTimeseries buckets payments by created_at (truncated to the given

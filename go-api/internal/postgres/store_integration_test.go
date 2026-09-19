@@ -81,6 +81,18 @@ func testPayment(idempotencyKey string) payment.Payment {
 	}
 }
 
+// networkUsageCount finds the count for one source/destination pair in a
+// DashboardStats.NetworkUsage breakdown, or 0 if that pair has no entry
+// (e.g. a fresh table with no rows on that corridor yet).
+func networkUsageCount(usage []payment.NetworkUsageEntry, sourceChain, destChain string) int64 {
+	for _, entry := range usage {
+		if entry.SourceChain == sourceChain && entry.DestinationChain == destChain {
+			return entry.Count
+		}
+	}
+	return 0
+}
+
 func TestCreateOrGetPayment_NormalCreation(t *testing.T) {
 	s := newTestStore(t)
 	key := "test-normal-creation-key"
@@ -1288,6 +1300,15 @@ func TestGetDashboardStats_CountsAndProviderUsageAreExact(t *testing.T) {
 	if got := after.ProviderUsage[providerB] - before.ProviderUsage[providerB]; got != 1 {
 		t.Fatalf("expected provider %s usage to increase by 1, got %d (before=%d after=%d)",
 			providerB, got, before.ProviderUsage[providerB], after.ProviderUsage[providerB])
+	}
+
+	// NetworkUsage: every one of the 5 seeded payments above uses
+	// testPayment()'s default ethereum -> base corridor, so the
+	// ethereum/base entry's count should increase by exactly 5 -- same
+	// before/after delta approach as ProviderUsage above, for the same
+	// shared-table reason.
+	if got := networkUsageCount(after.NetworkUsage, "ethereum", "base") - networkUsageCount(before.NetworkUsage, "ethereum", "base"); got != 5 {
+		t.Fatalf("expected ethereum->base network usage to increase by 5, got %d", got)
 	}
 
 	// AverageRoutingCost is a table-wide AVG(total_fee), so it can't be

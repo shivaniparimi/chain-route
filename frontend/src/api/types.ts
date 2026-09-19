@@ -101,7 +101,24 @@ export interface PaymentQuotesResponse {
   quotes: Quote[];
 }
 
+// handler.networkUsageEntry (dashboard.go) -- one element of
+// DashboardStats.network_usage.
+export interface NetworkUsageEntry {
+  source_chain: string;
+  destination_chain: string;
+  count: number;
+}
+
 // handler.dashboardStats (dashboard.go) -- GET /dashboard/stats
+//
+// network_usage: added by Task 12 (phase 12, additive-only extension to
+// dashboard.go's toDashboardStatsResponse -- every pre-existing field above
+// is untouched) so the Overview Dashboard's NetworkUsageChart has a true,
+// indexed SQL aggregate (postgres.Store.GetDashboardStats's new
+// GROUP BY source_chain, destination_chain query) to render instead of a
+// client-side approximation over a paginated /payments response. Always an
+// array (never null): an empty payments table serializes as "[]", matching
+// provider_usage's existing nil-map-renders-as-{} convention.
 export interface DashboardStats {
   total_payments: number;
   completed_payments: number;
@@ -109,6 +126,7 @@ export interface DashboardStats {
   failed_payments: number;
   provider_usage: Record<string, number>;
   average_routing_cost: number;
+  network_usage: NetworkUsageEntry[];
 }
 
 // handler.timeseriesPoint (dashboard.go)

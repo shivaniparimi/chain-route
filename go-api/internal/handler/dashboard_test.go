@@ -372,6 +372,10 @@ func TestGetDashboardStats_ReturnsExpectedShape(t *testing.T) {
 		TotalPayments: 10, CompletedPayments: 6, ProcessingPayments: 3, FailedPayments: 1,
 		ProviderUsage:      map[string]int64{"across": 4, "relay": 2},
 		AverageRoutingCost: 1.25,
+		NetworkUsage: []payment.NetworkUsageEntry{
+			{SourceChain: "ethereum", DestinationChain: "base", Count: 5},
+			{SourceChain: "base", DestinationChain: "arbitrum", Count: 1},
+		},
 	}
 	h := &Handler{DashboardStore: &fakeDashboardStore{statsResult: stats}}
 
@@ -390,6 +394,34 @@ func TestGetDashboardStats_ReturnsExpectedShape(t *testing.T) {
 	}
 	if resp.ProviderUsage["across"] != 4 || resp.ProviderUsage["relay"] != 2 || len(resp.ProviderUsage) != 2 {
 		t.Fatalf("unexpected provider usage: %+v", resp.ProviderUsage)
+	}
+	if len(resp.NetworkUsage) != 2 {
+		t.Fatalf("unexpected network usage length: %+v", resp.NetworkUsage)
+	}
+	if resp.NetworkUsage[0].SourceChain != "ethereum" || resp.NetworkUsage[0].DestinationChain != "base" || resp.NetworkUsage[0].Count != 5 {
+		t.Fatalf("unexpected network usage[0]: %+v", resp.NetworkUsage[0])
+	}
+	if resp.NetworkUsage[1].SourceChain != "base" || resp.NetworkUsage[1].DestinationChain != "arbitrum" || resp.NetworkUsage[1].Count != 1 {
+		t.Fatalf("unexpected network usage[1]: %+v", resp.NetworkUsage[1])
+	}
+}
+
+// TestGetDashboardStats_NilNetworkUsageRendersAsEmptyArray mirrors the
+// existing nil-map-renders-as-{} convention for ProviderUsage (see
+// toDashboardStatsResponse) -- a nil NetworkUsage slice (the zero value,
+// e.g. an empty payments table) must render as "[]" in the JSON response,
+// never fabricated data and never the bare word "null", so the frontend's
+// NetworkUsageChart can render an honest empty state without special-casing
+// null.
+func TestGetDashboardStats_NilNetworkUsageRendersAsEmptyArray(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{statsResult: payment.DashboardStats{}}}
+
+	rec := doDashboardStatsRequest(h, "/dashboard/stats")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"network_usage":[]`) {
+		t.Fatalf("expected network_usage to serialize as an empty array, got: %s", rec.Body.String())
 	}
 }
 
