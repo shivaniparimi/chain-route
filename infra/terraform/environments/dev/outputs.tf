@@ -19,5 +19,9 @@ output "database_secret_arn" {
 }
 
 output "cloudfront_domain_name" {
-  value = var.enable_frontend ? module.frontend[0].cloudfront_domain_name : null
+  # one() avoids indexing a count-0 module in the disabled path (see the
+  # matching CHAINROUTE_CORS_ALLOWED_ORIGINS comment in main.tf) -- it
+  # returns null when enable_frontend = false, the single domain name
+  # otherwise.
+  value = one(module.frontend[*].cloudfront_domain_name)
 }

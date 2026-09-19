@@ -77,5 +77,11 @@ resource "aws_cloudfront_distribution" "frontend" {
     cloudfront_default_certificate = var.acm_certificate_arn == null
     acm_certificate_arn            = var.acm_certificate_arn
     ssl_support_method             = var.acm_certificate_arn == null ? null : "sni-only"
+    # Without this, the AWS provider defaults minimum_protocol_version to
+    # TLSv1 when a custom acm_certificate_arn is supplied, silently
+    # allowing weak TLS. Only meaningful (and only settable) alongside a
+    # custom certificate -- must stay null for the CloudFront default
+    # certificate path, which enforces its own minimum.
+    minimum_protocol_version = var.acm_certificate_arn == null ? null : "TLSv1.2_2021"
   }
 }
