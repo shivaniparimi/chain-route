@@ -26,6 +26,13 @@ type fakeDashboardStore struct {
 
 	statsResult payment.DashboardStats
 	statsErr    error
+
+	timeseriesResult   []payment.TimeseriesPoint
+	timeseriesErr      error
+	lastTimeseriesArgs struct {
+		metric, interval string
+		days             int
+	}
 }
 
 func (f *fakeDashboardStore) ListPayments(_ context.Context, filter payment.ListFilter) ([]payment.Payment, string, error) {
@@ -40,6 +47,13 @@ func (f *fakeDashboardStore) GetQuotesByPaymentID(_ context.Context, paymentID s
 
 func (f *fakeDashboardStore) GetDashboardStats(_ context.Context) (payment.DashboardStats, error) {
 	return f.statsResult, f.statsErr
+}
+
+func (f *fakeDashboardStore) GetTimeseries(_ context.Context, metric, interval string, days int) ([]payment.TimeseriesPoint, error) {
+	f.lastTimeseriesArgs.metric = metric
+	f.lastTimeseriesArgs.interval = interval
+	f.lastTimeseriesArgs.days = days
+	return f.timeseriesResult, f.timeseriesErr
 }
 
 func doListPaymentsRequest(h *Handler, target string) *httptest.ResponseRecorder {
@@ -383,6 +397,133 @@ func TestGetDashboardStats_StoreErrorReturns500(t *testing.T) {
 	h := &Handler{DashboardStore: &fakeDashboardStore{statsErr: context.DeadlineExceeded}}
 
 	rec := doDashboardStatsRequest(h, "/dashboard/stats")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+}
+
+func doDashboardTimeseriesRequest(h *Handler, target string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", target, nil)
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /dashboard/timeseries", h.GetDashboardTimeseries)
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestGetDashboardTimeseries_DefaultsApplied(t *testing.T) {
+	store := &fakeDashboardStore{}
+	h := &Handler{DashboardStore: store}
+
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if store.lastTimeseriesArgs.metric != "volume" {
+		t.Fatalf("expected default metric \"volume\", got %q", store.lastTimeseriesArgs.metric)
+	}
+	if store.lastTimeseriesArgs.interval != "day" {
+		t.Fatalf("expected default interval \"day\", got %q", store.lastTimeseriesArgs.interval)
+	}
+	if store.lastTimeseriesArgs.days != defaultTimeseriesDays {
+		t.Fatalf("expected default days %d, got %d", defaultTimeseriesDays, store.lastTimeseriesArgs.days)
+	}
+
+	var resp timeseriesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Metric != "volume" {
+		t.Fatalf("expected response metric \"volume\", got %q", resp.Metric)
+	}
+}
+
+func TestGetDashboardTimeseries_InvalidMetricReturns400(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{}}
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries?metric=bogus")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetDashboardTimeseries_InvalidIntervalReturns400(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{}}
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries?interval=week")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestGetDashboardTimeseries_InvalidDaysReturns400(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{}}
+	for _, raw := range []string{"0", "-1", "abc"} {
+		rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries?days="+raw)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("days=%q: expected 400, got %d", raw, rec.Code)
+		}
+	}
+}
+
+func TestGetDashboardTimeseries_DaysClampedToMax(t *testing.T) {
+	store := &fakeDashboardStore{}
+	h := &Handler{DashboardStore: store}
+
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries?days=365")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if store.lastTimeseriesArgs.days != maxTimeseriesDays {
+		t.Fatalf("expected days clamped to %d, got %d", maxTimeseriesDays, store.lastTimeseriesArgs.days)
+	}
+}
+
+func TestGetDashboardTimeseries_ValidRequestReturnsExpectedShape(t *testing.T) {
+	bucket := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	store := &fakeDashboardStore{
+		timeseriesResult: []payment.TimeseriesPoint{
+			{Bucket: bucket, Value: 3, Count: 3},
+		},
+	}
+	h := &Handler{DashboardStore: store}
+
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries?metric=routing_cost&interval=hour&days=7")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if store.lastTimeseriesArgs.metric != "routing_cost" || store.lastTimeseriesArgs.interval != "hour" || store.lastTimeseriesArgs.days != 7 {
+		t.Fatalf("unexpected args passed to store: %+v", store.lastTimeseriesArgs)
+	}
+
+	var resp timeseriesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Metric != "routing_cost" {
+		t.Fatalf("expected metric \"routing_cost\", got %q", resp.Metric)
+	}
+	if len(resp.Points) != 1 {
+		t.Fatalf("expected 1 point, got %d", len(resp.Points))
+	}
+	p := resp.Points[0]
+	if p.Bucket != "2026-01-02T00:00:00Z" || p.Value != 3 || p.Count != 3 {
+		t.Fatalf("unexpected point shape: %+v", p)
+	}
+}
+
+func TestGetDashboardTimeseries_NoPointsReturnsEmptyArrayNotNull(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{timeseriesResult: nil}}
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"points":[]`) {
+		t.Fatalf("expected points to render as an empty array, not null: %s", rec.Body.String())
+	}
+}
+
+func TestGetDashboardTimeseries_StoreErrorReturns500(t *testing.T) {
+	h := &Handler{DashboardStore: &fakeDashboardStore{timeseriesErr: context.DeadlineExceeded}}
+	rec := doDashboardTimeseriesRequest(h, "/dashboard/timeseries")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", rec.Code)
 	}

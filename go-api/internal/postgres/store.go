@@ -439,6 +439,64 @@ func (s *Store) GetDashboardStats(ctx context.Context) (payment.DashboardStats, 
 	return stats, rows.Err()
 }
 
+// GetTimeseries buckets payments by created_at (truncated to the given
+// interval, "hour" or "day") over the trailing `days` days, returning one
+// row per non-empty bucket with the payment count and the requested
+// metric's aggregate ("volume" -> COUNT(*), "routing_cost" ->
+// COALESCE(AVG(total_fee), 0)) -- a single aggregation query, never
+// fetch-all-then-aggregate-in-Go, to keep this endpoint free of N+1 query
+// patterns.
+//
+// aggregateExpr is spliced into the query TEXT via fmt.Sprintf, but it is
+// chosen from a fixed, code-controlled 2-value set based on metric, which
+// the caller (handler.GetDashboardTimeseries) has already validated
+// against validTimeseriesMetrics ({"volume", "routing_cost"}) before this
+// method is ever reachable -- metric's raw string value is never itself
+// interpolated into the query, only used as a Go switch key that selects
+// one of the two literal SQL fragments below. interval and days, the
+// actual caller/user-influenced values, are passed as $1/$2 query
+// arguments, which QueryContext binds out-of-band -- never concatenated
+// into the query text. This mirrors ListPayments' nextArg convention
+// (see its doc comment) and is not vulnerable to SQL injection.
+func (s *Store) GetTimeseries(ctx context.Context, metric, interval string, days int) ([]payment.TimeseriesPoint, error) {
+	aggregateExpr := "COUNT(*)"
+	if metric == "routing_cost" {
+		aggregateExpr = "COALESCE(AVG(total_fee), 0)"
+	}
+	// The brief's sketch built the trailing-window cutoff as
+	// (($2 || ' days')::interval, i.e. concatenating the $2 placeholder
+	// (a Go int) with a text literal via ||. That leaves Postgres/pgx
+	// unable to infer $2's type ("failed to encode args[1] ... cannot
+	// find encode plan" at runtime) -- caught by this package's own
+	// integration tests. make_interval(days => $2) sidesteps the
+	// ambiguity by taking the integer directly, matching the same fix
+	// StalePaymentIDs already applies to an identical problem via
+	// make_interval(secs => $2) above.
+	query := fmt.Sprintf(`
+		SELECT date_trunc($1, created_at) AS bucket, COUNT(*), %s
+		FROM payments
+		WHERE created_at > now() - make_interval(days => $2)
+		GROUP BY bucket
+		ORDER BY bucket
+	`, aggregateExpr)
+
+	rows, err := s.db.QueryContext(ctx, query, interval, days)
+	if err != nil {
+		return nil, fmt.Errorf("get timeseries: %w", err)
+	}
+	defer rows.Close()
+
+	points := []payment.TimeseriesPoint{}
+	for rows.Next() {
+		var p payment.TimeseriesPoint
+		if err := rows.Scan(&p.Bucket, &p.Count, &p.Value); err != nil {
+			return nil, fmt.Errorf("scan timeseries row: %w", err)
+		}
+		points = append(points, p)
+	}
+	return points, rows.Err()
+}
+
 // ClaimPayment atomically transitions a payment from ROUTED to PROCESSING,
 // returning its execution_mode in the same round trip. claimed=false means
 // the payment was not ROUTED (already claimed by another delivery, or in

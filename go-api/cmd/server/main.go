@@ -126,6 +126,7 @@ func main() {
 	mux.HandleFunc("GET /payments/{id}", h.GetPayment)
 	mux.HandleFunc("GET /payments/{id}/quotes", h.GetPaymentQuotes)
 	mux.HandleFunc("GET /dashboard/stats", h.GetDashboardStats)
+	mux.HandleFunc("GET /dashboard/timeseries", h.GetDashboardTimeseries)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
 	// CORS wraps the whole mux (before otelhttp instrumentation) so its

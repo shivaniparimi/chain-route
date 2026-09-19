@@ -1306,3 +1306,181 @@ func TestGetDashboardStats_CountsAndProviderUsageAreExact(t *testing.T) {
 			wantAvg, beforeSum, seededCount, seededFee, before.TotalPayments+seededCount, after.AverageRoutingCost)
 	}
 }
+
+// seedPaymentAt inserts a payment row with an explicit created_at,
+// bypassing CreateOrGetPayment's now()-default -- necessary because
+// GetTimeseries buckets by created_at, and the timeseries tests below need
+// full control over which bucket each seeded row lands in. Every other
+// column besides idempotency_key/total_fee/created_at is left to its
+// table default (status='ROUTED', execution_mode='simulated'), since
+// GetTimeseries never reads them.
+func seedPaymentAt(t *testing.T, s *Store, idempotencyKey string, createdAt time.Time, totalFee float64) {
+	t.Helper()
+	_, err := s.db.ExecContext(context.Background(), `
+		INSERT INTO payments (idempotency_key, source_chain, destination_chain, asset, amount, total_fee, created_at)
+		VALUES ($1, 'ethereum', 'base', 'USDC', 1000.00, $2, $3)
+	`, idempotencyKey, totalFee, createdAt)
+	if err != nil {
+		t.Fatalf("seed payment %s at %v: %v", idempotencyKey, createdAt, err)
+	}
+}
+
+// truncatedBucket asks Postgres itself what date_trunc(interval, ts)
+// produces, rather than the test independently recomputing that boundary
+// in Go -- the session's timezone (e.g. not UTC) affects where a "day"
+// bucket boundary falls, and hardcoding that logic in the test would
+// either duplicate GetTimeseries's own SQL or silently assume UTC. This
+// only computes the ground-truth bucket for a known input instant; it
+// does not re-implement or bypass GetTimeseries's own aggregation.
+func truncatedBucket(t *testing.T, s *Store, interval string, ts time.Time) time.Time {
+	t.Helper()
+	var bucket time.Time
+	row := s.db.QueryRowContext(context.Background(), `SELECT date_trunc($1, $2::timestamptz)`, interval, ts)
+	if err := row.Scan(&bucket); err != nil {
+		t.Fatalf("compute expected %s bucket for %v: %v", interval, ts, err)
+	}
+	return bucket
+}
+
+func findTimeseriesPoint(points []payment.TimeseriesPoint, bucket time.Time) (payment.TimeseriesPoint, bool) {
+	for _, p := range points {
+		if p.Bucket.Equal(bucket) {
+			return p, true
+		}
+	}
+	return payment.TimeseriesPoint{}, false
+}
+
+// TestGetTimeseries_VolumeBucketsByDayAndRespectsDaysWindow seeds three
+// payments at the exact same instant (10 days ago), which -- because
+// date_trunc is deterministic -- are guaranteed to land in the same "day"
+// bucket regardless of session timezone, plus one payment 40 days ago
+// (outside the days=30 window). It asserts the in-window bucket's count is
+// exactly 3 and that no point exists for the out-of-window bucket, proving
+// both the GROUP BY bucketing and the `created_at > now() - N days` filter.
+func TestGetTimeseries_VolumeBucketsByDayAndRespectsDaysWindow(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{
+		"test-ts-vol-day-1", "test-ts-vol-day-2", "test-ts-vol-day-3",
+		"test-ts-vol-day-outside-window",
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	inWindow := time.Now().UTC().AddDate(0, 0, -10)
+	outsideWindow := time.Now().UTC().AddDate(0, 0, -40)
+
+	seedPaymentAt(t, s, keys[0], inWindow, 1.0)
+	seedPaymentAt(t, s, keys[1], inWindow, 1.0)
+	seedPaymentAt(t, s, keys[2], inWindow, 1.0)
+	seedPaymentAt(t, s, keys[3], outsideWindow, 1.0)
+
+	points, err := s.GetTimeseries(context.Background(), "volume", "day", 30)
+	if err != nil {
+		t.Fatalf("GetTimeseries: %v", err)
+	}
+
+	wantBucket := truncatedBucket(t, s, "day", inWindow)
+	got, found := findTimeseriesPoint(points, wantBucket)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", wantBucket, points)
+	}
+	if got.Count != 3 {
+		t.Fatalf("expected count 3 in the in-window bucket, got %d", got.Count)
+	}
+	if got.Value != 3 {
+		t.Fatalf("expected value 3 (COUNT(*) for volume metric) in the in-window bucket, got %v", got.Value)
+	}
+
+	excludedBucket := truncatedBucket(t, s, "day", outsideWindow)
+	if _, found := findTimeseriesPoint(points, excludedBucket); found {
+		t.Fatalf("expected no bucket at %v (40 days ago, outside the 30-day window), but found one", excludedBucket)
+	}
+}
+
+// TestGetTimeseries_RoutingCostAveragePerBucketIsExact seeds three payments
+// with known, distinct total_fee values into a single day bucket (11 days
+// ago, distinct from the other timeseries tests' synthetic days so they
+// can't cross-contaminate each other's bucket), then asserts
+// GetTimeseries("routing_cost", ...) computes that bucket's average
+// exactly -- an exact assertion is possible here (unlike
+// GetDashboardStats's table-wide average) because this bucket is
+// exclusively populated by this test's own seeded rows.
+func TestGetTimeseries_RoutingCostAveragePerBucketIsExact(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{"test-ts-cost-day-1", "test-ts-cost-day-2", "test-ts-cost-day-3"}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	bucketInstant := time.Now().UTC().AddDate(0, 0, -11)
+	fees := []float64{1.0, 2.0, 3.0}
+	for i, key := range keys {
+		seedPaymentAt(t, s, key, bucketInstant, fees[i])
+	}
+
+	points, err := s.GetTimeseries(context.Background(), "routing_cost", "day", 30)
+	if err != nil {
+		t.Fatalf("GetTimeseries: %v", err)
+	}
+
+	wantBucket := truncatedBucket(t, s, "day", bucketInstant)
+	got, found := findTimeseriesPoint(points, wantBucket)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", wantBucket, points)
+	}
+	if got.Count != 3 {
+		t.Fatalf("expected count 3, got %d", got.Count)
+	}
+	const wantAvg = 2.0 // (1.0 + 2.0 + 3.0) / 3
+	if diff := got.Value - wantAvg; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("expected average routing cost %v, got %v", wantAvg, got.Value)
+	}
+}
+
+// TestGetTimeseries_HourIntervalBucketsSeparately seeds two payments 3
+// hours apart (12 days ago, distinct from the other timeseries tests'
+// synthetic days) and asserts interval="hour" places them in two distinct
+// buckets with the correct per-bucket counts -- a 3-hour gap guarantees
+// distinct hour buckets regardless of the session's timezone offset,
+// since date_trunc('hour', ...) always produces buckets exactly one
+// wall-clock hour wide.
+func TestGetTimeseries_HourIntervalBucketsSeparately(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{"test-ts-hour-1a", "test-ts-hour-1b", "test-ts-hour-2"}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	hourOne := time.Now().UTC().AddDate(0, 0, -12)
+	hourTwo := hourOne.Add(3 * time.Hour)
+
+	seedPaymentAt(t, s, keys[0], hourOne, 1.0)
+	seedPaymentAt(t, s, keys[1], hourOne, 1.0)
+	seedPaymentAt(t, s, keys[2], hourTwo, 1.0)
+
+	points, err := s.GetTimeseries(context.Background(), "volume", "hour", 30)
+	if err != nil {
+		t.Fatalf("GetTimeseries: %v", err)
+	}
+
+	bucketOne := truncatedBucket(t, s, "hour", hourOne)
+	bucketTwo := truncatedBucket(t, s, "hour", hourTwo)
+	if bucketOne.Equal(bucketTwo) {
+		t.Fatalf("test setup bug: expected distinct hour buckets, got the same bucket %v for both", bucketOne)
+	}
+
+	gotOne, found := findTimeseriesPoint(points, bucketOne)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", bucketOne, points)
+	}
+	if gotOne.Count != 2 {
+		t.Fatalf("expected count 2 in the first hour bucket, got %d", gotOne.Count)
+	}
+
+	gotTwo, found := findTimeseriesPoint(points, bucketTwo)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", bucketTwo, points)
+	}
+	if gotTwo.Count != 1 {
+		t.Fatalf("expected count 1 in the second hour bucket, got %d", gotTwo.Count)
+	}
+}

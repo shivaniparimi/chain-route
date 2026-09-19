@@ -18,6 +18,7 @@ type DashboardStore interface {
 	ListPayments(ctx context.Context, filter payment.ListFilter) ([]payment.Payment, string, error)
 	GetQuotesByPaymentID(ctx context.Context, paymentID string) ([]payment.Quote, error)
 	GetDashboardStats(ctx context.Context) (payment.DashboardStats, error)
+	GetTimeseries(ctx context.Context, metric, interval string, days int) ([]payment.TimeseriesPoint, error)
 }
 
 type paymentListItem struct {
@@ -207,4 +208,82 @@ func (h *Handler) GetDashboardStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toDashboardStatsResponse(stats))
+}
+
+type timeseriesPoint struct {
+	Bucket string  `json:"bucket"`
+	Value  float64 `json:"value"`
+	Count  int64   `json:"count"`
+}
+
+type timeseriesResponse struct {
+	Metric string            `json:"metric"`
+	Points []timeseriesPoint `json:"points"`
+}
+
+var validTimeseriesMetrics = map[string]bool{"volume": true, "routing_cost": true}
+var validTimeseriesIntervals = map[string]bool{"hour": true, "day": true}
+
+const (
+	defaultTimeseriesDays = 30
+	maxTimeseriesDays     = 90
+)
+
+// GetDashboardTimeseries returns bucketed payment volume or average routing
+// cost over time, for the dashboard's trend chart -- read-only, computed
+// entirely in SQL by postgres.Store.GetTimeseries (one aggregation query,
+// never fetch-all-then-aggregate-in-Go). metric and interval are validated
+// against a fixed allow-list before ever reaching the store, since
+// GetTimeseries builds its SQL aggregate expression from metric via
+// fmt.Sprintf (see that method's doc comment) -- this validation is what
+// keeps that safe.
+func (h *Handler) GetDashboardTimeseries(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	metric := q.Get("metric")
+	if metric == "" {
+		metric = "volume"
+	}
+	if !validTimeseriesMetrics[metric] {
+		writeError(w, http.StatusBadRequest, "metric must be \"volume\" or \"routing_cost\"")
+		return
+	}
+
+	interval := q.Get("interval")
+	if interval == "" {
+		interval = "day"
+	}
+	if !validTimeseriesIntervals[interval] {
+		writeError(w, http.StatusBadRequest, "interval must be \"hour\" or \"day\"")
+		return
+	}
+
+	days := defaultTimeseriesDays
+	if raw := q.Get("days"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "days must be a positive integer")
+			return
+		}
+		days = n
+		if days > maxTimeseriesDays {
+			days = maxTimeseriesDays
+		}
+	}
+
+	points, err := h.DashboardStore.GetTimeseries(r.Context(), metric, interval, days)
+	if err != nil {
+		h.logger().ErrorContext(r.Context(), "failed to read dashboard timeseries", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	items := make([]timeseriesPoint, 0, len(points))
+	for _, p := range points {
+		items = append(items, timeseriesPoint{
+			Bucket: p.Bucket.UTC().Format(time.RFC3339),
+			Value:  p.Value,
+			Count:  p.Count,
+		})
+	}
+	writeJSON(w, http.StatusOK, timeseriesResponse{Metric: metric, Points: items})
 }

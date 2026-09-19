@@ -155,6 +155,19 @@ type DashboardStats struct {
 	AverageRoutingCost float64
 }
 
+// TimeseriesPoint is one bucketed data point for the read-only
+// GET /dashboard/timeseries endpoint -- Bucket is the truncated timestamp
+// (per the requested interval: hour or day), Count is the number of
+// payments in that bucket, and Value is the requested metric's aggregate
+// for that bucket (payment count for "volume", average total_fee for
+// "routing_cost"). Like DashboardStats, this is a plain domain type with
+// no json tags; handler holds its own json-tagged response-shape struct.
+type TimeseriesPoint struct {
+	Bucket time.Time
+	Value  float64
+	Count  int64
+}
+
 // CreateResult reports what Store.CreateOrGetPayment actually did.
 type CreateResult int
 
