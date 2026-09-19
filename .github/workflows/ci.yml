@@ -93,6 +93,36 @@ jobs:
           cmake --build cpp-routing-service/build -j
           ctest --test-dir cpp-routing-service/build --output-on-failure
 
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: install
+        working-directory: frontend
+        run: npm ci
+      - name: typecheck
+        working-directory: frontend
+        # frontend/tsconfig.json is solution-style ({"files": [],
+        # "references": [...]}); `tsc --noEmit` does NOT follow project
+        # references (only `tsc -b` does), so it silently resolves to zero
+        # input files and exits 0 without checking anything. `tsc -b
+        # --force` is required to actually type-check this project.
+        run: npx tsc -b --force
+      - name: lint
+        working-directory: frontend
+        run: npx eslint src --ext .ts,.tsx
+      - name: test
+        working-directory: frontend
+        run: npm run test
+      - name: build
+        working-directory: frontend
+        run: npm run build
+
   docker-build:
     runs-on: ubuntu-latest
     steps:
@@ -116,6 +146,11 @@ jobs:
           context: .
           file: Dockerfile.cpp-router
           push: false
+      - name: build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: false
       - name: hadolint (cpp-router)
         uses: hadolint/hadolint-action@v3.1.0
         with:
@@ -128,6 +163,10 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: go-api/cmd/worker/Dockerfile
+      - name: hadolint (frontend)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
 
   terraform:
     runs-on: ubuntu-latest

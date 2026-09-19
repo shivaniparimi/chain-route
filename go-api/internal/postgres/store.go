@@ -253,8 +253,8 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 		}
 	}
 
-	if p.Quote != nil {
-		if err := insertPaymentQuote(ctx, tx, created.ID, p.Quote); err != nil {
+	if len(p.Quotes) > 0 {
+		if err := insertPaymentQuotes(ctx, tx, created.ID, p.Quotes); err != nil {
 			return payment.Payment{}, 0, err
 		}
 	}
@@ -293,6 +293,231 @@ func (s *Store) CreateOrGetPayment(ctx context.Context, p payment.Payment) (paym
 	created.BridgeProvider = p.BridgeProvider
 
 	return created, payment.Created, nil
+}
+
+// ListPayments returns a page of payments (payment-level columns only, no
+// quotes/hops -- callers needing those use GetPayment for a single
+// payment), newest-first, matching every non-nil filter dimension, plus an
+// opaque cursor for the next page ("" when this is the last page). This is
+// a single query -- no per-row follow-up queries -- to avoid N+1 query
+// patterns on a list endpoint.
+//
+// The query text is built up dynamically to append zero or more optional
+// WHERE clauses, but every filter VALUE is passed as a $N placeholder
+// argument to QueryContext, never concatenated into the query text itself
+// -- nextArg only ever splices the placeholder's positional name ("$3")
+// into the SQL string, and the actual value goes into args, which
+// QueryContext binds out-of-band. This is standard parameterized-query
+// construction and is not vulnerable to SQL injection: there is no code
+// path here where a filter value (status, provider, chain name, cursor
+// component, ...) is formatted directly into query via fmt.Sprintf with a
+// %s that holds the value itself, only ones that hold "$N".
+func (s *Store) ListPayments(ctx context.Context, filter payment.ListFilter) ([]payment.Payment, string, error) {
+	ctx, span := observability.Tracer("db").Start(ctx, "db.ListPayments")
+	defer span.End()
+
+	query := `
+		SELECT id, source_chain, destination_chain, asset, amount::text, status,
+		       total_fee, execution_mode, bridge_provider, created_at
+		FROM payments
+		WHERE 1=1
+	`
+	args := []any{}
+	argN := 0
+	nextArg := func(v any) string {
+		argN++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", argN)
+	}
+
+	if filter.Cursor != "" {
+		createdAt, id, err := payment.DecodeCursor(filter.Cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		query += fmt.Sprintf(" AND (created_at, id) < (%s, %s)", nextArg(createdAt), nextArg(id))
+	}
+	if filter.Status != nil {
+		query += fmt.Sprintf(" AND status = %s", nextArg(*filter.Status))
+	}
+	if filter.Provider != nil {
+		query += fmt.Sprintf(" AND bridge_provider = %s", nextArg(*filter.Provider))
+	}
+	if filter.SourceChain != nil {
+		query += fmt.Sprintf(" AND source_chain = %s", nextArg(*filter.SourceChain))
+	}
+	if filter.DestinationChain != nil {
+		query += fmt.Sprintf(" AND destination_chain = %s", nextArg(*filter.DestinationChain))
+	}
+	if filter.ExecutionMode != nil {
+		query += fmt.Sprintf(" AND execution_mode = %s", nextArg(*filter.ExecutionMode))
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT %s", nextArg(limit+1))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("list payments: %w", err)
+	}
+	defer rows.Close()
+
+	var results []payment.Payment
+	for rows.Next() {
+		var p payment.Payment
+		var status, execMode string
+		var bridgeProvider sql.NullString
+		if err := rows.Scan(&p.ID, &p.SourceChain, &p.DestinationChain, &p.Asset, &p.Amount,
+			&status, &p.TotalFee, &execMode, &bridgeProvider, &p.CreatedAt); err != nil {
+			return nil, "", fmt.Errorf("scan payment row: %w", err)
+		}
+		p.Status = payment.Status(status)
+		p.ExecutionMode = payment.ExecutionMode(execMode)
+		if bridgeProvider.Valid {
+			p.BridgeProvider = &bridgeProvider.String
+		}
+		results = append(results, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+
+	nextCursor := ""
+	if len(results) > limit {
+		last := results[limit-1]
+		nextCursor = payment.EncodeCursor(last.CreatedAt.UTC().Format(time.RFC3339Nano), last.ID)
+		results = results[:limit]
+	}
+	return results, nextCursor, nil
+}
+
+// GetDashboardStats computes the read-only dashboard overview counters in
+// exactly three aggregation queries -- all aggregating in SQL, never
+// fetch-all-then-aggregate-in-Go, to keep this endpoint free of N+1 query
+// patterns regardless of table size. The first query aggregates payment
+// counts by status plus the average total_fee in one pass; the second
+// groups by bridge_provider for the provider-usage breakdown, and the third
+// groups by (source_chain, destination_chain) for the network-usage
+// breakdown -- both variable-row-count breakdowns, so neither can be folded
+// into the fixed-shape first query.
+func (s *Store) GetDashboardStats(ctx context.Context) (payment.DashboardStats, error) {
+	var stats payment.DashboardStats
+	stats.ProviderUsage = map[string]int64{}
+
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) AS total,
+			COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+			COUNT(*) FILTER (WHERE status IN ('ROUTED', 'PROCESSING', 'SUBMITTED')) AS processing,
+			COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
+			COALESCE(AVG(total_fee), 0) AS avg_fee
+		FROM payments
+	`)
+	if err := row.Scan(&stats.TotalPayments, &stats.CompletedPayments, &stats.ProcessingPayments, &stats.FailedPayments, &stats.AverageRoutingCost); err != nil {
+		return payment.DashboardStats{}, fmt.Errorf("get dashboard stats: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT bridge_provider, COUNT(*)
+		FROM payments
+		WHERE bridge_provider IS NOT NULL
+		GROUP BY bridge_provider
+	`)
+	if err != nil {
+		return payment.DashboardStats{}, fmt.Errorf("get provider usage: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var provider string
+		var count int64
+		if err := rows.Scan(&provider, &count); err != nil {
+			return payment.DashboardStats{}, fmt.Errorf("scan provider usage row: %w", err)
+		}
+		stats.ProviderUsage[provider] = count
+	}
+	if err := rows.Err(); err != nil {
+		return payment.DashboardStats{}, err
+	}
+
+	networkRows, err := s.db.QueryContext(ctx, `
+		SELECT source_chain, destination_chain, COUNT(*)
+		FROM payments
+		GROUP BY source_chain, destination_chain
+		ORDER BY COUNT(*) DESC, source_chain, destination_chain
+	`)
+	if err != nil {
+		return payment.DashboardStats{}, fmt.Errorf("get network usage: %w", err)
+	}
+	defer networkRows.Close()
+	for networkRows.Next() {
+		var entry payment.NetworkUsageEntry
+		if err := networkRows.Scan(&entry.SourceChain, &entry.DestinationChain, &entry.Count); err != nil {
+			return payment.DashboardStats{}, fmt.Errorf("scan network usage row: %w", err)
+		}
+		stats.NetworkUsage = append(stats.NetworkUsage, entry)
+	}
+	return stats, networkRows.Err()
+}
+
+// GetTimeseries buckets payments by created_at (truncated to the given
+// interval, "hour" or "day") over the trailing `days` days, returning one
+// row per non-empty bucket with the payment count and the requested
+// metric's aggregate ("volume" -> COUNT(*), "routing_cost" ->
+// COALESCE(AVG(total_fee), 0)) -- a single aggregation query, never
+// fetch-all-then-aggregate-in-Go, to keep this endpoint free of N+1 query
+// patterns.
+//
+// aggregateExpr is spliced into the query TEXT via fmt.Sprintf, but it is
+// chosen from a fixed, code-controlled 2-value set based on metric, which
+// the caller (handler.GetDashboardTimeseries) has already validated
+// against validTimeseriesMetrics ({"volume", "routing_cost"}) before this
+// method is ever reachable -- metric's raw string value is never itself
+// interpolated into the query, only used as a Go switch key that selects
+// one of the two literal SQL fragments below. interval and days, the
+// actual caller/user-influenced values, are passed as $1/$2 query
+// arguments, which QueryContext binds out-of-band -- never concatenated
+// into the query text. This mirrors ListPayments' nextArg convention
+// (see its doc comment) and is not vulnerable to SQL injection.
+func (s *Store) GetTimeseries(ctx context.Context, metric, interval string, days int) ([]payment.TimeseriesPoint, error) {
+	aggregateExpr := "COUNT(*)"
+	if metric == "routing_cost" {
+		aggregateExpr = "COALESCE(AVG(total_fee), 0)"
+	}
+	// The brief's sketch built the trailing-window cutoff as
+	// (($2 || ' days')::interval, i.e. concatenating the $2 placeholder
+	// (a Go int) with a text literal via ||. That leaves Postgres/pgx
+	// unable to infer $2's type ("failed to encode args[1] ... cannot
+	// find encode plan" at runtime) -- caught by this package's own
+	// integration tests. make_interval(days => $2) sidesteps the
+	// ambiguity by taking the integer directly, matching the same fix
+	// StalePaymentIDs already applies to an identical problem via
+	// make_interval(secs => $2) above.
+	query := fmt.Sprintf(`
+		SELECT date_trunc($1, created_at) AS bucket, COUNT(*), %s
+		FROM payments
+		WHERE created_at > now() - make_interval(days => $2)
+		GROUP BY bucket
+		ORDER BY bucket
+	`, aggregateExpr)
+
+	rows, err := s.db.QueryContext(ctx, query, interval, days)
+	if err != nil {
+		return nil, fmt.Errorf("get timeseries: %w", err)
+	}
+	defer rows.Close()
+
+	points := []payment.TimeseriesPoint{}
+	for rows.Next() {
+		var p payment.TimeseriesPoint
+		if err := rows.Scan(&p.Bucket, &p.Count, &p.Value); err != nil {
+			return nil, fmt.Errorf("scan timeseries row: %w", err)
+		}
+		points = append(points, p)
+	}
+	return points, rows.Err()
 }
 
 // ClaimPayment atomically transitions a payment from ROUTED to PROCESSING,

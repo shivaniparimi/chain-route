@@ -2,5 +2,6 @@ aws_region                 = "us-east-1"
 environment                = "dev"
 db_instance_class          = "db.t4g.micro"
 enable_observability_stack = true
+enable_frontend            = true
 acm_certificate_arn        = "arn:aws:acm:us-east-1:123456789012:certificate/REPLACE-ME"
 image_tag                  = "latest"

@@ -66,6 +66,7 @@ type Quote struct {
 	QuotedAt             time.Time
 	ExpiresAt            time.Time
 	RawProviderPayload   json.RawMessage
+	Selected             bool // true for exactly one row per payment_id (migration 0007's partial unique index) -- the C++ router's winning hop
 	CreatedAt            time.Time
 }
 
@@ -82,10 +83,14 @@ type Payment struct {
 	ExecutionMode    ExecutionMode
 	BridgeProvider   *string
 	FailureReason    *string // populated only for the Phase 8 reasons: routing_quote_expired, fee_slippage_exceeded, route_unavailable, amount_exceeds_guardrail
-	Quote            *Quote  // set by the caller before CreateOrGetPayment for testnet-mode; nil for simulated
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	CompletedAt      *time.Time
+	// Quotes holds every quote fetched for a testnet-mode payment (winning
+	// and losing), exactly one of which has Selected=true -- the C++
+	// router's winning hop, persisted atomically with the payment. Empty
+	// for simulated-mode payments.
+	Quotes      []Quote
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	CompletedAt *time.Time
 }
 
 type Hop struct {
@@ -119,6 +124,64 @@ type Execution struct {
 	ConfirmedAt         *time.Time
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+}
+
+// ListFilter narrows a ListPayments query. All fields are optional
+// (nil/zero means "no filter on this dimension"); Limit and Cursor
+// govern keyset pagination.
+type ListFilter struct {
+	Limit            int
+	Cursor           string
+	Status           *string
+	Provider         *string
+	SourceChain      *string
+	DestinationChain *string
+	ExecutionMode    *string
+}
+
+// DashboardStats aggregates payment counts by status and bridge-provider
+// usage across all payments, for the read-only dashboard overview endpoint
+// (GET /dashboard/stats). Like Payment and Quote, this is a plain domain
+// type with no json tags -- handler holds its own thin json-tagged
+// response-shape struct and converts, per this codebase's existing
+// domain/response separation (see handler.paymentResponse/toPaymentResponse
+// and handler.paymentListItem).
+type DashboardStats struct {
+	TotalPayments      int64
+	CompletedPayments  int64
+	ProcessingPayments int64
+	FailedPayments     int64
+	ProviderUsage      map[string]int64
+	AverageRoutingCost float64
+	// NetworkUsage is the source_chain/destination_chain-pair frequency
+	// breakdown (Task 12, phase 12), added for the Overview Dashboard's
+	// network-usage chart -- computed by postgres.Store.GetDashboardStats
+	// as one additional GROUP BY source_chain, destination_chain query,
+	// following the exact same convention as ProviderUsage above (a
+	// variable number of rows, so it can't be folded into the fixed-shape
+	// counts query either).
+	NetworkUsage []NetworkUsageEntry
+}
+
+// NetworkUsageEntry is one source-chain/destination-chain pair's payment
+// count, one element of DashboardStats.NetworkUsage.
+type NetworkUsageEntry struct {
+	SourceChain      string
+	DestinationChain string
+	Count            int64
+}
+
+// TimeseriesPoint is one bucketed data point for the read-only
+// GET /dashboard/timeseries endpoint -- Bucket is the truncated timestamp
+// (per the requested interval: hour or day), Count is the number of
+// payments in that bucket, and Value is the requested metric's aggregate
+// for that bucket (payment count for "volume", average total_fee for
+// "routing_cost"). Like DashboardStats, this is a plain domain type with
+// no json tags; handler holds its own json-tagged response-shape struct.
+type TimeseriesPoint struct {
+	Bucket time.Time
+	Value  float64
+	Count  int64
 }
 
 // CreateResult reports what Store.CreateOrGetPayment actually did.

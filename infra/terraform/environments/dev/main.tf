@@ -102,6 +102,17 @@ module "alb" {
   acm_certificate_arn   = var.acm_certificate_arn
 }
 
+# S3 + CloudFront static hosting for the read-only payment analytics
+# dashboard -- no Fargate service needed since it's static assets, kept
+# behind a toggle for the same cost/complexity escape hatch pattern as
+# `enable_observability_stack`.
+module "frontend" {
+  count  = var.enable_frontend ? 1 : 0
+  source = "../../modules/frontend"
+
+  environment = var.environment
+}
+
 resource "aws_ecr_repository" "go_server" {
   name = "${var.environment}-chainroute-go-server"
 }
@@ -143,6 +154,17 @@ module "go_server_service" {
   security_group_ids = [module.networking.app_security_group_id]
   environment_variables = {
     OTEL_EXPORTER_OTLP_ENDPOINT = "otel-collector.chainroute.local:4317"
+    # one(module.frontend[*].cloudfront_domain_name) instead of
+    # module.frontend[0].cloudfront_domain_name -- indexing a count-0
+    # module in an untaken ternary branch is a known source of "Invalid
+    # index" plan errors on some Terraform versions. one() returns null
+    # when the module has zero instances (enable_frontend = false) and
+    # the single value when it has exactly one, with no indexing risk
+    # either way.
+    CHAINROUTE_CORS_ALLOWED_ORIGINS = coalesce(
+      one(module.frontend[*].cloudfront_domain_name) != null ? "https://${one(module.frontend[*].cloudfront_domain_name)}" : null,
+      "http://localhost:5173"
+    )
   }
   secrets            = { DATABASE_URL = module.database.connection_url_secret_arn }
   command            = ["--http-addr=:8080", "--grpc-addr=cpp-router.chainroute.local:50051"]

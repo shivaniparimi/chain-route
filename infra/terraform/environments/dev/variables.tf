@@ -19,6 +19,12 @@ variable "enable_observability_stack" {
   default     = true
 }
 
+variable "enable_frontend" {
+  description = "Toggle the S3+CloudFront static hosting for the payment analytics dashboard entirely -- the same cost/complexity escape hatch pattern as enable_observability_stack."
+  type        = bool
+  default     = true
+}
+
 variable "acm_certificate_arn" {
   description = "ACM certificate ARN for the ALB's HTTPS listener -- placeholder in terraform.tfvars.example, must be supplied per-deployment for a real domain."
   type        = string

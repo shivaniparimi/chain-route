@@ -632,6 +632,392 @@ rather than affecting payment processing, and the whole stack can be
 disabled via the `enable_observability_stack` Terraform variable
 (`environments/dev/variables.tf`) without touching any app service.
 
+## Payment analytics dashboard (Phase 12)
+
+Phase 12 adds a read-only, product-facing web dashboard for browsing and
+understanding payments — separate from, and non-overlapping with, the
+Grafana engineering dashboard from Phase 10 (see **React dashboard vs.
+Grafana** below). It consists of four new read-only HTTP endpoints on the
+existing Go server, one additive schema change so an honest per-provider
+quote comparison is possible, and a new `frontend/` single-page app served
+either by its own container (Docker Compose) or from S3+CloudFront
+(Terraform). No routing, execution, reconciliation, or recovery logic
+changed anywhere in this phase — the dashboard only reads state that
+already existed or that this phase started persisting additively.
+
+### New backend endpoints
+
+All four are implemented in `go-api/internal/handler/dashboard.go` and
+registered in `go-api/cmd/server/main.go`. Exact response shapes below are
+taken directly from that file's structs, not from this phase's design
+draft.
+
+**`GET /payments`** — paginated, filterable payment list (`ListPayments`).
+Query params: `limit` (default `25`, max `100`, must be a positive
+integer), `cursor` (opaque pagination cursor from a previous response's
+`next_cursor`), `status` (one of `ROUTED`/`PROCESSING`/`SUBMITTED`/
+`COMPLETED`/`FAILED`), `provider`, `source_chain`, `destination_chain`,
+`execution_mode` (`simulated` or `testnet`). There is deliberately no
+unbounded "list everything" mode — `limit` is always enforced server-side.
+Response:
+
+```json
+{
+  "payments": [
+    {
+      "id": "...", "source_chain": "...", "destination_chain": "...",
+      "asset": "...", "amount": "...", "status": "...",
+      "execution_mode": "...", "bridge_provider": "across" ,
+      "total_fee": 0.0, "created_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "next_cursor": "..." 
+}
+```
+
+`next_cursor` is `null` once there is no further page. `bridge_provider`
+is `null` for a payment that hasn't been routed to a provider yet.
+
+**`GET /payments/{id}/quotes`** — every quote fetched for a payment,
+winning and losing (`GetPaymentQuotes`, backed by the migration described
+below). 404s if the payment itself doesn't exist. An existing payment with
+no persisted quotes (any simulated-mode payment, or a real payment that
+predates the migration) renders as `"quotes": []`, never fabricated data:
+
+```json
+{
+  "quotes": [
+    {
+      "provider": "across", "input_amount": "...", "output_amount": "...",
+      "fee_amount": "...", "estimated_fill_time_sec": 0,
+      "selected": true, "quoted_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+**`GET /dashboard/stats`** — aggregate counters for the overview page
+(`GetDashboardStats`), computed entirely in SQL (`postgres.Store.
+GetDashboardStats`: a small fixed number of `COUNT`/`GROUP BY` queries,
+never fetch-all-then-aggregate-in-Go):
+
+```json
+{
+  "total_payments": 0, "completed_payments": 0, "processing_payments": 0,
+  "failed_payments": 0, "provider_usage": {"across": 0, "relay": 0},
+  "average_routing_cost": 0.0,
+  "network_usage": [
+    {"source_chain": "...", "destination_chain": "...", "count": 0}
+  ]
+}
+```
+
+**`GET /dashboard/timeseries`** — bucketed trend data for the overview
+page's chart (`GetDashboardTimeseries`), also computed in one SQL
+aggregation query (`date_trunc` + `GROUP BY`). Query params: `metric`
+(`volume` or `routing_cost`, default `volume`), `interval` (`hour` or
+`day`, default `day`), `days` (default `30`, max `90`). Both `metric` and
+`interval` are validated against a fixed allow-list before reaching the
+store, because `GetTimeseries` builds part of its SQL from `metric` —
+that validation is what keeps it safe from injection.
+
+```json
+{
+  "metric": "volume",
+  "points": [{"bucket": "2026-01-01T00:00:00Z", "value": 0.0, "count": 0}]
+}
+```
+
+**`GET /payments/{id}` also gained three fields** in this phase (additive
+only — the endpoint already existed): `provider_reference_id`,
+`external_status`, and `raw_external_status`. The underlying data
+(`payment_executions`) was already being loaded for `external_tx_hash`/
+`submitted_at`; these three were simply never surfaced before. All three
+are `null` for a simulated-mode payment or any payment with no execution
+row yet, matching the existing nil convention for `external_tx_hash`.
+
+**CORS**: a minimal explicit middleware (`go-api/internal/handler/cors.go`)
+wraps the whole mux, gated by `CHAINROUTE_CORS_ALLOWED_ORIGINS`
+(comma-separated, default `http://localhost:5173`). The API has no cookies
+or credentialed requests, so this is a lower-stakes surface than a
+session-authenticated app, but the allowed-origin list is still an
+explicit allowlist, never a blanket reflect-any-origin configuration.
+
+### The `payment_quotes` schema change and why
+
+Before this phase, `payment_quotes` had `UNIQUE(payment_id)` — schema-
+enforced, at most one quote row per payment. During testnet-mode `POST
+/payments`, quotes were (and still are) fetched from every registered
+provider concurrently, but only the C++ router's winning hop's quote was
+ever persisted; every losing quote was discarded in memory when the
+request completed. That meant there was no real losing-quote data
+anywhere in the database, and a per-provider cost comparison (Across vs.
+Relay) could only ever be fabricated on the frontend — which the project's
+constraints explicitly forbid.
+
+Migration `0007_dashboard_payment_analytics.sql` fixes this additively:
+
+```sql
+ALTER TABLE payment_quotes DROP CONSTRAINT payment_quotes_payment_id_key;
+ALTER TABLE payment_quotes ADD COLUMN selected BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE payment_quotes ADD CONSTRAINT payment_quotes_payment_id_provider_key UNIQUE (payment_id, provider);
+
+CREATE UNIQUE INDEX payment_quotes_one_selected_per_payment
+    ON payment_quotes (payment_id) WHERE selected;
+
+CREATE INDEX payments_created_at_idx ON payments (created_at DESC);
+CREATE INDEX payments_status_idx ON payments (status);
+CREATE INDEX payments_execution_mode_idx ON payments (execution_mode);
+CREATE INDEX payments_bridge_provider_idx ON payments (bridge_provider) WHERE bridge_provider IS NOT NULL;
+CREATE INDEX payments_source_dest_idx ON payments (source_chain, destination_chain);
+```
+
+The unique constraint moves from `(payment_id)` to `(payment_id,
+provider)`, so a payment can now have one row per provider that was
+actually quoted (winning and losing), never more than one row per
+`(payment, provider)` pair. A partial unique index enforces "at most one
+`selected = true` row per payment, never more than one" at the database
+level, not just in application code, so a future bug can't silently
+select two winners for the same payment. Note this is a ceiling, not a
+floor: a partial unique index can only cap the count at one, it cannot
+guarantee at least one exists — that a payment with any quotes always
+has exactly one marked `selected` relies on application code (quote
+insertion) and, for rows that predate this migration, on migration
+0007's own backfill (`UPDATE payment_quotes SET selected = true`),
+which is what keeps `GetQuoteByPaymentID` working for payments created
+before this migration ran. The remaining
+indexes back the new list/filter/aggregate query patterns `GET /payments`
+and `GET /dashboard/*` introduce.
+
+The write itself happens inside the *existing* `CreateOrGetPayment`
+transaction, at the point that transaction already runs — it is not a new
+decision point, and the C++ router's selection is computed before this
+write happens, unchanged. `GetQuoteByPaymentID` (singular — the method the
+execution path depends on to know which quote to re-validate and execute
+against) continues to return exactly the one selected/winning quote after
+this migration, with identical semantics to before; this is verified by a
+dedicated test, not assumed.
+
+### Provider comparison and its empty state
+
+`ProviderComparison` (`frontend/src/components/ProviderComparison.tsx`),
+shown on the Payment Detail page, is the one place in the dashboard whose
+entire purpose is an honest cost comparison, so it never invents one.
+Simulated-mode payments always have zero persisted quotes, and so does any
+real (testnet-mode) payment created before migration 0005 introduced the
+`payment_quotes` table at all — both render an explicit empty state ("No
+provider comparison data available for this payment") rather than an empty
+or fabricated chart. A real (testnet-mode) payment created between
+migration 0005 and migration 0007 has exactly one persisted quote — pre-0007's
+`UNIQUE(payment_id)` constraint guaranteed exactly one row per payment, and
+it was always the winner, now correctly backfilled with `selected = true`
+— so it renders that one quote card with an explicit note ("Only one
+provider responded for this payment") instead of letting a single card
+look like it "won" a comparison that never happened. A genuine multi-quote
+Across-vs-Relay comparison is only available for payments created after
+migration 0007, since only Task 1's every-fetched-quote persistence records
+the losing candidate as well as the winner.
+
+### Frontend architecture
+
+`frontend/` is a Vite + React + TypeScript single-page app (`react`/
+`react-dom` `^19.2.8` per `frontend/package.json` — the phase's design
+draft referred to "React 18," but React 19 is what actually shipped):
+
+```
+frontend/src/
+├── api/           client.ts (fetch wrapper, VITE_API_BASE_URL), types.ts
+├── hooks/         one TanStack Query hook per endpoint (see below)
+├── components/     shared, reusable UI (see list below) + components/charts/
+├── pages/         OverviewPage, PaymentExplorerPage, PaymentDetailPage
+├── lib/           chains.ts, explorer.ts, format.ts (formatting helpers)
+├── router.tsx     React Router route table
+├── App.tsx        TanStack Query client setup
+└── main.tsx        entry point
+```
+
+**Why this stack** (see the design doc, `docs/superpowers/specs/
+2026-09-18-payment-analytics-dashboard-design.md`, for the full reasoning):
+Vite for a fast dev server and a simple static-asset production build (no
+server-side rendering needed for a read-only dashboard); TypeScript so the
+API response shapes are typed end to end; Tailwind CSS for a restrained
+custom palette rather than a generic component-library look; TanStack
+Query for its built-in polling (`refetchInterval`), caching, and loading/
+error state machine, which is exactly the "real-time" mechanism this
+dashboard needs (see below) without adding a new transport; Recharts for
+lightweight, composable, React-native charting rather than a heavier
+imperative charting library; React Router for client-side routing between
+the three pages.
+
+**Pages** (`frontend/src/pages/`):
+
+- `OverviewPage.tsx` — dashboard stats (`GET /dashboard/stats`) as stat
+  cards, plus the volume/routing-cost trend chart (`GET
+  /dashboard/timeseries`), provider-selection and network-usage charts.
+- `PaymentExplorerPage.tsx` — the filterable, paginated payment table
+  (`GET /payments`), backed by `FilterBar` and `Pagination`.
+- `PaymentDetailPage.tsx` — a single payment's full detail (`GET
+  /payments/{id}`): route visualization, lifecycle timeline, and the
+  provider comparison described above.
+
+**Shared components** (`frontend/src/components/`): `PaymentTable`,
+`FilterBar`, `Pagination`, `StatusBadge`, `StatCard`, `RouteVisualization`
+(a hand-rolled SVG component, not a graph library — the graph is at most 5
+nodes and 2 hops, a full graph-drawing library would be disproportionate),
+`LifecycleTimeline`, `ProviderComparison`, and three shared state
+components (`LoadingState`, `ErrorState`, `EmptyState`) used consistently
+across every data-dependent view. Chart components live in
+`components/charts/`: `PaymentVolumeChart`, `RoutingCostChart`,
+`StatusDistributionChart`, `ProviderSelectionChart`, `NetworkUsageChart`
+(all Recharts-based).
+
+**Real-time update strategy — polling, not WebSockets/SSE.** Per the
+design doc's own §8/non-goals reasoning: this dashboard's data changes at
+human-observable speed (a payment moves through a handful of states over
+seconds to tens of seconds), so a persistent-connection transport is
+unjustified complexity for a read-only, low-cardinality view — TanStack
+Query's `refetchInterval` gives fresh-enough data with far less moving
+infrastructure. The intervals actually used, per hook
+(`frontend/src/hooks/`):
+
+| Hook | Endpoint | Interval |
+|---|---|---|
+| `usePaymentList` | `GET /payments` | every 10s, always |
+| `usePayment` | `GET /payments/{id}` | every 5s while the payment is non-terminal (`ROUTED`/`PROCESSING`/`SUBMITTED`); stops polling once it reaches `COMPLETED` or `FAILED` — `refetchInterval` is a function re-evaluated against the latest fetched data, not a fixed value decided at mount |
+| `useDashboardStats` | `GET /dashboard/stats` | every 10s |
+| `useTimeseries` | `GET /dashboard/timeseries` | every 10s |
+| `usePaymentQuotes` | `GET /payments/{id}/quotes` | no polling — a payment's quotes never change once fetched, so there's nothing to poll for |
+
+`App.tsx` also sets `refetchIntervalInBackground: false` globally, so
+polling pauses when the browser tab isn't visible.
+
+### Local development
+
+```bash
+cd frontend
+npm install
+npm run dev      # Vite dev server, default http://localhost:5173
+```
+
+Point the dev server at a locally-running Go server (native or Docker) by
+setting `VITE_API_BASE_URL` (an `.env.local` file, or inline:
+`VITE_API_BASE_URL=http://localhost:8099 npm run dev` if you're running
+the server on the `scripts/e2e_test.sh` port). It defaults to
+`http://localhost:8080` — the server's own default port — when unset.
+
+Other scripts: `npm run build` (`tsc -b && vite build`, a production
+static build into `frontend/dist/`), `npm run lint` (ESLint), `npm test`
+(Vitest + React Testing Library component tests), `npm run preview`
+(serves the production build locally).
+
+### Docker
+
+The frontend joins the Docker Compose stack described in the **Docker**
+section above as a fourth app-tier service:
+
+```bash
+docker compose up -d
+```
+
+`frontend` builds via a multi-stage `frontend/Dockerfile` (`node:20-
+bookworm` builder running `npm ci && npm run build`, served by `nginx:1.27-
+alpine`), published on host port **`5173`** (mapped to nginx's `:80`
+inside the container). It has no `depends_on` on `go-server` — the
+frontend's own loading/error states handle a not-yet-ready API, the same
+"nothing gates on a soft dependency" pattern the observability stack
+already uses.
+
+**The SPA-routing fix (this phase's Task 13):** nginx's stock
+`default.conf` only serves literal files and 404s on anything else, which
+breaks a hard refresh or direct link to a React Router client-side route
+like `/payments/:id`. The image replaces it with a custom `nginx.conf`
+adding `try_files $uri $uri/ /index.html;`, so any path that isn't a real
+static asset falls back to `index.html` and lets React Router take over
+client-side, matching the equivalent CloudFront fallback described below
+for the Terraform deployment.
+
+### Terraform
+
+`infra/terraform/modules/frontend/` provisions the frontend's AWS hosting:
+a private S3 bucket (all public access blocked) serving the built static
+assets, fronted by a CloudFront distribution that reaches the bucket only
+via an Origin Access Control (no public S3 URL exists), with the same
+SPA-fallback behavior as the Docker nginx config (CloudFront serves
+`index.html` for any path it can't find in the bucket, so a client-side
+route survives a direct link or refresh). S3+CloudFront was chosen over
+adding a fourth Fargate service specifically to avoid running a container
+just to serve static files.
+
+This module is gated by the `enable_frontend` boolean variable
+(`infra/terraform/environments/dev/variables.tf`, default per
+`terraform.tfvars.example`), so an environment can provision the backend
+alone if it doesn't need the dashboard. When enabled, `go-server`'s
+`CHAINROUTE_CORS_ALLOWED_ORIGINS` is automatically set to the
+provisioned CloudFront domain (`https://<distribution>.cloudfront.net`)
+instead of the local-dev default, so the deployed frontend can call the
+deployed API cross-origin without any manual CORS configuration step.
+
+As with the rest of the Terraform in this repository: `terraform fmt`/
+`init -backend=false`/`validate` were run and passed against this module;
+`plan`/`apply` require real AWS credentials and were never run.
+
+### Demo data
+
+`scripts/seed_demo_data.sh` populates a running server with realistic-
+looking demo payments through the **real** `POST /payments` API in
+simulated mode only — never a direct SQL insert, and never anything
+hardcoded into the frontend. It picks random source/destination chain
+pairs (from `ethereum`, `base`, `arbitrum`, `optimism`, `polygon`),
+picks `usdc`/`eth` at random for each payment (not alternating), and
+posts `COUNT` payments (default `40`,
+override with the `COUNT` env var) against `BASE_URL` (default
+`http://localhost:8080`), each with a unique `Idempotency-Key`. Because it
+only ever calls the app's own real code path, every field a demo payment
+produces (route, fee, status, quotes) is exactly as genuine as a payment a
+real caller created — there's no separate "seed data" code path in the
+backend for the dashboard to accidentally trust more or less than real
+traffic.
+
+### React dashboard vs. Grafana
+
+This project now has two dashboards, deliberately non-overlapping by
+design (see the design doc's "Current state" analysis, point on Phase
+10's Grafana dashboard):
+
+| | **Grafana** (Phase 10) | **React dashboard** (Phase 12) |
+|---|---|---|
+| Audience | Engineering / operations | Product / business |
+| Data source | Prometheus metrics (rate/latency/count time series) | PostgreSQL payment records, queried live |
+| Granularity | Aggregate, metric-level — cannot show one payment's record | Per-payment-record-level — a single payment's full lifecycle |
+| What it shows | Throughput, latency percentiles, Kafka/worker processing rates, execution outcome counts, infra health | Payment volume/status/provider mix over time, per-payment route + lifecycle + quote comparison, network (corridor) usage, average routing cost |
+| Why the split is structural, not just organizational | Prometheus's label-cardinality limits structurally prevent per-payment-ID metrics — Grafana could not show "this one payment's journey" even if asked to | The dashboard is deliberately not a metrics/observability tool — it has no latency percentiles, no infra/worker/error-rate panels, and reads Postgres, never Prometheus |
+
+Concretely: Grafana's 10 panels are all Prometheus-derived rate/latency/
+count series — none of them show an individual payment's record, a
+filterable payment list, or a genuine per-payment provider-quote
+comparison. The React dashboard has none of Grafana's panels — no
+latency, no throughput, no worker/Kafka/error-rate metrics, no trace or
+infra data. Anyone needing "is the system healthy / fast / erroring" still
+goes to Grafana (`http://localhost:3000` locally); anyone needing "what
+did this payment do / how does Across compare to Relay / what's our
+payment volume by chain" goes to the React dashboard. Neither dashboard
+duplicates the other's panels anywhere.
+
+### Screenshots
+
+**None are included, deliberately, rather than fabricated.** Capturing a
+real screenshot would require a running Go server plus a running frontend
+dev server plus a browser to render and capture the page. This
+environment has no reachable Docker daemon (confirmed throughout every
+phase of this project, including this one — see the Docker section
+above), and no browser or screenshot-capture tool is available in this
+session either way, so a genuine screenshot could not be produced here
+even by starting the frontend natively with `npm run dev` (which was not
+attempted for this reason). Rather than describe or invent an imagined
+screenshot, this README states the gap plainly: run `npm run dev` in
+`frontend/` against a running server (native or Docker) and open
+`http://localhost:5173` yourself to see the actual UI.
+
 ## CI/CD
 
 **`.github/workflows/ci.yml`** runs on every pull request and every push

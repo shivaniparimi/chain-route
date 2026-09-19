@@ -81,6 +81,18 @@ func testPayment(idempotencyKey string) payment.Payment {
 	}
 }
 
+// networkUsageCount finds the count for one source/destination pair in a
+// DashboardStats.NetworkUsage breakdown, or 0 if that pair has no entry
+// (e.g. a fresh table with no rows on that corridor yet).
+func networkUsageCount(usage []payment.NetworkUsageEntry, sourceChain, destChain string) int64 {
+	for _, entry := range usage {
+		if entry.SourceChain == sourceChain && entry.DestinationChain == destChain {
+			return entry.Count
+		}
+	}
+	return 0
+}
+
 func TestCreateOrGetPayment_NormalCreation(t *testing.T) {
 	s := newTestStore(t)
 	key := "test-normal-creation-key"
@@ -943,6 +955,208 @@ func TestClaimPayment_ReturnsExecutionMode(t *testing.T) {
 	}
 }
 
+// chainPaymentFor builds a payment.Payment on caller-supplied source/dest
+// chains (rather than the fixed ethereum/base of testPayment) so
+// ListPayments tests can scope their query to a SourceChain/DestinationChain
+// filter that no other test or pre-existing row in the shared database will
+// ever match, instead of relying on absolute timestamps to isolate rows.
+func chainPaymentFor(idempotencyKey, sourceChain, destChain string) payment.Payment {
+	p := testPayment(idempotencyKey)
+	p.SourceChain = sourceChain
+	p.DestinationChain = destChain
+	return p
+}
+
+func deleteByIdempotencyKeys(t *testing.T, s *Store, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		if _, err := s.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup %s: %v", key, err)
+		}
+	}
+}
+
+func TestListPayments_PaginatesWithoutOverlapOrGap(t *testing.T) {
+	s := newTestStore(t)
+	const n = 5
+	src, dst := "zz-test-list-page-src", "zz-test-list-page-dst"
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = fmt.Sprintf("test-list-page-%d", i)
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	ids := make([]string, n)
+	base := time.Now().UTC()
+	for i := 0; i < n; i++ {
+		created, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(keys[i], src, dst))
+		if err != nil || outcome != payment.Created {
+			t.Fatalf("create %d: outcome=%v err=%v", i, outcome, err)
+		}
+		ids[i] = created.ID
+		// Backdate created_at to a distinct, deterministic value (ascending
+		// with i) so ORDER BY created_at DESC, id DESC gives a known order:
+		// ids[n-1] first, ids[0] last.
+		if _, err := s.db.ExecContext(context.Background(),
+			`UPDATE payments SET created_at = $2 WHERE id = $1`,
+			created.ID, base.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("backdate %d: %v", i, err)
+		}
+	}
+
+	wantOrder := []string{ids[4], ids[3], ids[2], ids[1], ids[0]}
+
+	var gotOrder []string
+	filter := payment.ListFilter{Limit: 2, SourceChain: &src, DestinationChain: &dst}
+	for page := 0; page < 10; page++ {
+		results, nextCursor, err := s.ListPayments(context.Background(), filter)
+		if err != nil {
+			t.Fatalf("page %d: ListPayments: %v", page, err)
+		}
+		for _, p := range results {
+			gotOrder = append(gotOrder, p.ID)
+		}
+		if nextCursor == "" {
+			break
+		}
+		filter.Cursor = nextCursor
+	}
+
+	if len(gotOrder) != n {
+		t.Fatalf("expected %d total rows across pages (no overlap/gap), got %d: %v", n, len(gotOrder), gotOrder)
+	}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("order mismatch at position %d: want %v, got %v", i, wantOrder, gotOrder)
+		}
+	}
+}
+
+func TestListPayments_FiltersByStatus(t *testing.T) {
+	s := newTestStore(t)
+	src, dst := "zz-test-list-status-src", "zz-test-list-status-dst"
+	routedKey, completedKey := "test-list-status-routed", "test-list-status-completed"
+	deleteByIdempotencyKeys(t, s, routedKey, completedKey)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, routedKey, completedKey) })
+
+	routed, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(routedKey, src, dst))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create routed: outcome=%v err=%v", outcome, err)
+	}
+	completed, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(completedKey, src, dst))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create completed: outcome=%v err=%v", outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), completed.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, _, err := s.CompletePayment(context.Background(), completed.ID, payment.StatusCompleted); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	status := string(payment.StatusCompleted)
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &src, DestinationChain: &dst, Status: &status,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != completed.ID {
+		t.Fatalf("expected exactly the completed payment %s, got %+v", completed.ID, results)
+	}
+	_ = routed
+}
+
+func TestListPayments_FiltersByProvider(t *testing.T) {
+	s := newTestStore(t)
+	src, dst := "zz-test-list-provider-src", "zz-test-list-provider-dst"
+	withProviderKey, withoutProviderKey := "test-list-provider-with", "test-list-provider-without"
+	deleteByIdempotencyKeys(t, s, withProviderKey, withoutProviderKey)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, withProviderKey, withoutProviderKey) })
+
+	withProvider := chainPaymentFor(withProviderKey, src, dst)
+	withProvider.ExecutionMode = payment.ExecutionModeTestnet
+	withProvider.BridgeProvider = strPtr("zz-test-provider")
+	created, outcome, err := s.CreateOrGetPayment(context.Background(), withProvider)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create with provider: outcome=%v err=%v", outcome, err)
+	}
+
+	without := chainPaymentFor(withoutProviderKey, src, dst)
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), without); err != nil || outcome != payment.Created {
+		t.Fatalf("create without provider: outcome=%v err=%v", outcome, err)
+	}
+
+	provider := "zz-test-provider"
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &src, DestinationChain: &dst, Provider: &provider,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != created.ID {
+		t.Fatalf("expected exactly the payment with provider %s, got %+v", created.ID, results)
+	}
+}
+
+func TestListPayments_FiltersBySourceAndDestinationChain(t *testing.T) {
+	s := newTestStore(t)
+	keyA, keyB := "test-list-chain-a", "test-list-chain-b"
+	srcA, dstA := "zz-test-list-chain-a-src", "zz-test-list-chain-a-dst"
+	srcB, dstB := "zz-test-list-chain-b-src", "zz-test-list-chain-b-dst"
+	deleteByIdempotencyKeys(t, s, keyA, keyB)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keyA, keyB) })
+
+	pA, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(keyA, srcA, dstA))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create A: outcome=%v err=%v", outcome, err)
+	}
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(keyB, srcB, dstB)); err != nil || outcome != payment.Created {
+		t.Fatalf("create B: outcome=%v err=%v", outcome, err)
+	}
+
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &srcA, DestinationChain: &dstA,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != pA.ID {
+		t.Fatalf("expected exactly payment A %s, got %+v", pA.ID, results)
+	}
+}
+
+func TestListPayments_FiltersByExecutionMode(t *testing.T) {
+	s := newTestStore(t)
+	src, dst := "zz-test-list-mode-src", "zz-test-list-mode-dst"
+	simulatedKey, testnetKey := "test-list-mode-simulated", "test-list-mode-testnet"
+	deleteByIdempotencyKeys(t, s, simulatedKey, testnetKey)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, simulatedKey, testnetKey) })
+
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), chainPaymentFor(simulatedKey, src, dst)); err != nil || outcome != payment.Created {
+		t.Fatalf("create simulated: outcome=%v err=%v", outcome, err)
+	}
+	testnetPayment := chainPaymentFor(testnetKey, src, dst)
+	testnetPayment.ExecutionMode = payment.ExecutionModeTestnet
+	testnetCreated, outcome, err := s.CreateOrGetPayment(context.Background(), testnetPayment)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create testnet: outcome=%v err=%v", outcome, err)
+	}
+
+	mode := string(payment.ExecutionModeTestnet)
+	results, _, err := s.ListPayments(context.Background(), payment.ListFilter{
+		Limit: 10, SourceChain: &src, DestinationChain: &dst, ExecutionMode: &mode,
+	})
+	if err != nil {
+		t.Fatalf("ListPayments: %v", err)
+	}
+	if len(results) != 1 || results[0].ID != testnetCreated.ID {
+		t.Fatalf("expected exactly the testnet payment %s, got %+v", testnetCreated.ID, results)
+	}
+}
+
 func TestStalePaymentIDs_ExcludesTestnetMode(t *testing.T) {
 	s := newTestStore(t)
 	key := "test-stale-excludes-testnet-key"
@@ -975,5 +1189,319 @@ func TestStalePaymentIDs_ExcludesTestnetMode(t *testing.T) {
 		if id == created.ID {
 			t.Fatal("StalePaymentIDs must never return a testnet-mode payment -- Recovery's execution.Execute has no meaning for a real transaction")
 		}
+	}
+}
+
+// TestGetDashboardStats_CountsAndProviderUsageAreExact seeds a mix of
+// payments spanning every status bucket and two distinct bridge providers,
+// then asserts GetDashboardStats's counts and provider-usage map move by
+// exactly the seeded amounts. It compares before/after deltas rather than
+// absolute values because GetDashboardStats aggregates over the entire
+// payments table with no scoping filter (unlike ListPayments, which every
+// other integration test in this file can scope by a unique
+// source_chain/destination_chain pair) -- this is the only way to make the
+// assertion exact against a shared, persistent database that may already
+// hold rows from other runs, while still catching a subtly wrong
+// FILTER/GROUP BY clause (which would move the deltas, not just the
+// absolute totals).
+func TestGetDashboardStats_CountsAndProviderUsageAreExact(t *testing.T) {
+	s := newTestStore(t)
+	providerA := "zz-test-stats-provider-a"
+	providerB := "zz-test-stats-provider-b"
+	keys := []string{
+		"test-stats-routed-no-provider",
+		"test-stats-routed-provider-a",
+		"test-stats-completed-provider-a",
+		"test-stats-failed-provider-b",
+		"test-stats-processing-no-provider",
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	before, err := s.GetDashboardStats(context.Background())
+	if err != nil {
+		t.Fatalf("baseline GetDashboardStats: %v", err)
+	}
+
+	// 1: simulated, left ROUTED, no provider -- counts toward "processing".
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), testPayment(keys[0])); err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[0], outcome, err)
+	}
+
+	// 2: testnet, left ROUTED, provider A -- counts toward "processing" and provider A.
+	p2 := testPayment(keys[1])
+	p2.ExecutionMode = payment.ExecutionModeTestnet
+	p2.BridgeProvider = strPtr(providerA)
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), p2); err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[1], outcome, err)
+	}
+
+	// 3: testnet, driven to COMPLETED, provider A -- counts toward "completed" and provider A.
+	p3 := testPayment(keys[2])
+	p3.ExecutionMode = payment.ExecutionModeTestnet
+	p3.BridgeProvider = strPtr(providerA)
+	created3, outcome, err := s.CreateOrGetPayment(context.Background(), p3)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[2], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created3.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[2], err)
+	}
+	if _, _, err := s.CompletePayment(context.Background(), created3.ID, payment.StatusCompleted); err != nil {
+		t.Fatalf("complete %s: %v", keys[2], err)
+	}
+
+	// 4: testnet, driven to FAILED, provider B -- counts toward "failed" and provider B.
+	p4 := testPayment(keys[3])
+	p4.ExecutionMode = payment.ExecutionModeTestnet
+	p4.BridgeProvider = strPtr(providerB)
+	created4, outcome, err := s.CreateOrGetPayment(context.Background(), p4)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[3], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created4.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[3], err)
+	}
+	if ok, err := s.MarkProcessingFailed(context.Background(), created4.ID, "test-failure"); err != nil || !ok {
+		t.Fatalf("mark failed %s: ok=%v err=%v", keys[3], ok, err)
+	}
+
+	// 5: simulated, driven to PROCESSING, no provider -- counts toward "processing".
+	created5, outcome, err := s.CreateOrGetPayment(context.Background(), testPayment(keys[4]))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[4], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created5.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[4], err)
+	}
+
+	after, err := s.GetDashboardStats(context.Background())
+	if err != nil {
+		t.Fatalf("GetDashboardStats: %v", err)
+	}
+
+	if got := after.TotalPayments - before.TotalPayments; got != 5 {
+		t.Fatalf("expected total_payments to increase by 5, got %d", got)
+	}
+	if got := after.CompletedPayments - before.CompletedPayments; got != 1 {
+		t.Fatalf("expected completed_payments to increase by 1, got %d", got)
+	}
+	if got := after.ProcessingPayments - before.ProcessingPayments; got != 3 {
+		t.Fatalf("expected processing_payments (ROUTED/PROCESSING/SUBMITTED) to increase by 3, got %d", got)
+	}
+	if got := after.FailedPayments - before.FailedPayments; got != 1 {
+		t.Fatalf("expected failed_payments to increase by 1, got %d", got)
+	}
+
+	if got := after.ProviderUsage[providerA] - before.ProviderUsage[providerA]; got != 2 {
+		t.Fatalf("expected provider %s usage to increase by 2, got %d (before=%d after=%d)",
+			providerA, got, before.ProviderUsage[providerA], after.ProviderUsage[providerA])
+	}
+	if got := after.ProviderUsage[providerB] - before.ProviderUsage[providerB]; got != 1 {
+		t.Fatalf("expected provider %s usage to increase by 1, got %d (before=%d after=%d)",
+			providerB, got, before.ProviderUsage[providerB], after.ProviderUsage[providerB])
+	}
+
+	// NetworkUsage: every one of the 5 seeded payments above uses
+	// testPayment()'s default ethereum -> base corridor, so the
+	// ethereum/base entry's count should increase by exactly 5 -- same
+	// before/after delta approach as ProviderUsage above, for the same
+	// shared-table reason.
+	if got := networkUsageCount(after.NetworkUsage, "ethereum", "base") - networkUsageCount(before.NetworkUsage, "ethereum", "base"); got != 5 {
+		t.Fatalf("expected ethereum->base network usage to increase by 5, got %d", got)
+	}
+
+	// AverageRoutingCost is a table-wide AVG(total_fee), so it can't be
+	// delta-checked directly -- but AVG * COUNT recovers the pre-existing
+	// fee sum, letting us predict the exact post-seed average in closed
+	// form: every testPayment() seeded above has a fixed TotalFee of 1.5,
+	// so the new sum is simply the recovered pre-existing sum plus 5*1.5.
+	// This verifies the actual COALESCE(AVG(total_fee), 0) SQL against
+	// real seeded rows, rather than only checking counts around it.
+	const seededFee = 1.5
+	const seededCount = 5
+	beforeSum := before.AverageRoutingCost * float64(before.TotalPayments)
+	wantAvg := (beforeSum + seededCount*seededFee) / float64(before.TotalPayments+seededCount)
+	if diff := after.AverageRoutingCost - wantAvg; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("expected average_routing_cost to be %v (recovered pre-existing sum %v + %d*%v over %d rows), got %v",
+			wantAvg, beforeSum, seededCount, seededFee, before.TotalPayments+seededCount, after.AverageRoutingCost)
+	}
+}
+
+// seedPaymentAt inserts a payment row with an explicit created_at,
+// bypassing CreateOrGetPayment's now()-default -- necessary because
+// GetTimeseries buckets by created_at, and the timeseries tests below need
+// full control over which bucket each seeded row lands in. Every other
+// column besides idempotency_key/total_fee/created_at is left to its
+// table default (status='ROUTED', execution_mode='simulated'), since
+// GetTimeseries never reads them.
+func seedPaymentAt(t *testing.T, s *Store, idempotencyKey string, createdAt time.Time, totalFee float64) {
+	t.Helper()
+	_, err := s.db.ExecContext(context.Background(), `
+		INSERT INTO payments (idempotency_key, source_chain, destination_chain, asset, amount, total_fee, created_at)
+		VALUES ($1, 'ethereum', 'base', 'USDC', 1000.00, $2, $3)
+	`, idempotencyKey, totalFee, createdAt)
+	if err != nil {
+		t.Fatalf("seed payment %s at %v: %v", idempotencyKey, createdAt, err)
+	}
+}
+
+// truncatedBucket asks Postgres itself what date_trunc(interval, ts)
+// produces, rather than the test independently recomputing that boundary
+// in Go -- the session's timezone (e.g. not UTC) affects where a "day"
+// bucket boundary falls, and hardcoding that logic in the test would
+// either duplicate GetTimeseries's own SQL or silently assume UTC. This
+// only computes the ground-truth bucket for a known input instant; it
+// does not re-implement or bypass GetTimeseries's own aggregation.
+func truncatedBucket(t *testing.T, s *Store, interval string, ts time.Time) time.Time {
+	t.Helper()
+	var bucket time.Time
+	row := s.db.QueryRowContext(context.Background(), `SELECT date_trunc($1, $2::timestamptz)`, interval, ts)
+	if err := row.Scan(&bucket); err != nil {
+		t.Fatalf("compute expected %s bucket for %v: %v", interval, ts, err)
+	}
+	return bucket
+}
+
+func findTimeseriesPoint(points []payment.TimeseriesPoint, bucket time.Time) (payment.TimeseriesPoint, bool) {
+	for _, p := range points {
+		if p.Bucket.Equal(bucket) {
+			return p, true
+		}
+	}
+	return payment.TimeseriesPoint{}, false
+}
+
+// TestGetTimeseries_VolumeBucketsByDayAndRespectsDaysWindow seeds three
+// payments at the exact same instant (10 days ago), which -- because
+// date_trunc is deterministic -- are guaranteed to land in the same "day"
+// bucket regardless of session timezone, plus one payment 40 days ago
+// (outside the days=30 window). It asserts the in-window bucket's count is
+// exactly 3 and that no point exists for the out-of-window bucket, proving
+// both the GROUP BY bucketing and the `created_at > now() - N days` filter.
+func TestGetTimeseries_VolumeBucketsByDayAndRespectsDaysWindow(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{
+		"test-ts-vol-day-1", "test-ts-vol-day-2", "test-ts-vol-day-3",
+		"test-ts-vol-day-outside-window",
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	inWindow := time.Now().UTC().AddDate(0, 0, -10)
+	outsideWindow := time.Now().UTC().AddDate(0, 0, -40)
+
+	seedPaymentAt(t, s, keys[0], inWindow, 1.0)
+	seedPaymentAt(t, s, keys[1], inWindow, 1.0)
+	seedPaymentAt(t, s, keys[2], inWindow, 1.0)
+	seedPaymentAt(t, s, keys[3], outsideWindow, 1.0)
+
+	points, err := s.GetTimeseries(context.Background(), "volume", "day", 30)
+	if err != nil {
+		t.Fatalf("GetTimeseries: %v", err)
+	}
+
+	wantBucket := truncatedBucket(t, s, "day", inWindow)
+	got, found := findTimeseriesPoint(points, wantBucket)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", wantBucket, points)
+	}
+	if got.Count != 3 {
+		t.Fatalf("expected count 3 in the in-window bucket, got %d", got.Count)
+	}
+	if got.Value != 3 {
+		t.Fatalf("expected value 3 (COUNT(*) for volume metric) in the in-window bucket, got %v", got.Value)
+	}
+
+	excludedBucket := truncatedBucket(t, s, "day", outsideWindow)
+	if _, found := findTimeseriesPoint(points, excludedBucket); found {
+		t.Fatalf("expected no bucket at %v (40 days ago, outside the 30-day window), but found one", excludedBucket)
+	}
+}
+
+// TestGetTimeseries_RoutingCostAveragePerBucketIsExact seeds three payments
+// with known, distinct total_fee values into a single day bucket (11 days
+// ago, distinct from the other timeseries tests' synthetic days so they
+// can't cross-contaminate each other's bucket), then asserts
+// GetTimeseries("routing_cost", ...) computes that bucket's average
+// exactly -- an exact assertion is possible here (unlike
+// GetDashboardStats's table-wide average) because this bucket is
+// exclusively populated by this test's own seeded rows.
+func TestGetTimeseries_RoutingCostAveragePerBucketIsExact(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{"test-ts-cost-day-1", "test-ts-cost-day-2", "test-ts-cost-day-3"}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	bucketInstant := time.Now().UTC().AddDate(0, 0, -11)
+	fees := []float64{1.0, 2.0, 3.0}
+	for i, key := range keys {
+		seedPaymentAt(t, s, key, bucketInstant, fees[i])
+	}
+
+	points, err := s.GetTimeseries(context.Background(), "routing_cost", "day", 30)
+	if err != nil {
+		t.Fatalf("GetTimeseries: %v", err)
+	}
+
+	wantBucket := truncatedBucket(t, s, "day", bucketInstant)
+	got, found := findTimeseriesPoint(points, wantBucket)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", wantBucket, points)
+	}
+	if got.Count != 3 {
+		t.Fatalf("expected count 3, got %d", got.Count)
+	}
+	const wantAvg = 2.0 // (1.0 + 2.0 + 3.0) / 3
+	if diff := got.Value - wantAvg; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("expected average routing cost %v, got %v", wantAvg, got.Value)
+	}
+}
+
+// TestGetTimeseries_HourIntervalBucketsSeparately seeds two payments 3
+// hours apart (12 days ago, distinct from the other timeseries tests'
+// synthetic days) and asserts interval="hour" places them in two distinct
+// buckets with the correct per-bucket counts -- a 3-hour gap guarantees
+// distinct hour buckets regardless of the session's timezone offset,
+// since date_trunc('hour', ...) always produces buckets exactly one
+// wall-clock hour wide.
+func TestGetTimeseries_HourIntervalBucketsSeparately(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{"test-ts-hour-1a", "test-ts-hour-1b", "test-ts-hour-2"}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	hourOne := time.Now().UTC().AddDate(0, 0, -12)
+	hourTwo := hourOne.Add(3 * time.Hour)
+
+	seedPaymentAt(t, s, keys[0], hourOne, 1.0)
+	seedPaymentAt(t, s, keys[1], hourOne, 1.0)
+	seedPaymentAt(t, s, keys[2], hourTwo, 1.0)
+
+	points, err := s.GetTimeseries(context.Background(), "volume", "hour", 30)
+	if err != nil {
+		t.Fatalf("GetTimeseries: %v", err)
+	}
+
+	bucketOne := truncatedBucket(t, s, "hour", hourOne)
+	bucketTwo := truncatedBucket(t, s, "hour", hourTwo)
+	if bucketOne.Equal(bucketTwo) {
+		t.Fatalf("test setup bug: expected distinct hour buckets, got the same bucket %v for both", bucketOne)
+	}
+
+	gotOne, found := findTimeseriesPoint(points, bucketOne)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", bucketOne, points)
+	}
+	if gotOne.Count != 2 {
+		t.Fatalf("expected count 2 in the first hour bucket, got %d", gotOne.Count)
+	}
+
+	gotTwo, found := findTimeseriesPoint(points, bucketTwo)
+	if !found {
+		t.Fatalf("expected a bucket at %v, got points %+v", bucketTwo, points)
+	}
+	if gotTwo.Count != 1 {
+		t.Fatalf("expected count 1 in the second hour bucket, got %d", gotTwo.Count)
 	}
 }
