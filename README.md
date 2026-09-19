@@ -775,10 +775,17 @@ CREATE INDEX payments_source_dest_idx ON payments (source_chain, destination_cha
 The unique constraint moves from `(payment_id)` to `(payment_id,
 provider)`, so a payment can now have one row per provider that was
 actually quoted (winning and losing), never more than one row per
-`(payment, provider)` pair. A partial unique index enforces "exactly one
-`selected = true` row per payment, never zero once any quote exists, never
-more than one" at the database level, not just in application code, so a
-future bug can't silently select two winners or none. The remaining
+`(payment, provider)` pair. A partial unique index enforces "at most one
+`selected = true` row per payment, never more than one" at the database
+level, not just in application code, so a future bug can't silently
+select two winners for the same payment. Note this is a ceiling, not a
+floor: a partial unique index can only cap the count at one, it cannot
+guarantee at least one exists — that a payment with any quotes always
+has exactly one marked `selected` relies on application code (quote
+insertion) and, for rows that predate this migration, on migration
+0007's own backfill (`UPDATE payment_quotes SET selected = true`),
+which is what keeps `GetQuoteByPaymentID` working for payments created
+before this migration ran. The remaining
 indexes back the new list/filter/aggregate query patterns `GET /payments`
 and `GET /dashboard/*` introduce.
 
@@ -957,7 +964,8 @@ looking demo payments through the **real** `POST /payments` API in
 simulated mode only — never a direct SQL insert, and never anything
 hardcoded into the frontend. It picks random source/destination chain
 pairs (from `ethereum`, `base`, `arbitrum`, `optimism`, `polygon`),
-alternates `usdc`/`eth`, and posts `COUNT` payments (default `40`,
+picks `usdc`/`eth` at random for each payment (not alternating), and
+posts `COUNT` payments (default `40`,
 override with the `COUNT` env var) against `BASE_URL` (default
 `http://localhost:8080`), each with a unique `Idempotency-Key`. Because it
 only ever calls the app's own real code path, every field a demo payment

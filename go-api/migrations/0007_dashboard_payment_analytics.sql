@@ -2,6 +2,12 @@ ALTER TABLE payment_quotes DROP CONSTRAINT payment_quotes_payment_id_key;
 ALTER TABLE payment_quotes ADD COLUMN selected BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE payment_quotes ADD CONSTRAINT payment_quotes_payment_id_provider_key UNIQUE (payment_id, provider);
 
+-- Pre-0007 rows: UNIQUE(payment_id) guaranteed exactly one quote per
+-- payment and it was always the winner, so every existing row is the
+-- selected one. Without this, GetQuoteByPaymentID (now filtering on
+-- selected = true) strands in-flight payments the Executor must resume.
+UPDATE payment_quotes SET selected = true;
+
 CREATE UNIQUE INDEX payment_quotes_one_selected_per_payment
     ON payment_quotes (payment_id) WHERE selected;
 

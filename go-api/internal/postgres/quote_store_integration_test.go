@@ -412,6 +412,95 @@ func TestGetQuotesByPaymentID_EmptyForSimulatedModePayment(t *testing.T) {
 	}
 }
 
+// TestMigration0007Backfill_SelectsPreExistingQuoteRows proves the
+// migration 0007 backfill (`UPDATE payment_quotes SET selected = true`)
+// is necessary and sufficient to keep GetQuoteByPaymentID working for
+// payment_quotes rows that existed before migration 0007 added the
+// `selected` column. It simulates the pre-backfill state directly: a
+// payment_quotes row inserted with selected = false via raw SQL,
+// bypassing insertPaymentQuotes (which always writes Selected: true for
+// single-quote testnet payments) -- exactly what every pre-0007 row
+// looked like immediately after `ALTER TABLE ... ADD COLUMN selected
+// BOOLEAN NOT NULL DEFAULT false` ran, before the backfill statement.
+//
+// Without the backfill, GetQuoteByPaymentID (which filters on
+// selected = true) would return found=false for every such row, and
+// the Executor's execution/recovery path would loop forever on
+// reconciliation for any pre-existing testnet payment. This test fails
+// if the backfill statement is ever removed from the migration file.
+func TestMigration0007Backfill_SelectsPreExistingQuoteRows(t *testing.T) {
+	store := newTestStore(t)
+	key := "migration-0007-backfill-" + t.Name()
+	cleanup := func() {
+		if _, err := store.db.ExecContext(context.Background(),
+			`DELETE FROM payments WHERE idempotency_key = $1`, key); err != nil {
+			t.Fatalf("cleanup: %v", err)
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	// Create a payment with no quote rows (simulated mode keeps
+	// CreateOrGetPayment from inserting anything into payment_quotes, so
+	// we can insert our own row below with full control over `selected`).
+	p := payment.Payment{
+		IdempotencyKey: key, SourceChain: "ethereum", DestinationChain: "base",
+		Asset: "eth", Amount: "0.001", ExecutionMode: payment.ExecutionModeSimulated,
+	}
+	created, _, err := store.CreateOrGetPayment(context.Background(), p)
+	if err != nil {
+		t.Fatalf("CreateOrGetPayment: %v", err)
+	}
+
+	now := time.Now().UTC()
+	// Insert a payment_quotes row directly via raw SQL with selected
+	// explicitly false, bypassing insertPaymentQuotes entirely --
+	// reproducing the exact on-disk shape of a pre-0007 row the instant
+	// after `ADD COLUMN selected BOOLEAN NOT NULL DEFAULT false` ran, but
+	// before the backfill UPDATE.
+	if _, err := store.db.ExecContext(context.Background(), `
+		INSERT INTO payment_quotes
+			(payment_id, provider, origin_chain_id, destination_chain_id, asset,
+			 input_amount, output_amount, fee_amount, estimated_fill_time_sec,
+			 quoted_at, expires_at, raw_provider_payload, selected)
+		VALUES ($1, 'across', 11155111, 84532, 'WETH',
+			1000000000000000, 999900000000000, 100000000000, 60,
+			$2, $3, '{}'::JSONB, false)
+	`, created.ID, now, now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("insert pre-backfill quote row: %v", err)
+	}
+
+	// Pre-backfill state: GetQuoteByPaymentID must NOT find the row,
+	// documenting exactly the bug that shipped without the backfill.
+	_, found, err := store.GetQuoteByPaymentID(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetQuoteByPaymentID (pre-backfill): %v", err)
+	}
+	if found {
+		t.Fatal("expected GetQuoteByPaymentID to NOT find a selected=false row -- if this fails, the test fixture itself is broken")
+	}
+
+	// Apply the equivalent of migration 0007's backfill statement.
+	if _, err := store.db.ExecContext(context.Background(),
+		`UPDATE payment_quotes SET selected = true WHERE payment_id = $1`, created.ID); err != nil {
+		t.Fatalf("apply backfill: %v", err)
+	}
+
+	// Post-backfill state: GetQuoteByPaymentID must now find the row --
+	// this is the assertion that would have failed if the backfill
+	// statement had been omitted from migration 0007.
+	q, found, err := store.GetQuoteByPaymentID(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetQuoteByPaymentID (post-backfill): %v", err)
+	}
+	if !found {
+		t.Fatal("expected GetQuoteByPaymentID to find the row after the backfill sets selected = true -- migration 0007's backfill is missing or broken")
+	}
+	if q.Provider != "across" {
+		t.Errorf("unexpected quote after backfill: %+v", q)
+	}
+}
+
 func TestMarkProcessingFailed_TransitionsFromProcessingOnly(t *testing.T) {
 	store := newTestStore(t)
 	key := "mark-failed-" + t.Name()
