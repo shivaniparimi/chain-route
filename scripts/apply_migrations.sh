@@ -52,4 +52,8 @@ apply_if_missing \
 	"SELECT 1 FROM information_schema.columns WHERE table_name='payment_quotes' AND column_name='selected'" \
 	"$MIGRATIONS_DIR/0007_dashboard_payment_analytics.sql"
 
+apply_if_missing \
+	"SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM payment_quotes GROUP BY payment_id HAVING COUNT(*) = 1 AND COUNT(*) FILTER (WHERE selected) = 0)" \
+	"$MIGRATIONS_DIR/0008_backfill_orphaned_selected_quotes.sql"
+
 echo "apply_migrations: all migrations up to date"
