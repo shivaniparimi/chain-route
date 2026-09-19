@@ -8,6 +8,11 @@ import { EmptyState } from "../EmptyState";
 // series (corridor frequency), no per-bar color distinction needed.
 const ACCENT_COLOR = "#0bb6a3";
 
+// With 5 chains there can be up to 20 corridors, each with a long
+// "Ethereum → Base"-style label -- illegible on a single bar chart
+// without a cap. Only the top TOP_N by count are ever rendered.
+const TOP_N = 8;
+
 // Backed by DashboardStats.network_usage -- a true SQL aggregate
 // (postgres.Store.GetDashboardStats's GROUP BY source_chain, destination_chain
 // query, added in this task) rather than a client-side approximation over a
@@ -19,6 +24,7 @@ export function NetworkUsageChart({ stats }: { stats: DashboardStats }) {
 
   const data = [...stats.network_usage]
     .sort((a, b) => b.count - a.count)
+    .slice(0, TOP_N)
     .map((entry) => ({
       corridor: `${CHAIN_DISPLAY_NAMES[entry.source_chain] ?? entry.source_chain} → ${
         CHAIN_DISPLAY_NAMES[entry.destination_chain] ?? entry.destination_chain

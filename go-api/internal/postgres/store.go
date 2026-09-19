@@ -446,6 +446,7 @@ func (s *Store) GetDashboardStats(ctx context.Context) (payment.DashboardStats, 
 		SELECT source_chain, destination_chain, COUNT(*)
 		FROM payments
 		GROUP BY source_chain, destination_chain
+		ORDER BY COUNT(*) DESC, source_chain, destination_chain
 	`)
 	if err != nil {
 		return payment.DashboardStats{}, fmt.Errorf("get network usage: %w", err)

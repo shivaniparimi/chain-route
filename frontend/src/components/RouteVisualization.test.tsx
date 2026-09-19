@@ -51,6 +51,12 @@ describe("RouteVisualization", () => {
     expect(dashedLines).toHaveLength(9);
 
     expect(screen.getByText("Relay", { selector: "text" })).toBeInTheDocument();
+
+    // Legend distinguishes this payment's real route from the rest of the
+    // always-drawn simulated graph, so a viewer never mistakes the full
+    // pentagon for the payment's actual path.
+    expect(screen.getByText("This payment's route")).toBeInTheDocument();
+    expect(screen.getByText("Other routes in the simulated graph")).toBeInTheDocument();
   });
 
   it("renders the Live testnet execution badge for a testnet-mode Ethereum<->Base ETH payment", () => {

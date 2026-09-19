@@ -206,6 +206,28 @@ export function RouteVisualization({
         })}
       </svg>
 
+      {/* Legend distinguishing the payment's real path from the always-drawn
+          5-node pentagon's structural connectivity, so a viewer never
+          mistakes "simulated routing support across the graph" for this
+          payment's actual route. Plain HTML swatches (not SVG <line>
+          elements) so this doesn't interfere with the diagram-only
+          line[stroke]/line[stroke-dasharray] queries the existing tests
+          run against the SVG above. */}
+      <div className="mt-2 flex flex-col gap-1 text-xs text-slate-500">
+        <div className="flex items-center gap-2">
+          <span aria-hidden="true" className="h-0.5 w-6 flex-shrink-0" style={{ backgroundColor: ACCENT }} />
+          <span>This payment&apos;s route</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span
+            aria-hidden="true"
+            className="h-0 w-6 flex-shrink-0 border-t border-dashed"
+            style={{ borderColor: MUTED_EDGE }}
+          />
+          <span>Other routes in the simulated graph</span>
+        </div>
+      </div>
+
       {orderedHops.length > 0 && (
         <ol className="mt-3 space-y-1 text-sm text-slate-700">
           {orderedHops.map((hop) => (

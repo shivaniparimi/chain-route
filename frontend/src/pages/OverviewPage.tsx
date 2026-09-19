@@ -35,9 +35,9 @@ function ChartSection<T>({
         <LoadingState label={loadingLabel} />
       ) : query.isError ? (
         <ErrorState error={query.error} onRetry={() => query.refetch()} />
-      ) : (
-        render(query.data as T)
-      )}
+      ) : query.data ? (
+        render(query.data)
+      ) : null}
     </ChartCard>
   );
 }
