@@ -802,11 +802,13 @@ dedicated test, not assumed.
 
 `ProviderComparison` (`frontend/src/components/ProviderComparison.tsx`),
 shown on the Payment Detail page, is the one place in the dashboard whose
-entire purpose is an honest cost comparison, so it never invents one. Only
-simulated-mode payments have zero persisted quotes; they render an explicit
-empty state ("No provider comparison data available for this payment")
-rather than an empty or fabricated chart. A real (testnet-mode) payment
-created before migration 0007 has exactly one persisted quote — pre-0007's
+entire purpose is an honest cost comparison, so it never invents one.
+Simulated-mode payments always have zero persisted quotes, and so does any
+real (testnet-mode) payment created before migration 0005 introduced the
+`payment_quotes` table at all — both render an explicit empty state ("No
+provider comparison data available for this payment") rather than an empty
+or fabricated chart. A real (testnet-mode) payment created between
+migration 0005 and migration 0007 has exactly one persisted quote — pre-0007's
 `UNIQUE(payment_id)` constraint guaranteed exactly one row per payment, and
 it was always the winner, now correctly backfilled with `selected = true`
 — so it renders that one quote card with an explicit note ("Only one
