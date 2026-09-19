@@ -33,6 +33,10 @@ type fakePaymentStore struct {
 	lookupOutcome payment.CreateResult
 	lookupFound   bool
 	lookupErr     error
+
+	execResult payment.Execution
+	execFound  bool
+	execErr    error
 }
 
 func (f *fakePaymentStore) CreateOrGetPayment(_ context.Context, p payment.Payment) (payment.Payment, payment.CreateResult, error) {
@@ -49,7 +53,7 @@ func (f *fakePaymentStore) LookupByIdempotencyKey(_ context.Context, _ payment.P
 }
 
 func (f *fakePaymentStore) GetExecutionByPaymentID(_ context.Context, _ string) (payment.Execution, bool, error) {
-	return payment.Execution{}, false, nil
+	return f.execResult, f.execFound, f.execErr
 }
 
 func doPaymentRequest(h *Handler, method, path, idempotencyKey, body string) *httptest.ResponseRecorder {
@@ -374,6 +378,78 @@ func TestToPaymentResponse_FailureReasonNullWhenNotSet(t *testing.T) {
 	}
 	if v != nil {
 		t.Fatalf("expected failure_reason to be null, got %v", v)
+	}
+}
+
+// TestToPaymentResponse_ProviderReferenceAndExternalStatusSetWhenExecutionFound
+// guards the Task 11 additive extension to GET /payments/{id}: the handler
+// already loaded payment.Execution (for external_tx_hash/submitted_at)
+// but silently dropped ProviderReferenceID/ExternalStatus/RawExternalStatus.
+// The Payment Detail page needs these for its "provider status/reference"
+// field, so they're now surfaced too.
+func TestToPaymentResponse_ProviderReferenceAndExternalStatusSetWhenExecutionFound(t *testing.T) {
+	refID := "relay-request-123"
+	rawStatus := "success"
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-exec-found", Status: payment.StatusSubmitted,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+		execFound: true,
+		execResult: payment.Execution{
+			ProviderReferenceID: &refID,
+			ExternalStatus:      payment.ExternalStatusFilled,
+			RawExternalStatus:   &rawStatus,
+		},
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-exec-found", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := body["provider_reference_id"]; got != refID {
+		t.Fatalf("expected provider_reference_id = %q, got %v", refID, got)
+	}
+	if got := body["external_status"]; got != "filled" {
+		t.Fatalf("expected external_status = %q, got %v", "filled", got)
+	}
+	if got := body["raw_external_status"]; got != rawStatus {
+		t.Fatalf("expected raw_external_status = %q, got %v", rawStatus, got)
+	}
+}
+
+// TestToPaymentResponse_ProviderReferenceNullWhenNoExecution is the
+// null-key counterpart -- a simulated-mode payment (or a testnet-mode
+// payment whose execution hasn't started yet) has no execution row at
+// all, so these three fields must be present-but-null, matching the
+// existing external_tx_hash/submitted_at convention.
+func TestToPaymentResponse_ProviderReferenceNullWhenNoExecution(t *testing.T) {
+	store := &fakePaymentStore{
+		getFound: true,
+		getResult: payment.Payment{
+			ID: "test-id-no-exec", Status: payment.StatusRouted,
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		},
+		execFound: false,
+	}
+	h := &Handler{Client: &fakeClient{}, Store: store}
+	rec := doPaymentRequest(h, "GET", "/payments/test-id-no-exec", "", "")
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for _, key := range []string{"provider_reference_id", "external_status", "raw_external_status"} {
+		v, ok := body[key]
+		if !ok {
+			t.Fatalf("expected %q key to be present in the response", key)
+		}
+		if v != nil {
+			t.Fatalf("expected %q to be null, got %v", key, v)
+		}
 	}
 }
 

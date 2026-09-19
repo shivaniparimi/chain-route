@@ -23,6 +23,13 @@ export interface Hop {
 
 // handler.paymentResponse -- the GET /payments/{id} response shape
 // (payments.go, pre-existing endpoint predating this phase).
+//
+// provider_reference_id/external_status/raw_external_status: added by
+// Task 11 (additive-only extension to payments.go's toPaymentResponse --
+// every pre-existing field above is untouched). null whenever there's no
+// execution row yet (simulated-mode payments, or a testnet-mode payment
+// that hasn't started executing) -- same nil convention as
+// external_tx_hash/submitted_at just above.
 export interface Payment {
   id: string;
   source_chain: string;
@@ -40,6 +47,9 @@ export interface Payment {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
+  provider_reference_id: string | null;
+  external_status: string | null;
+  raw_external_status: string | null;
 }
 
 // handler.paymentListItem (dashboard.go) -- the row shape for GET

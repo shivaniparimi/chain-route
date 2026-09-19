@@ -73,6 +73,19 @@ type paymentResponse struct {
 	CreatedAt        string        `json:"created_at"`
 	UpdatedAt        string        `json:"updated_at"`
 	CompletedAt      *string       `json:"completed_at"`
+	// ProviderReferenceID/ExternalStatus/RawExternalStatus -- additive
+	// (Task 11, phase 12): payment_executions already carried this data
+	// (see payment.Execution / go-api/internal/postgres/execution_store.go),
+	// and GetPayment already loads the row via GetExecutionByPaymentID for
+	// ExternalTxHash/SubmittedAt above, but never surfaced these three
+	// fields. The Payment Detail page needs "provider status/reference" per
+	// the design doc's §4 field list, so this exposes exactly what's
+	// already fetched -- nil (not omitted) for a simulated-mode payment or
+	// any payment with no execution row yet, matching the existing
+	// ExternalTxHash/SubmittedAt nil convention below.
+	ProviderReferenceID *string `json:"provider_reference_id"`
+	ExternalStatus      *string `json:"external_status"`
+	RawExternalStatus   *string `json:"raw_external_status"`
 }
 
 func toPaymentResponse(p payment.Payment, exec payment.Execution, execFound bool) paymentResponse {
@@ -89,7 +102,8 @@ func toPaymentResponse(p payment.Payment, exec payment.Execution, execFound bool
 		formatted := p.CompletedAt.UTC().Format(time.RFC3339Nano)
 		completedAt = &formatted
 	}
-	var externalTxHash, submittedAt *string
+	var externalTxHash, submittedAt, externalStatus, rawExternalStatus *string
+	var providerReferenceID *string
 	if execFound {
 		if exec.SignedTxHash != nil {
 			externalTxHash = exec.SignedTxHash
@@ -98,6 +112,15 @@ func toPaymentResponse(p payment.Payment, exec payment.Execution, execFound bool
 			formatted := exec.BroadcastAt.UTC().Format(time.RFC3339Nano)
 			submittedAt = &formatted
 		}
+		providerReferenceID = exec.ProviderReferenceID
+		rawExternalStatus = exec.RawExternalStatus
+		// exec.ExternalStatus is a non-pointer column that is always
+		// populated (defaults to "pending") once an execution row exists --
+		// safe to always take its address here since we're inside
+		// execFound, unlike ExternalTxHash/SubmittedAt above which stay nil
+		// until a real broadcast happens.
+		status := string(exec.ExternalStatus)
+		externalStatus = &status
 	}
 	return paymentResponse{
 		ID: p.ID, SourceChain: p.SourceChain, DestinationChain: p.DestinationChain,
@@ -105,9 +128,12 @@ func toPaymentResponse(p payment.Payment, exec payment.Execution, execFound bool
 		Hops: hops, ExecutionMode: string(p.ExecutionMode), BridgeProvider: p.BridgeProvider,
 		FailureReason:  p.FailureReason,
 		ExternalTxHash: externalTxHash, SubmittedAt: submittedAt,
-		CreatedAt:   p.CreatedAt.UTC().Format(time.RFC3339Nano),
-		UpdatedAt:   p.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		CompletedAt: completedAt,
+		CreatedAt:           p.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:           p.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		CompletedAt:         completedAt,
+		ProviderReferenceID: providerReferenceID,
+		ExternalStatus:      externalStatus,
+		RawExternalStatus:   rawExternalStatus,
 	}
 }
 
