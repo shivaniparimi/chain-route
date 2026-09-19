@@ -162,4 +162,36 @@ describe("LifecycleTimeline", () => {
     expect(confirmation.state).toBe("active");
     expect(confirmation.timestamp).toBeNull();
   });
+
+  it("renders Blockchain Execution as not_applicable (never 'pending'/'Not yet broadcast') for a testnet payment that FAILED before ever broadcasting", () => {
+    // Mirrors a real backend path (go-api/internal/worker/executor.go):
+    // quote-expiry, route-unavailable, fee-slippage, and guardrail-exceeded
+    // failures all reach status FAILED while submitted_at is still null,
+    // because the payment never made it to broadcast. Rendering "pending —
+    // Not yet broadcast" here would wrongly imply the broadcast might still
+    // happen, directly contradicting Destination Confirmation's "failed"
+    // state for the same payment.
+    const payment = makePayment({
+      status: "FAILED",
+      execution_mode: "testnet",
+      submitted_at: null,
+      failure_reason: "quote expired before route could be confirmed",
+    });
+
+    render(<LifecycleTimeline payment={payment} />);
+
+    const stages = deriveLifecycleStages(payment);
+    const execution = stages.find((s) => s.id === "blockchain_execution")!;
+
+    expect(execution.state).not.toBe("pending");
+    expect(execution.note).not.toContain("Not yet broadcast");
+    expect(execution.state).toBe("not_applicable");
+    expect(execution.timestamp).toBeNull();
+    expect(execution.note).toContain("Never broadcast");
+
+    // Destination Confirmation still correctly shows the payment as failed,
+    // so the two stages no longer contradict each other.
+    const confirmation = stages.find((s) => s.id === "destination_confirmation")!;
+    expect(confirmation.state).toBe("failed");
+  });
 });

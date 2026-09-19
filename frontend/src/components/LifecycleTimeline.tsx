@@ -109,7 +109,16 @@ export function deriveLifecycleStages(payment: Payment): LifecycleStage[] {
   // `submitted_at` (the design doc's conceptual `broadcast_at`) is set,
   // then complete with that real timestamp. Simulated-mode payments never
   // really execute on-chain, so this is N/A, not pending -- pending would
-  // wrongly imply it's still going to happen.
+  // wrongly imply it's still going to happen. Likewise, a testnet payment
+  // that reached FAILED status while `submitted_at` is still null failed
+  // during Kafka Processing (quote-expiry, route-unavailable, fee-slippage,
+  // or guardrail-exceeded -- see go-api/internal/worker/executor.go) and so
+  // never reached broadcast at all; rendering "pending" there would falsely
+  // imply the broadcast might still happen even though Destination
+  // Confirmation already shows the payment as failed. Note: if
+  // `submitted_at` IS set on a FAILED payment, the broadcast genuinely
+  // happened and only the later confirmation failed, so that case still
+  // takes the `complete` branch below.
   if (!isTestnet) {
     stages.push({
       id: "blockchain_execution",
@@ -125,6 +134,14 @@ export function deriveLifecycleStages(payment: Payment): LifecycleStage[] {
       state: "complete",
       timestamp: payment.submitted_at,
       note: "",
+    });
+  } else if (payment.status === "FAILED") {
+    stages.push({
+      id: "blockchain_execution",
+      label: "Blockchain Execution",
+      state: "not_applicable",
+      timestamp: null,
+      note: "Never broadcast — payment failed before broadcast",
     });
   } else {
     stages.push({
