@@ -802,17 +802,19 @@ dedicated test, not assumed.
 
 `ProviderComparison` (`frontend/src/components/ProviderComparison.tsx`),
 shown on the Payment Detail page, is the one place in the dashboard whose
-entire purpose is an honest cost comparison, so it never invents one. A
-payment with zero persisted quotes — every simulated-mode payment, and any
-real payment that predates migration 0007 (the two cases are
-indistinguishable from the `GET /payments/{id}/quotes` response and don't
-need to be distinguished, since the honest message is the same either
-way) — renders an explicit empty state ("No provider comparison data
-available for this payment") rather than an empty or fabricated chart. A
-payment with exactly one persisted quote renders that one quote card with
-an explicit note ("Only one provider responded for this payment") instead
-of letting a single card look like it "won" a comparison that never
-happened.
+entire purpose is an honest cost comparison, so it never invents one. Only
+simulated-mode payments have zero persisted quotes; they render an explicit
+empty state ("No provider comparison data available for this payment")
+rather than an empty or fabricated chart. A real (testnet-mode) payment
+created before migration 0007 has exactly one persisted quote — pre-0007's
+`UNIQUE(payment_id)` constraint guaranteed exactly one row per payment, and
+it was always the winner, now correctly backfilled with `selected = true`
+— so it renders that one quote card with an explicit note ("Only one
+provider responded for this payment") instead of letting a single card
+look like it "won" a comparison that never happened. A genuine multi-quote
+Across-vs-Relay comparison is only available for payments created after
+migration 0007, since only Task 1's every-fetched-quote persistence records
+the losing candidate as well as the winner.
 
 ### Frontend architecture
 
