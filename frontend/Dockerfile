@@ -8,6 +8,11 @@ RUN npm run build
 
 FROM nginx:1.27-alpine AS runtime
 COPY --from=builder /src/dist /usr/share/nginx/html
+# Replace the stock server block with one that adds a try_files fallback to
+# index.html, so React Router (BrowserRouter) client-side routes such as
+# /payments/:id survive a hard refresh or direct navigation instead of
+# 404ing at nginx. See nginx.conf for details.
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY docker-entrypoint.sh /docker-entrypoint.d/40-chainroute-env-config.sh
 RUN chmod +x /docker-entrypoint.d/40-chainroute-env-config.sh
 EXPOSE 80
