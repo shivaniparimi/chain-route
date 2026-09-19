@@ -17,3 +17,7 @@ output "ecr_cpp_router_repository_url" {
 output "database_secret_arn" {
   value = module.database.secret_arn
 }
+
+output "cloudfront_domain_name" {
+  value = var.enable_frontend ? module.frontend[0].cloudfront_domain_name : null
+}
