@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/chainroute_service_server /app/chainroute_service_server
 COPY --from=builder /usr/local/bin/grpc-health-probe /usr/local/bin/grpc-health-probe
 
-USER routerapp
+USER 10001
 EXPOSE 50051 9102
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/grpc-health-probe", "-addr=localhost:50051"]

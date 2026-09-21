@@ -23,4 +23,4 @@ EXPOSE 80
 # environment this was authored in) -- see task-13-report.md for the full
 # verification trail and confidence level on this specific choice.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --spider -q http://localhost:80/ || exit 1
+    CMD ["sh", "-c", "wget --spider -q http://localhost:80/ || exit 1"]

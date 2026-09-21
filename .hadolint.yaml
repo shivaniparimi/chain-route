@@ -1,0 +1,10 @@
+ignored:
+  # DL3008: "pin versions in apt-get install". Deliberately not followed
+  # project-wide -- hard-pinning exact Debian package versions makes builds
+  # brittle against routine security patches (a pinned version can vanish
+  # from the mirror the moment Debian ships a point release), and this
+  # project already verifies its runtime-stage package set against the live
+  # Debian Bookworm index by hand (see the comment above the runtime-stage
+  # apt-get install in Dockerfile.cpp-router) rather than freezing exact
+  # version strings that would need manual upkeep on every security update.
+  - DL3008

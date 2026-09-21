@@ -99,7 +99,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # jsdom (a vitest/testing dependency) dropped Node 20 support as
+          # of jsdom 30 -- its package.json requires
+          # ^22.22.2 || ^24.15.0 || >=26.0.0. Node 22 is the oldest LTS line
+          # that still satisfies this.
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
       - name: install
