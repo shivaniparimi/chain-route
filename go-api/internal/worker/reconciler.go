@@ -297,7 +297,7 @@ func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, r
 		// below: completed=false means no real, new payment transition
 		// happened (guard-suppressed no-op), so recording
 		// ExecutionsCompleted/ExecutionsFailed/PaymentDuration/
-		// PaymentsProcessing/PaymentsCompleted/PaymentsFailed here would
+		// PaymentsCompleted/PaymentsFailed here would
 		// double-count against whatever actor already completed this
 		// payment -- the same class of bug Task 9's review caught and
 		// fixed for Executor's Broadcasts metric (gate on the operation's
@@ -314,7 +314,6 @@ func (r *Reconciler) markTerminal(ctx context.Context, exec payment.Execution, r
 		r.metrics().ExecutionsCompleted.WithLabelValues(providerLabel).Inc()
 	}
 	r.metrics().PaymentDuration.WithLabelValues(string(payment.ExecutionModeTestnet), outcome).Observe(time.Since(createdAt).Seconds())
-	r.metrics().PaymentsProcessing.WithLabelValues(string(payment.ExecutionModeTestnet)).Dec()
 	if terminal == payment.StatusCompleted {
 		r.metrics().PaymentsCompleted.WithLabelValues(string(payment.ExecutionModeTestnet)).Inc()
 	} else {

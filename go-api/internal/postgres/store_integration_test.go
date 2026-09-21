@@ -1328,6 +1328,81 @@ func TestGetDashboardStats_CountsAndProviderUsageAreExact(t *testing.T) {
 	}
 }
 
+// TestCountInFlightPayments_ReflectsRealNonTerminalPaymentsByMode is the
+// authoritative-source verification for the chainroute_payments_processing
+// metric fix: CountInFlightPayments must reflect exactly what PostgreSQL
+// says is non-terminal (ROUTED/PROCESSING/SUBMITTED), grouped by
+// execution_mode, and must NOT count anything terminal (COMPLETED/FAILED).
+// Uses the same before/after delta approach as
+// TestGetDashboardStats_CountsAndProviderUsageAreExact, for the same
+// shared-table reason.
+func TestCountInFlightPayments_ReflectsRealNonTerminalPaymentsByMode(t *testing.T) {
+	s := newTestStore(t)
+	keys := []string{
+		"test-inflight-simulated-routed",
+		"test-inflight-simulated-processing",
+		"test-inflight-testnet-routed",
+		"test-inflight-testnet-completed",
+	}
+	deleteByIdempotencyKeys(t, s, keys...)
+	t.Cleanup(func() { deleteByIdempotencyKeys(t, s, keys...) })
+
+	before, err := s.CountInFlightPayments(context.Background())
+	if err != nil {
+		t.Fatalf("baseline CountInFlightPayments: %v", err)
+	}
+
+	// 1: simulated, left ROUTED -- in-flight.
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), testPayment(keys[0])); err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[0], outcome, err)
+	}
+
+	// 2: simulated, driven to PROCESSING -- still in-flight.
+	created2, outcome, err := s.CreateOrGetPayment(context.Background(), testPayment(keys[1]))
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[1], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created2.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[1], err)
+	}
+
+	// 3: testnet, left ROUTED -- in-flight, distinct mode bucket.
+	p3 := testPayment(keys[2])
+	p3.ExecutionMode = payment.ExecutionModeTestnet
+	if _, outcome, err := s.CreateOrGetPayment(context.Background(), p3); err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[2], outcome, err)
+	}
+
+	// 4: testnet, driven all the way to COMPLETED -- terminal, must NOT count.
+	p4 := testPayment(keys[3])
+	p4.ExecutionMode = payment.ExecutionModeTestnet
+	created4, outcome, err := s.CreateOrGetPayment(context.Background(), p4)
+	if err != nil || outcome != payment.Created {
+		t.Fatalf("create %s: outcome=%v err=%v", keys[3], outcome, err)
+	}
+	if _, _, err := s.ClaimPayment(context.Background(), created4.ID); err != nil {
+		t.Fatalf("claim %s: %v", keys[3], err)
+	}
+	if _, _, err := s.CompletePayment(context.Background(), created4.ID, payment.StatusCompleted); err != nil {
+		t.Fatalf("complete %s: %v", keys[3], err)
+	}
+
+	after, err := s.CountInFlightPayments(context.Background())
+	if err != nil {
+		t.Fatalf("CountInFlightPayments: %v", err)
+	}
+
+	if got := after["simulated"] - before["simulated"]; got != 2 {
+		t.Fatalf("expected simulated in-flight count to increase by 2 (ROUTED + PROCESSING), got %d", got)
+	}
+	if got := after["testnet"] - before["testnet"]; got != 1 {
+		t.Fatalf("expected testnet in-flight count to increase by 1 (the ROUTED one only -- the COMPLETED one must not count), got %d", got)
+	}
+	if after["simulated"] < 0 || after["testnet"] < 0 {
+		t.Fatalf("in-flight counts can never be negative (COUNT(*) cannot), got simulated=%d testnet=%d", after["simulated"], after["testnet"])
+	}
+}
+
 // seedPaymentAt inserts a payment row with an explicit created_at,
 // bypassing CreateOrGetPayment's now()-default -- necessary because
 // GetTimeseries buckets by created_at, and the timeseries tests below need

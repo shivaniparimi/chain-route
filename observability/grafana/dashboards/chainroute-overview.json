@@ -82,7 +82,8 @@
       "id": 10, "title": "Payments Currently Processing", "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
       "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [{"expr": "sum by (execution_mode) (chainroute_payments_processing)", "legendFormat": "{{execution_mode}}"}]
+      "description": "chainroute_payments_processing is now derived live from PostgreSQL on every scrape by the API server, the metric's single authoritative source (see observability.PaymentsInFlightCollector) -- no more in-memory Inc()/Dec() gauge split across the API and worker processes. max by (not sum by) so multiple API server replicas -- which would each report the identical, correct value -- collapse to that one value instead of being multiplied together; today there is only one replica, so this is forward-looking, not a correction of a currently-observed multi-replica issue.",
+      "targets": [{"expr": "max by (execution_mode) (chainroute_payments_processing)", "legendFormat": "{{execution_mode}}"}]
     }
   ]
 }

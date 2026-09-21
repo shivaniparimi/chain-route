@@ -79,7 +79,6 @@ func (r *Recovery) SweepOnce(ctx context.Context) (int, error) {
 			completed++
 			r.metrics().StaleRecoveries.WithLabelValues("recovery").Inc()
 			r.metrics().PaymentDuration.WithLabelValues(string(payment.ExecutionModeSimulated), outcome).Observe(time.Since(createdAt).Seconds())
-			r.metrics().PaymentsProcessing.WithLabelValues(string(payment.ExecutionModeSimulated)).Dec()
 			if terminal == payment.StatusCompleted {
 				r.metrics().PaymentsCompleted.WithLabelValues(string(payment.ExecutionModeSimulated)).Inc()
 			} else {

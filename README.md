@@ -201,20 +201,25 @@ unbounded label cardinality.
 | `chainroute_payments_created_total` | Counter | `execution_mode` | Total payments created via `POST /payments`. |
 | `chainroute_payments_completed_total` | Counter | `execution_mode` | Total payments that reached `COMPLETED`. |
 | `chainroute_payments_failed_total` | Counter | `execution_mode`, `failure_reason_class` | Total payments that reached `FAILED`. |
-| `chainroute_payments_processing` | Gauge | `execution_mode` | Payments created but not yet in a terminal state. **Split across two processes** — see note below. |
+| `chainroute_payments_processing` | Gauge | `execution_mode` | Payments currently in a non-terminal status (`ROUTED`/`PROCESSING`/`SUBMITTED`), queried live from PostgreSQL on every scrape. |
 | `chainroute_payment_duration_seconds` | Histogram | `execution_mode`, `outcome` | Wall time from payment creation to a terminal state. |
 
-> `chainroute_payments_processing` is `Inc()`'d in the `go-api` server
-> process (on payment creation) and `Dec()`'d only in the `go-api` worker
-> process (on reaching a terminal state). Those are two separate binaries
-> with two separate, isolated Prometheus registries, so neither process's
-> own scraped series is meaningful on its own — the server's series only
-> ever climbs and the worker's series only ever falls into negative
-> numbers. Query it with `sum by (execution_mode)
-> (chainroute_payments_processing)` (as the Grafana dashboard's "Payments
-> Currently Processing" panel already does) to recover the true in-flight
-> count; querying either scrape target's value directly will look wrong
-> by design.
+> `chainroute_payments_processing` is exposed only by the `go-api` server
+> process, via `observability.PaymentsInFlightCollector`, which runs
+> `postgres.Store.CountInFlightPayments` against the real `payments` table
+> on every `/metrics` scrape rather than tracking an in-memory counter. An
+> earlier version of this metric was a `*prometheus.GaugeVec` `Inc()`'d on
+> creation in the server and `Dec()`'d on completion in the worker — since
+> those are two separate processes with two separate, isolated Prometheus
+> registries, the server's own series only ever grew and the worker's only
+> ever fell, and neither (nor summing them) survived a process restart.
+> Deriving the value fresh from PostgreSQL has none of these problems: it
+> is correct immediately after any restart, and it can never go negative.
+> The Grafana dashboard's "Payments Currently Processing" panel queries
+> `max by (execution_mode) (chainroute_payments_processing)` — `max`
+> rather than `sum` so that multiple API server replicas, which would each
+> report the identical correct value, collapse to that value instead of
+> being multiplied together.
 
 **Routing (Go server -> C++ router)**
 

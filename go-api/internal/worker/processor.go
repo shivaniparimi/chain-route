@@ -160,7 +160,6 @@ func (p *Processor) HandleRoutedPayment(ctx context.Context, evt events.RoutedPa
 	}
 	if completed {
 		p.metrics().PaymentDuration.WithLabelValues(string(mode), outcome).Observe(time.Since(createdAt).Seconds())
-		p.metrics().PaymentsProcessing.WithLabelValues(string(mode)).Dec()
 		if terminal == payment.StatusCompleted {
 			p.metrics().PaymentsCompleted.WithLabelValues(string(mode)).Inc()
 		} else {

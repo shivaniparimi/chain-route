@@ -815,7 +815,7 @@ func newTestHandlerWithMetricsAndProviders(t *testing.T, providers map[string]qu
 	return h, metrics
 }
 
-func TestPostPayments_SimulatedMode_IncrementsPaymentsCreatedAndProcessing(t *testing.T) {
+func TestPostPayments_SimulatedMode_IncrementsPaymentsCreated(t *testing.T) {
 	h, metrics := newTestHandlerWithMetrics(t)
 	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(
 		`{"source_chain":"ethereum","destination_chain":"base","asset":"usdc","amount":"100"}`))
@@ -828,9 +828,6 @@ func TestPostPayments_SimulatedMode_IncrementsPaymentsCreatedAndProcessing(t *te
 	}
 	if got := testutil.ToFloat64(metrics.PaymentsCreated.WithLabelValues("simulated")); got != 1 {
 		t.Errorf("PaymentsCreated{simulated} = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(metrics.PaymentsProcessing.WithLabelValues("simulated")); got != 1 {
-		t.Errorf("PaymentsProcessing{simulated} = %v, want 1", got)
 	}
 }
 

@@ -394,6 +394,40 @@ func (s *Store) ListPayments(ctx context.Context, filter payment.ListFilter) ([]
 	return results, nextCursor, nil
 }
 
+// CountInFlightPayments returns the current count of non-terminal
+// (ROUTED, PROCESSING, or SUBMITTED) payments, grouped by execution_mode,
+// in a single aggregation query. This is the authoritative source for the
+// chainroute_payments_processing metric (see
+// observability.PaymentsInFlightCollector) -- queried fresh on every
+// Prometheus scrape rather than tracked via an in-memory counter, so it is
+// correct regardless of process restarts and can never go negative. A
+// mode with zero in-flight payments is simply absent from the returned
+// map; callers that need an explicit 0 (e.g. the collector, for a fixed,
+// bounded label set) supply their own default.
+func (s *Store) CountInFlightPayments(ctx context.Context) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT execution_mode, COUNT(*)
+		FROM payments
+		WHERE status IN ('ROUTED', 'PROCESSING', 'SUBMITTED')
+		GROUP BY execution_mode
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("count in-flight payments: %w", err)
+	}
+	defer rows.Close()
+
+	counts := map[string]int64{}
+	for rows.Next() {
+		var mode string
+		var count int64
+		if err := rows.Scan(&mode, &count); err != nil {
+			return nil, fmt.Errorf("scan in-flight payment count row: %w", err)
+		}
+		counts[mode] = count
+	}
+	return counts, rows.Err()
+}
+
 // GetDashboardStats computes the read-only dashboard overview counters in
 // exactly three aggregation queries -- all aggregating in SQL, never
 // fetch-all-then-aggregate-in-Go, to keep this endpoint free of N+1 query

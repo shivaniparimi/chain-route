@@ -114,6 +114,13 @@ func main() {
 
 	store := postgres.New(db)
 
+	// chainroute_payments_processing is derived live from PostgreSQL on
+	// every scrape (see observability.PaymentsInFlightCollector's own doc
+	// comment) rather than tracked via an in-memory Inc()/Dec() gauge --
+	// registered here, in the API server only, as this metric's single
+	// authoritative source.
+	metrics.Registry.MustRegister(observability.NewPaymentsInFlightCollector(store, logger))
+
 	h := &handler.Handler{
 		Client: client, Store: store, DashboardStore: store, BlockchainEnv: blockchainEnv,
 		MaxTestnetAmountWei: maxTestnetAmountWei, QuoteRegistry: registry,

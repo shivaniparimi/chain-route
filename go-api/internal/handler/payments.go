@@ -451,7 +451,6 @@ func (h *Handler) PostPayments(w http.ResponseWriter, r *http.Request) {
 	switch outcome {
 	case payment.Created:
 		h.metrics().PaymentsCreated.WithLabelValues(string(mode)).Inc()
-		h.metrics().PaymentsProcessing.WithLabelValues(string(mode)).Inc()
 		span.SetAttributes(attribute.String("payment.id", result.ID), attribute.String("payment.status", string(result.Status)))
 		w.Header().Set("Location", "/payments/"+result.ID)
 		writeJSON(w, http.StatusCreated, toPaymentResponse(result, payment.Execution{}, false))

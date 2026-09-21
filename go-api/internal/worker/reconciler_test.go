@@ -534,7 +534,7 @@ func TestCheckAndUpdateOutcome_StillPendingRecordsReconciliationButNotCompletion
 // Task 9's fix: when CompleteSubmittedPayment's own guard affects zero
 // rows (completed=false -- e.g. a race where the payment was already
 // completed by a previous sweep), markTerminal must NOT increment
-// ExecutionsCompleted/PaymentsCompleted/PaymentDuration/PaymentsProcessing,
+// ExecutionsCompleted/PaymentsCompleted/PaymentDuration,
 // since no real, new completion happened.
 func TestMarkTerminal_CompleteSubmittedPaymentGuardFalse_DoesNotRecordCompletionMetrics(t *testing.T) {
 	hash := "0xa0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
