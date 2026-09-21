@@ -395,6 +395,85 @@ number for the containerized stack. No such number exists anywhere in
 this repository, and none should be assumed or quoted until a real Docker
 daemon is available and the run described above is actually performed.
 
+### Full-system benchmark, native stack (2026-09-19)
+
+A real, measured throughput number **does** exist, from a full-system
+integration test and benchmark run natively (not containerized) against
+`main`: PostgreSQL 16 and Prometheus/Grafana via Homebrew services, a real
+Apache Kafka 4.3.1 broker in KRaft mode via Homebrew (no Docker/Zookeeper),
+and `cpp-routing-service`/`go-api/cmd/server`/`go-api/cmd/worker`/`frontend`
+all built from `main` and run as plain OS processes. Docker's daemon was
+attempted again for this run and, after a single image-build attempt
+exhausted the host's disk and left the daemon unresponsive, was not pursued
+further to avoid risking other, unrelated Docker state already on that
+machine — full details, methodology, and the before/after data behind the
+bottleneck fix below are in
+`docs/superpowers/benchmarks/2026-09-19-full-system-benchmark.md`.
+
+Using the same `go-api/cmd/benchmark` tool described above, unmodified
+(it already measures true completed-payment throughput, not HTTP accept),
+an initial sweep found a flat ~75–78 processed-payments/sec ceiling from
+concurrency 8 onward, with climbing latency, 0 Kafka consumer lag, and
+worker CPU under 1% — a saturation signature pointing away from Kafka/DB
+capacity. The actual constraint, found by reading the code: the outbox
+publisher claimed and published exactly one row per call, on one
+goroutine. Fixed via two new, additive, default-unchanged environment
+variables (`WORKER_PUBLISHER_CONCURRENCY`, `WORKER_CONSUMER_CONCURRENCY`,
+both defaulting to `1`) that run more instances of the existing,
+unmodified publish/consume loop bodies — safe because the outbox claim
+already uses PostgreSQL's `FOR UPDATE SKIP LOCKED`, kafka-go's
+`FetchMessage`/`CommitMessages` are documented-safe for concurrent
+callers, and every payment-state transition was already idempotent and
+DB-guarded. No transaction boundary, commit ordering, delivery guarantee,
+or payment-state guard changed.
+
+With `WORKER_PUBLISHER_CONCURRENCY=4`/`WORKER_CONSUMER_CONCURRENCY=3`, two
+independent 30-second runs at concurrency 32 measured **314.19** and
+**315.57** completed-simulated-payments/sec, and concurrency 64 measured
+311.02/sec, all with healthy p50 latency (~100–176ms) and near-zero Kafka
+lag. Concurrency 96 broke the pattern (278.09/sec, rising latency, ~58%
+server CPU) — a real degradation signal, not sustained throughput. The
+defensible, conservative, rounded-down claim from these measurements is
+**300+ completed payments/sec, sustained, simulated-execution mode, on
+this specific machine** — not a universal figure, and not to be confused
+with `throughput_accept_per_sec` (HTTP acceptance) or with the C++
+router's own microsecond-scale synthetic Dijkstra benchmark (see below),
+which measures a different, narrower thing.
+
+This run also **did not** verify: a real Docker image build (the daemon
+never came back up after the disk incident); OpenTelemetry Collector or
+Jaeger (no Homebrew formula for either, so trace export was confirmed to
+fail open — retries every few seconds, logs a warning, never blocks a
+request — but no trace was ever confirmed landing in a tracing backend);
+or the React dashboard rendered in an actual browser (checked only via its
+real API responses, never visually). Stated here plainly rather than
+implied.
+
+### C++ routing-engine benchmark, synthetic graphs (2026-09-19)
+
+Measured separately, calling `chainroute::findCheapestRoute` (unmodified)
+directly against synthetic graphs, since the real production graph is
+capped at 25 nodes (5 `ChainId` × 5 `AssetId` — the actual type system's
+ceiling, not a benchmark artifact). Graph size was scaled via edge count
+(parallel bridge options across those 25 nodes), deterministically
+generated via `chainroute::sim::draw`, 5000 route queries per size:
+
+| edges (synthetic) | nodes | p50 | p95 | p99 | throughput |
+|---|---|---|---|---|---|
+| 100 | 25 | 1.96µs | 2.33µs | 2.67µs | 466,074 route-queries/sec |
+| 1,000 | 25 | 4.58µs | 6.71µs | 9.21µs | 210,084 route-queries/sec |
+| 10,000 | 25 | 11.17µs | 15.88µs | 17.50µs | 83,825 route-queries/sec |
+
+**This is a synthetic in-memory-algorithm micro-benchmark, not production
+routing across 10,000 real blockchain routes** — the real graph never
+exceeds 25 nodes. It produces a far larger raw number than the payment
+benchmark above (tens/hundreds of thousands vs. ~300/sec), but the two
+measure fundamentally different things — an isolated Dijkstra call on a
+synthetic graph vs. a full HTTP→PostgreSQL→Kafka→worker pipeline — and the
+routing number is not a substitute resume metric for the system as a
+whole. It is evidence that Dijkstra itself was never close to being this
+project's throughput bottleneck.
+
 ## Docker
 
 Phase 11 packages all three ChainRoute runtime components as containers.
