@@ -16,9 +16,8 @@ import (
 // recognized terminal signal may ever produce FAILED).
 //
 // Across's own generated TypeScript interface for this endpoint (captured
-// live during Phase 7 planning/verification -- see
-// docs/superpowers/reports/2026-09-13-across-verification-findings.md,
-// Step 2) documents 11 possible status values, not the 4 originally
+// live during Phase 7 planning/verification)
+// documents 11 possible status values, not the 4 originally
 // assumed: "filled", "pending", "expired", "refunded",
 // "slowFillRequested", "slowFilled", "deposit-pending", "deposit-failed",
 // "auto-refund-pending", "manual-refund-required", "refund-failed". The

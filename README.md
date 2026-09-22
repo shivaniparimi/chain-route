@@ -406,9 +406,8 @@ all built from `main` and run as plain OS processes. Docker's daemon was
 attempted again for this run and, after a single image-build attempt
 exhausted the host's disk and left the daemon unresponsive, was not pursued
 further to avoid risking other, unrelated Docker state already on that
-machine — full details, methodology, and the before/after data behind the
-bottleneck fix below are in
-`docs/superpowers/benchmarks/2026-09-19-full-system-benchmark.md`.
+machine. The methodology and the before/after data behind the bottleneck
+fix are summarized below.
 
 Using the same `go-api/cmd/benchmark` tool described above, unmodified
 (it already measures true completed-payment throughput, not HTTP accept),
@@ -920,8 +919,7 @@ frontend/src/
 └── main.tsx        entry point
 ```
 
-**Why this stack** (see the design doc, `docs/superpowers/specs/
-2026-09-18-payment-analytics-dashboard-design.md`, for the full reasoning):
+**Why this stack:**
 Vite for a fast dev server and a simple static-asset production build (no
 server-side rendering needed for a read-only dashboard); TypeScript so the
 API response shapes are typed end to end; Tailwind CSS for a restrained

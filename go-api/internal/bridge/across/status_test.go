@@ -10,8 +10,7 @@ import (
 
 // realDepositNotFoundFixture is the exact error body this plan's live
 // verification captured from https://testnet.across.to/api/deposit/status
-// (re-confirmed by Task 1, see
-// docs/superpowers/reports/2026-09-13-across-verification-findings.md).
+// (re-confirmed by Task 1).
 const realDepositNotFoundFixture = `{"error":"DepositNotFoundException","message":"Deposit not found given the provided constraints"}`
 
 func TestDepositStatusByTxHash_NotFoundMapsToSentinelError(t *testing.T) {
@@ -68,8 +67,7 @@ func TestDepositStatusByTxHash_UnrecognizedStatusDoesNotError(t *testing.T) {
 
 // TestDepositStatusByTxHash_ParsesOtherDocumentedStatuses locks in that
 // every one of the 11 status values Across's own generated TypeScript
-// interface documents (see docs/superpowers/reports/2026-09-13-across-
-// verification-findings.md, Step 2) round-trips through this client
+// interface documents round-trips through this client
 // without error -- not just "filled" and an arbitrary unknown string.
 func TestDepositStatusByTxHash_ParsesOtherDocumentedStatuses(t *testing.T) {
 	documented := []string{

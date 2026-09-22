@@ -256,8 +256,7 @@ func main() {
 	// *kafka.Consumer/*worker.Processor or *worker.Publisher, rather than
 	// one. Both default to 1 (today's exact prior behavior, unchanged for
 	// any deployment that doesn't set these). A benchmark
-	// (docs/superpowers/benchmarks/2026-09-19-full-system-benchmark.md
-	// §10) found the single-goroutine OUTBOX PUBLISHER -- not the Kafka
+	// found the single-goroutine OUTBOX PUBLISHER -- not the Kafka
 	// consumer -- to be the pipeline's real throughput ceiling: worker CPU
 	// sat under 1% at saturation and Kafka consumer lag stayed at 0 even
 	// with 3 consumer goroutines running, because Publisher.PollOnce
