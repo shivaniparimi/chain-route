@@ -89,10 +89,6 @@ Measured on a native (non-Docker) run of the actual pipeline — a real payment 
 
 All of this runs in **simulated execution mode** by default — no real blockchain transactions or funds. There's also a `testnet` mode that signs and broadcasts real (testnet) transactions via the Across and Relay bridge APIs, gated behind an explicit environment variable.
 
-## What hasn't been verified
-
-Being direct about this rather than implying more than is true: a real Docker build/deploy of the full stack, and an actual deployment to AWS via the included Terraform, have not been run end-to-end. The Terraform is written and passes `validate`/`plan` against dummy credentials, but `apply` has never been run against a real AWS account.
-
 ## Project layout
 
 ```
